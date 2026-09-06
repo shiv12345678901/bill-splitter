@@ -23,7 +23,7 @@ Deno.serve(async (request) => {
       body: JSON.stringify({
         contents: [{ parts: [
           { inlineData: { mimeType, data: imageBase64 } },
-          { text: 'Read this household receipt. Identify the merchant, final amount actually paid, and best category. Ignore subtotals, savings, tax lines, cash tendered, and change. Use Other if uncertain.' },
+          { text: 'Read this household receipt. Identify the merchant, final amount actually paid, receipt date, and best category. Ignore subtotals, savings, tax lines, cash tendered, and change. Use Other if uncertain. Return an empty receipt date when it is unclear.' },
         ] }],
         generationConfig: {
           responseMimeType: 'application/json',
@@ -33,6 +33,7 @@ Deno.serve(async (request) => {
             properties: {
               merchant: { type: 'STRING', description: 'Store, restaurant, or utility name; Receipt if unreadable' },
               total_amount: { type: 'NUMBER', description: 'Final numerical amount paid' },
+              receipt_date: { type: 'STRING', description: 'Receipt date in YYYY-MM-DD format, or an empty string if unclear' },
               category: { type: 'STRING', enum: categories },
             },
           },
@@ -51,6 +52,7 @@ Deno.serve(async (request) => {
     return Response.json({
       merchant: String(parsed.merchant || 'Receipt').slice(0, 100),
       total_amount: Math.round(amount * 100) / 100,
+      receipt_date: /^\d{4}-\d{2}-\d{2}$/.test(parsed.receipt_date) ? parsed.receipt_date : null,
       category: categories.includes(parsed.category) ? parsed.category : 'Other',
     }, { headers: { ...corsHeaders, 'Cache-Control': 'no-store' } });
   } catch (error) {
