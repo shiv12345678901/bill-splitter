@@ -1,9 +1,12 @@
 {
   "name": "SplitMate",
   "short_name": "SplitMate",
+  "id": "/",
   "description": "Household bills, sorted.",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
+  "orientation": "portrait-primary",
   "background_color": "#f7f7f9",
   "theme_color": "#172033",
   "icons": [
