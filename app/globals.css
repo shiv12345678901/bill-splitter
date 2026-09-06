@@ -7,6 +7,16 @@
 html { background:var(--background); }
 body { margin:0; background:var(--background); color:var(--foreground); font-family:var(--font-geist-sans),-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue",sans-serif; }
 button,input,select { font:inherit; } button { cursor:pointer; }
+.auth-shell { display:grid; min-height:100dvh; place-items:center; overflow:hidden; background:radial-gradient(circle at 85% 12%,rgba(216,255,126,.55),transparent 26%),radial-gradient(circle at 12% 88%,rgba(143,220,255,.38),transparent 30%),#eef0f4; padding:24px; }
+.auth-card { width:min(440px,100%); border:1px solid rgba(255,255,255,.85); border-radius:34px; background:rgba(255,255,255,.82); padding:30px; box-shadow:0 28px 80px rgba(27,36,59,.14); backdrop-filter:blur(24px); }
+.auth-mark { display:grid; height:58px; width:58px; place-items:center; border-radius:19px; background:#172033; color:#d8ff7e; box-shadow:0 12px 28px rgba(23,32,51,.24); }
+.auth-field { display:flex; height:56px; align-items:center; gap:11px; border:1px solid #e1e3e8; border-radius:18px; background:#f7f7f9; padding:0 16px; color:#858c99; }
+.auth-field:focus-within { border-color:#7c87e8; box-shadow:0 0 0 3px rgba(103,114,217,.12); color:#6772d9; }
+.auth-field input { min-width:0; flex:1; border:0; background:transparent; color:#172033; font-size:15px; font-weight:620; outline:none; }
+.auth-submit { display:flex; min-height:56px; width:100%; align-items:center; justify-content:center; gap:8px; border:0; border-radius:18px; background:#172033; color:white; font-weight:750; box-shadow:0 12px 24px rgba(23,32,51,.18); }
+.auth-submit:disabled { opacity:.55; cursor:wait; }
+.auth-switch { display:block; margin:18px auto 0; border:0; background:transparent; color:#5e6bd4; font-size:13px; font-weight:750; }
+.auth-alert { margin-top:14px; border-radius:15px; background:#fff1e8; padding:11px 13px; color:#a04e32; font-size:12px; font-weight:650; line-height:1.5; }
 .ios-icon-button { display:grid; height:44px; width:44px; place-items:center; border:0; border-radius:50%; background:#ebecef; color:#485063; }
 .balance-card { position:relative; overflow:hidden; border-radius:28px; background:linear-gradient(145deg,#182033 0%,#273250 100%); padding:24px; box-shadow:0 18px 38px rgba(26,35,58,.18); }
 .balance-card::after { content:''; position:absolute; right:-45px; top:-70px; height:180px; width:180px; border-radius:999px; border:36px solid rgba(216,255,126,.08); pointer-events:none; }
