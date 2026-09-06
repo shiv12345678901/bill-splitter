@@ -1,7 +1,7 @@
 'use client';
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDownLeft, ArrowRight, Camera, Check, ChevronRight, Copy, Home, LockKeyhole, LogOut, Mail, PieChart, ReceiptText, Settings, Users, X } from 'lucide-react';
+import { ArrowDownLeft, ArrowRight, Camera, Check, ChevronRight, Copy, Home, ImagePlus, LockKeyhole, LogOut, Mail, PieChart, ReceiptText, Settings, Users, X } from 'lucide-react';
 import type { User } from '@supabase/supabase-js';
 import { supabase, supabaseConfigured } from '@/lib/supabase';
 
@@ -102,7 +102,8 @@ export default function HomePage() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [toast, setToast] = useState('');
   const [draft, setDraft] = useState<Draft>(blankDraft);
-  const fileRef = useRef<HTMLInputElement>(null);
+  const uploadRef = useRef<HTMLInputElement>(null);
+  const cameraRef = useRef<HTMLInputElement>(null);
   const total = useMemo(() => expenses.reduce((sum, expense) => sum + expense.amount, 0), [expenses]);
   const share = total / members.length;
   const balances = useMemo(() => members.map((member) => ({ ...member, paid: expenses.filter((expense) => expense.payer === member.name).reduce((sum, expense) => sum + expense.amount, 0) })), [expenses]);
@@ -172,16 +173,17 @@ export default function HomePage() {
     void Promise.resolve(context.registerTool({
       name: 'start_receipt_creation',
       title: 'Add a household receipt',
-      description: 'Open the receipt capture flow for the currently selected household payer.',
+      description: 'Open the receipt photo picker for the currently selected household payer.',
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       annotations: { readOnlyHint: false, untrustedContentHint: false },
-      execute: () => { openCapture(); return { status: 'capture_opened', payer: activeMember }; },
+      execute: () => { openUpload(); return { status: 'photo_picker_opened', payer: activeMember }; },
     }, { signal: lifecycle.signal })).catch(() => undefined);
     return () => lifecycle.abort();
   }, [activeMember]);
 
   const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(''), 2200); };
-  const openCapture = () => fileRef.current?.click();
+  const openUpload = () => uploadRef.current?.click();
+  const openCamera = () => cameraRef.current?.click();
   const closeSheet = () => {
     if (draft.image.startsWith('blob:')) URL.revokeObjectURL(draft.image);
     setSheetOpen(false);
@@ -191,12 +193,14 @@ export default function HomePage() {
     if (!file) return;
     if (!allowedReceiptTypes.includes(file.type)) {
       notify('Choose a JPG, PNG, or WebP receipt');
-      if (fileRef.current) fileRef.current.value = '';
+      if (uploadRef.current) uploadRef.current.value = '';
+      if (cameraRef.current) cameraRef.current.value = '';
       return;
     }
     if (file.size > maxReceiptBytes) {
       notify('Receipt images must be under 10 MB');
-      if (fileRef.current) fileRef.current.value = '';
+      if (uploadRef.current) uploadRef.current.value = '';
+      if (cameraRef.current) cameraRef.current.value = '';
       return;
     }
     const image = URL.createObjectURL(file);
@@ -223,7 +227,8 @@ export default function HomePage() {
       notify('Scan unavailable — enter details manually');
     } finally {
       setAnalyzing(false);
-      if (fileRef.current) fileRef.current.value = '';
+      if (uploadRef.current) uploadRef.current.value = '';
+      if (cameraRef.current) cameraRef.current.value = '';
     }
   };
   const saveExpense = async () => {
@@ -291,7 +296,8 @@ export default function HomePage() {
 
   return (
     <main className="min-h-dvh bg-[#eef0f4] text-[#172033]">
-      <input ref={fileRef} className="hidden" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" onChange={(event) => void handleFile(event.target.files?.[0])} />
+      <input ref={uploadRef} className="hidden" type="file" accept="image/jpeg,image/png,image/webp" onChange={(event) => void handleFile(event.target.files?.[0])} />
+      <input ref={cameraRef} className="hidden" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" onChange={(event) => void handleFile(event.target.files?.[0])} />
       <div className="mx-auto min-h-dvh max-w-[1120px] pb-28 md:px-7 md:py-7">
         <div className="overflow-hidden bg-[#f7f7f9] shadow-[0_24px_80px_rgba(32,42,67,.14)] md:min-h-[calc(100dvh-56px)] md:rounded-[36px]">
           <header className="flex items-center justify-between px-5 pb-3 pt-[max(18px,env(safe-area-inset-top))] md:px-8 md:pt-7">
@@ -308,7 +314,7 @@ export default function HomePage() {
 
               <div><div className="mb-3 flex items-center justify-between px-1"><h2 className="section-title">Who paid?</h2><span className="text-xs font-semibold text-[#8a909c]">Tap to switch</span></div><div className="grid grid-cols-4 gap-2.5">{members.map((member) => <button key={member.name} onClick={() => setActiveMember(member.name)} className={`member-chip ${activeMember === member.name ? 'member-chip-active' : ''}`}><Avatar member={member} /><span className="mt-2 text-xs font-bold">{member.name}</span>{activeMember === member.name && <span className="absolute right-2 top-2 grid h-5 w-5 place-items-center rounded-full bg-[#172033] text-white"><Check size={12} strokeWidth={3} /></span>}</button>)}</div></div>
 
-              <button onClick={openCapture} className="capture-button"><span className="grid h-11 w-11 place-items-center rounded-full bg-white/14"><Camera size={21} /></span><span className="text-left"><span className="block text-base font-bold">Snap a receipt</span><span className="block text-xs font-medium text-white/60">OCR reads the merchant, total, and category</span></span><ChevronRight className="ml-auto" size={20} /></button>
+              <div className="space-y-2.5"><button onClick={openUpload} className="capture-button"><span className="grid h-11 w-11 place-items-center rounded-full bg-white/14"><ImagePlus size={21} /></span><span className="text-left"><span className="block text-base font-bold">Upload a bill</span><span className="block text-xs font-medium text-white/60">Choose a receipt from Photos for OCR</span></span><ChevronRight className="ml-auto" size={20} /></button><button onClick={openCamera} className="secondary-action w-full"><Camera size={18} /> Scan with camera</button></div>
             </section>
 
             <section className={tab === 'home' ? 'block' : 'hidden md:block'}>
@@ -330,7 +336,7 @@ export default function HomePage() {
         </div>
       </div>
 
-      <nav className="bottom-nav" aria-label="Primary navigation"><button onClick={() => setTab('home')} className={tab === 'home' ? 'nav-active' : ''}><Home size={20} /><span>Home</span></button><button onClick={() => setTab('settle')} className={tab === 'settle' ? 'nav-active' : ''}><PieChart size={20} /><span>Settle</span></button><button onClick={openCapture} className="nav-camera" aria-label="Snap receipt"><Camera size={23} /></button><button onClick={() => notify('Four members in Home')}><Users size={20} /><span>People</span></button><button onClick={() => notify('Settings coming soon')}><Settings size={20} /><span>Settings</span></button></nav>
+      <nav className="bottom-nav" aria-label="Primary navigation"><button onClick={() => setTab('home')} className={tab === 'home' ? 'nav-active' : ''}><Home size={20} /><span>Home</span></button><button onClick={() => setTab('settle')} className={tab === 'settle' ? 'nav-active' : ''}><PieChart size={20} /><span>Settle</span></button><button onClick={openUpload} className="nav-camera" aria-label="Upload bill"><ImagePlus size={23} /></button><button onClick={() => notify('Four members in Home')}><Users size={20} /><span>People</span></button><button onClick={() => notify('Settings coming soon')}><Settings size={20} /><span>Settings</span></button></nav>
 
       {sheetOpen && <div className="sheet-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) closeSheet(); }}><section className="receipt-sheet" role="dialog" aria-modal="true" aria-labelledby="receipt-title"><div className="mx-auto mb-4 h-1.5 w-10 rounded-full bg-[#d8dbe1]" /><div className="flex items-start justify-between"><div><p className="text-xs font-bold uppercase tracking-[.1em] text-[#6772d9]">{analyzing ? 'Reading with Gemini OCR' : 'Ready to review'}</p><h2 id="receipt-title" className="mt-1 text-2xl font-[750] tracking-[-.035em]">Receipt details</h2></div><button disabled={saving} onClick={closeSheet} className="ios-icon-button" aria-label="Close"><X size={18} /></button></div>{draft.image && <img src={draft.image} alt="Selected receipt" className="mt-5 h-28 w-full rounded-[20px] object-cover" />}{analyzing && <div className="scan-status" role="status"><span className="scan-spinner" />Analyzing merchant, total, date, and category…</div>}<div className="mt-5 space-y-3"><label className="field-label">Merchant<input autoFocus={!analyzing} value={draft.merchant} onChange={(event) => setDraft({ ...draft, merchant: event.target.value })} className="field-input" placeholder="Store name" /></label><div className="grid grid-cols-2 gap-3"><label className="field-label">Total (AUD)<input inputMode="decimal" value={draft.amount} onChange={(event) => setDraft({ ...draft, amount: event.target.value })} className="field-input" placeholder="0.00" /></label><label className="field-label">Category<select value={draft.category} onChange={(event) => setDraft({ ...draft, category: event.target.value })} className="field-input">{categories.map((category) => <option key={category}>{category}</option>)}</select></label></div><label className="field-label">Receipt date<input type="date" value={draft.receiptDate} onChange={(event) => setDraft({ ...draft, receiptDate: event.target.value })} className="field-input" /></label><div className="flex items-center justify-between rounded-2xl bg-[#f1f2f6] px-4 py-3"><div className="flex items-center gap-2"><ArrowDownLeft size={17} className="text-[#6772d9]" /><span className="text-sm font-semibold">Paid by {activeMember}</span></div><button disabled={saving} onClick={closeSheet} className="text-xs font-bold text-[#6772d9]">Change</button></div><button onClick={() => void saveExpense()} disabled={analyzing || saving || !draft.merchant.trim() || !(Number(draft.amount) > 0)} className="save-button">{analyzing ? 'Reading receipt…' : saving ? 'Saving receipt…' : 'Add receipt'} {!analyzing && !saving && <ArrowRight size={18} />}</button></div></section></div>}
       {toast && <div className="toast"><Check size={15} /> {toast}</div>}
