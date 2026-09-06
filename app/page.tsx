@@ -94,6 +94,7 @@ export default function HomePage() {
   const [receiptFilter, setReceiptFilter] = useState<'active' | 'settled'>('active');
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
+  const [dataLoading, setDataLoading] = useState(true);
   const [error, setError] = useState('');
   const [online, setOnline] = useState(() => typeof navigator === 'undefined' || navigator.onLine);
   const [sheetOpen, setSheetOpen] = useState(false);
@@ -121,6 +122,7 @@ export default function HomePage() {
   const pendingDelete = useRef<{ expense: Expense; timer: number } | null>(null);
   const activeScan = useRef('');
   const cancelledScan = useRef('');
+  const currentHouseholdId = useRef<string | null>(null);
 
   const notify = useCallback((message: string, action?: ToastState['action'], duration = 2800) => {
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
@@ -132,6 +134,7 @@ export default function HomePage() {
     const cached = window.localStorage.getItem(`splitmate-membership:${user.id}`);
     if (cached) {
       const parsed = JSON.parse(cached) as { self: Member; household: Household };
+      currentHouseholdId.current = parsed.household.id;
       setSelf(parsed.self); setHousehold(parsed.household); setProfileName(parsed.self.name); setHouseholdName(parsed.household.name); setLoading(false);
     } else setLoading(true);
     setError('');
@@ -141,11 +144,13 @@ export default function HomePage() {
       else setError(memberResult.error.message);
       setLoading(false); return;
     }
-    if (!memberResult.data) { window.localStorage.removeItem(`splitmate-membership:${user.id}`); setSelf(null); setHousehold(null); setLoading(false); return; }
+    if (!memberResult.data) { window.localStorage.removeItem(`splitmate-membership:${user.id}`); currentHouseholdId.current = null; setSelf(null); setHousehold(null); setLoading(false); return; }
     const rawMember = memberResult.data as Member & { households: Household | Household[] };
     const loadedHousehold = Array.isArray(rawMember.households) ? rawMember.households[0] : rawMember.households;
     const { households: _households, ...loadedMember } = rawMember;
     if (!loadedHousehold) { setError('Household could not be loaded.'); setLoading(false); return; }
+    if (currentHouseholdId.current !== loadedHousehold.id) setDataLoading(true);
+    currentHouseholdId.current = loadedHousehold.id;
     setSelf(loadedMember); setHousehold(loadedHousehold); setProfileName(loadedMember.name); setHouseholdName(loadedHousehold.name);
     window.localStorage.setItem(`splitmate-membership:${user.id}`, JSON.stringify({ self: loadedMember, household: loadedHousehold }));
     setLoading(false);
@@ -154,6 +159,11 @@ export default function HomePage() {
   const loadData = useCallback(async () => {
     if (!household) return;
     setError('');
+    const cached = window.localStorage.getItem(`splitmate-data:${household.id}`);
+    if (cached) {
+      const parsed = JSON.parse(cached) as { members: Member[]; expenses: Expense[]; cycles: Cycle[] };
+      setMembers(parsed.members); setExpenses(parsed.expenses); setCycles(parsed.cycles); setDataLoading(false);
+    }
     const [memberResult, expenseResult, cycleResult, activityResult, categoryResult, flagResult] = await Promise.all([
       supabase.from('household_members').select('*').eq('household_id', household.id).is('left_at', null).order('joined_at'),
       supabase.from('expenses').select('*').eq('household_id', household.id).is('deleted_at', null).order('receipt_date', { ascending: false }).limit(200),
@@ -164,9 +174,9 @@ export default function HomePage() {
     ]);
     const firstError = memberResult.error ?? expenseResult.error ?? cycleResult.error ?? activityResult.error ?? categoryResult.error ?? flagResult.error;
     if (firstError) {
-      const cached = window.localStorage.getItem(`splitmate-data:${household.id}`);
       if (cached && !navigator.onLine) { const parsed = JSON.parse(cached) as { members: Member[]; expenses: Expense[]; cycles: Cycle[] }; setMembers(parsed.members); setExpenses(parsed.expenses); setCycles(parsed.cycles); }
       else setError(firstError.message);
+      setDataLoading(false);
       return;
     }
     const loadedMembers = (memberResult.data ?? []) as Member[];
@@ -177,6 +187,7 @@ export default function HomePage() {
     const loadedExpenses = rows.map((row) => ({ id: row.id, householdId: row.household_id, payerId: row.payer_member_id, payerName: loadedMembers.find((member) => member.id === row.payer_member_id)?.name ?? row.payer ?? 'Member', merchant: row.merchant, amount: Number(row.amount), category: row.category, receiptDate: row.receipt_date ?? row.created_at.slice(0, 10), createdAt: row.created_at, image: row.image_path ? urls.get(row.image_path) ?? undefined : undefined, imagePath: row.image_path ?? undefined, settled: Boolean(row.settled), ocrStatus: row.ocr_status ?? 'not_requested', ocrModel: row.ocr_model ?? undefined, notes: row.notes ?? '' }));
     const loadedCycles = (cycleResult.data ?? []).map((cycle) => ({ ...cycle, total_amount: Number(cycle.total_amount), transfers: Array.isArray(cycle.transfers) ? cycle.transfers : [] })) as Cycle[];
     setMembers(loadedMembers); setExpenses(loadedExpenses); setCycles(loadedCycles); setActivities((activityResult.data ?? []) as Activity[]); setCustomCategories((categoryResult.data ?? []) as HouseholdCategory[]); setReceiptFlags((flagResult.data ?? []) as ReceiptFlag[]);
+    setDataLoading(false);
     window.localStorage.setItem(`splitmate-data:${household.id}`, JSON.stringify({ members: loadedMembers, expenses: loadedExpenses, cycles: loadedCycles }));
     const cutoff = new Date(Date.now() - 30_000).toISOString();
     const deleted = await supabase.from('expenses').select('id,image_path').eq('household_id', household.id).not('deleted_at', 'is', null).lt('deleted_at', cutoff);
@@ -436,7 +447,7 @@ export default function HomePage() {
   const changeMemberRole = async (member: Member, role: Member['role']) => { if (!isAdmin || !user || member.role === role) return; const result = await supabase.rpc('set_household_member_role', { target_member: member.id, new_role: role }); if (result.error) notify(result.error.message); else { if (member.user_id === user.id) window.localStorage.removeItem(`splitmate-membership:${user.id}`); await loadMembership(); setRefreshKey((value) => value + 1); notify(`${member.name} is now ${role === 'admin' ? 'an admin' : 'a user'}`); } };
   const reportIncorrect = async () => { if (!detail) return; const result = await supabase.rpc('report_receipt_incorrect', { target_expense: detail.id, report_reason: flagReason.trim() || null }); if (result.error) notify(result.error.message); else { setFlagReason(''); setRefreshKey((value) => value + 1); notify('Admin notified'); } };
   const resolveFlag = async (flag: ReceiptFlag) => { if (!isAdmin) return; const result = await supabase.rpc('resolve_receipt_flag', { target_flag: flag.id }); if (result.error) notify(result.error.message); else { setRefreshKey((value) => value + 1); notify('Report resolved'); } };
-  const leaveHousehold = async () => { if (!user || !household || !window.confirm(isOwner ? 'Delete this household? This cannot be undone.' : 'Leave this household?')) return; const result = await supabase.rpc('leave_household', { target_household: household.id }); if (result.error) notify(result.error.message); else { window.localStorage.removeItem(`splitmate-membership:${user.id}`); setHousehold(null); setSelf(null); await loadMembership(); } };
+  const leaveHousehold = async () => { if (!user || !household || !window.confirm(isOwner ? 'Delete this household? This cannot be undone.' : 'Leave this household?')) return; const result = await supabase.rpc('leave_household', { target_household: household.id }); if (result.error) notify(result.error.message); else { window.localStorage.removeItem(`splitmate-membership:${user.id}`); currentHouseholdId.current = null; setHousehold(null); setSelf(null); setDataLoading(true); await loadMembership(); } };
   const receiptRow = (expense: Expense) => {
     const payer = members.find((member) => member.id === expense.payerId) ?? self; const isOpen = !expense.settled && swipedId === expense.id;
     return <div className={`swipe-shell ${expense.settled || !isAdmin ? 'swipe-disabled' : ''}`} key={expense.id}>{!expense.settled && isAdmin && <button className="swipe-delete" onClick={() => requestDelete(expense)} aria-label={`Delete ${expense.merchant}`}><Trash2 size={19} /><span>Delete</span></button>}<button className={`receipt-row ${isOpen ? 'receipt-row-swiped' : ''}`} onTouchStart={(event) => { touchStart.current = event.touches[0].clientX; }} onTouchEnd={(event) => { if (expense.settled || !isAdmin) return; const distance = event.changedTouches[0].clientX - touchStart.current; if (distance < -45) setSwipedId(expense.id); if (distance > 35) setSwipedId(null); }} onClick={() => { if (isOpen) setSwipedId(null); else openDetail(expense); }}><div className="receipt-thumb">{expense.image ? <img src={expense.image} alt="" /> : <ReceiptText size={21} />}</div><div className="receipt-main"><h3>{expense.merchant}{receiptFlags.some((flag) => flag.expense_id === expense.id) && <span className="flag-pill">Check</span>}</h3><p>{expense.syncStatus ? 'Waiting to sync' : `${expense.category} · ${new Date(`${expense.receiptDate}T00:00:00`).toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })}`}</p></div><div className="receipt-amount"><strong>{money.format(expense.amount)}</strong><span>{payer && <i style={{ background: payer.color }} />}{expense.payerName}</span></div><ChevronRight size={17} className="row-chevron" /></button></div>;
@@ -474,7 +485,7 @@ export default function HomePage() {
 
   if (authLoading) return <main className="loading-screen"><img className="brand-logo loading-logo" src="/app-icon.svg" alt="SplitMate" /><span className="loader" /><p>Opening SplitMate…</p></main>;
   if (!user) return <AuthScreen />;
-  if (loading) return <main className="loading-screen"><img className="brand-logo loading-logo" src="/app-icon.svg" alt="SplitMate" /><span className="loader" /><p>Loading your household…</p></main>;
+  if (loading || (household && self && dataLoading)) return <main className="loading-screen"><img className="brand-logo loading-logo" src="/app-icon.svg" alt="SplitMate" /><span className="loader" /><p>Loading your household…</p></main>;
   if (!household || !self) return <HouseholdSetup user={user} onReady={() => void loadMembership()} />;
 
   return <main className="app-shell">
