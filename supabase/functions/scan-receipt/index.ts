@@ -3,6 +3,11 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+declare const Deno: {
+  env: { get: (name: string) => string | undefined };
+  serve: (handler: (request: Request) => Response | Promise<Response>) => void;
+};
+
 const categories = ['Groceries', 'Utilities', 'Household', 'Dining', 'Other'];
 
 Deno.serve(async (request) => {
@@ -13,9 +18,9 @@ Deno.serve(async (request) => {
   try {
     const apiKey = Deno.env.get('GEMINI_API_KEY');
     if (!apiKey) throw new Error('Receipt scanning is not configured yet.');
-    const { imageBase64, mimeType } = await request.json();
+    const { imageBase64, mimeType } = await request.json() as { imageBase64?: string; mimeType?: string };
     if (typeof imageBase64 !== 'string' || imageBase64.length < 20 || imageBase64.length > 14_000_000) throw new Error('Please choose a receipt image under 10 MB.');
-    if (!['image/jpeg', 'image/png', 'image/webp'].includes(mimeType)) throw new Error('Please choose a JPG, PNG, or WebP image.');
+    if (typeof mimeType !== 'string' || !['image/jpeg', 'image/png', 'image/webp'].includes(mimeType)) throw new Error('Please choose a JPG, PNG, or WebP image.');
 
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.7-flash:generateContent?key=${apiKey}`, {
       method: 'POST',
@@ -42,7 +47,7 @@ Deno.serve(async (request) => {
       }),
     });
     if (!response.ok) throw new Error('The OCR service could not read this receipt.');
-    const result = await response.json();
+    const result = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
     const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!text) throw new Error('No receipt details were found.');
     const parsed = JSON.parse(text);
