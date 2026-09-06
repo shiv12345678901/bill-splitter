@@ -223,6 +223,12 @@ export default function HomePage() {
     else document.documentElement.dataset.theme = theme;
   }, [theme]);
   useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [tab]);
+  useEffect(() => {
     if (!sheetOpen && !confirmDelete) return;
     const scrollY = window.scrollY;
     const previous = { overflow: document.body.style.overflow, position: document.body.style.position, top: document.body.style.top, width: document.body.style.width };
