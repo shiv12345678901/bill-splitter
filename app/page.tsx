@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowRight, Camera, Check, ChevronRight, Copy, Home, ImagePlus, LogOut, Mail, ReceiptText, RefreshCw, Search, Share2, Trash2, Users, WifiOff, X } from 'lucide-react';
+import { ArrowRight, Camera, Check, ChevronRight, Copy, Fingerprint, Home, ImagePlus, LogOut, Mail, ReceiptText, RefreshCw, Search, Share2, ShieldCheck, Trash2, Users, WifiOff, X } from 'lucide-react';
 import type { User } from '@supabase/supabase-js';
 import { supabase, supabaseConfigured } from '@/lib/supabase';
 import { fileToBase64, prepareReceiptImage } from '@/lib/receipt-image';
@@ -32,10 +32,11 @@ function Avatar({ member, small = false }: { member: Member; small?: boolean }) 
 
 function AuthScreen() {
   const [mode, setMode] = useState<'signin' | 'signup'>('signin');
-  const [email, setEmail] = useState('');
+  const [emailName, setEmailName] = useState('');
   const [password, setPassword] = useState('');
   const [status, setStatus] = useState('');
   const [busy, setBusy] = useState(false);
+  const email = `${emailName.trim()}@gmail.com`;
   const submit = async (event: React.SyntheticEvent<HTMLFormElement>) => {
     event.preventDefault(); setBusy(true); setStatus('');
     const result = mode === 'signin' ? await supabase.auth.signInWithPassword({ email, password }) : await supabase.auth.signUp({ email, password, options: { emailRedirectTo: window.location.origin } });
@@ -43,11 +44,18 @@ function AuthScreen() {
     if (result.error) setStatus(result.error.message); else if (mode === 'signup' && !result.data.session) setStatus('Check your email to confirm your account.');
   };
   const resetPassword = async () => {
-    if (!email) { setStatus('Enter your email address first.'); return; }
+    if (!emailName.trim()) { setStatus('Enter your Gmail username first.'); return; }
     const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin });
     setStatus(error?.message ?? 'Password reset link sent.');
   };
-  return <main className="auth-shell"><section className="auth-card"><div className="auth-mark"><ReceiptText size={27} /></div><p className="eyebrow">SplitMate</p><h1>Household bills,<br />sorted.</h1><p className="auth-copy">Private receipts, automatic fair shares, and clear settlements.</p>{!supabaseConfigured ? <div className="auth-alert">Supabase is not connected yet.</div> : <form onSubmit={submit} className="auth-form"><label className="auth-field"><Mail size={18} /><input aria-label="Email address" required type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="Email address" /></label><label className="auth-field"><input aria-label="Password" required minLength={6} type="password" autoComplete={mode === 'signin' ? 'current-password' : 'new-password'} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" /></label>{status && <output className="auth-alert">{status}</output>}<button disabled={busy} className="primary-button">{busy ? 'Please wait…' : mode === 'signin' ? 'Sign in' : 'Create account'} <ArrowRight size={17} /></button></form>}<button onClick={() => { setMode(mode === 'signin' ? 'signup' : 'signin'); setStatus(''); }} className="text-button">{mode === 'signin' ? 'Create an account' : 'Already have an account? Sign in'}</button>{mode === 'signin' && <button onClick={() => void resetPassword()} className="text-button muted">Forgot password?</button>}</section></main>;
+  const passkeySignIn = async () => {
+    setBusy(true); setStatus('');
+    try { const result = await supabase.auth.signInWithPasskey(); if (result.error) setStatus(result.error.message); }
+    catch (passkeyError) { setStatus(passkeyError instanceof Error ? passkeyError.message : 'Passkey sign-in was cancelled.'); }
+    finally { setBusy(false); }
+  };
+  const updateEmailName = (value: string) => setEmailName(value.trim().replace(/@gmail\.com$/i, '').replace(/@.*$/, ''));
+  return <main className="auth-shell"><section className="auth-card intro-card"><img className="brand-logo" src="/app-icon.svg" alt="SplitMate" /><p className="eyebrow">SplitMate</p><h1>Scan. Split.<br />Settle.</h1><p className="auth-copy">The private household bill app designed to feel at home on your iPhone.</p><div className="intro-points"><span><ImagePlus size={17} /> Scan bills from Photos</span><span><Users size={17} /> Share every cost equally</span><span><ShieldCheck size={17} /> Private and securely synced</span></div>{!supabaseConfigured ? <div className="auth-alert">Supabase is not connected yet.</div> : <><form onSubmit={submit} className="auth-form"><label className="auth-field gmail-field"><Mail size={18} /><input aria-label="Gmail username" required type="text" inputMode="email" autoComplete="username" value={emailName} onChange={(event) => updateEmailName(event.target.value)} placeholder="yourname" /><span>@gmail.com</span></label><label className="auth-field"><input aria-label="Password" required minLength={6} type="password" autoComplete={mode === 'signin' ? 'current-password' : 'new-password'} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" /></label>{status && <output className="auth-alert">{status}</output>}<button disabled={busy} className="primary-button">{busy ? 'Please wait…' : mode === 'signin' ? 'Sign in' : 'Create account'} <ArrowRight size={17} /></button></form>{mode === 'signin' && typeof PublicKeyCredential !== 'undefined' && <><div className="auth-divider"><span />or<span /></div><button disabled={busy} onClick={() => void passkeySignIn()} className="passkey-button"><Fingerprint size={21} /> Use Face ID or passkey</button></>}</>}<button onClick={() => { setMode(mode === 'signin' ? 'signup' : 'signin'); setStatus(''); }} className="text-button">{mode === 'signin' ? 'Create an account' : 'Already have an account? Sign in'}</button>{mode === 'signin' && <button onClick={() => void resetPassword()} className="text-button muted">Forgot password?</button>}</section></main>;
 }
 
 function HouseholdSetup({ user, onReady }: { user: User; onReady: () => void }) {
@@ -84,6 +92,7 @@ export default function HomePage() {
   const [draft, setDraft] = useState<Draft>(blankDraft);
   const [analyzing, setAnalyzing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [passkeyBusy, setPasskeyBusy] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
   const [swipedId, setSwipedId] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -100,19 +109,25 @@ export default function HomePage() {
 
   const loadMembership = useCallback(async () => {
     if (!user) return;
-    setLoading(true); setError('');
-    const memberResult = await supabase.from('household_members').select('*').eq('user_id', user.id).limit(1).maybeSingle();
+    const cached = window.localStorage.getItem(`splitmate-membership:${user.id}`);
+    if (cached) {
+      const parsed = JSON.parse(cached) as { self: Member; household: Household };
+      setSelf(parsed.self); setHousehold(parsed.household); setLoading(false);
+    } else setLoading(true);
+    setError('');
+    const memberResult = await supabase.from('household_members').select('*,households(id,name,join_code)').eq('user_id', user.id).limit(1).maybeSingle();
     if (memberResult.error) {
-      const cached = window.localStorage.getItem(`splitmate-membership:${user.id}`);
       if (cached && !navigator.onLine) { const parsed = JSON.parse(cached) as { self: Member; household: Household }; setSelf(parsed.self); setHousehold(parsed.household); }
       else setError(memberResult.error.message);
       setLoading(false); return;
     }
-    if (!memberResult.data) { setSelf(null); setHousehold(null); setLoading(false); return; }
-    const householdResult = await supabase.from('households').select('*').eq('id', memberResult.data.household_id).single();
-    if (householdResult.error) { setError(householdResult.error.message); setLoading(false); return; }
-    setSelf(memberResult.data as Member); setHousehold(householdResult.data as Household);
-    window.localStorage.setItem(`splitmate-membership:${user.id}`, JSON.stringify({ self: memberResult.data, household: householdResult.data }));
+    if (!memberResult.data) { window.localStorage.removeItem(`splitmate-membership:${user.id}`); setSelf(null); setHousehold(null); setLoading(false); return; }
+    const rawMember = memberResult.data as Member & { households: Household | Household[] };
+    const loadedHousehold = Array.isArray(rawMember.households) ? rawMember.households[0] : rawMember.households;
+    const { households: _households, ...loadedMember } = rawMember;
+    if (!loadedHousehold) { setError('Household could not be loaded.'); setLoading(false); return; }
+    setSelf(loadedMember); setHousehold(loadedHousehold);
+    window.localStorage.setItem(`splitmate-membership:${user.id}`, JSON.stringify({ self: loadedMember, household: loadedHousehold }));
     setLoading(false);
   }, [user]);
 
@@ -239,6 +254,14 @@ export default function HomePage() {
   };
   const settleCycle = async () => { if (!household || !activeExpenses.length) return; setSaving(true); const result = await supabase.rpc('settle_household', { target_household: household.id, transfer_summary: transfers }); setSaving(false); if (result.error) notify(result.error.message); else { setRefreshKey((value) => value + 1); notify('Cycle settled'); } };
   const shareSettlement = async () => { const text = `${household?.name ?? 'Household'} settlement\n${transfers.length ? transfers.map((transfer) => `${transfer.from} pays ${transfer.to} ${money.format(transfer.amount)}`).join('\n') : 'Everyone is even.'}`; if (navigator.share) await navigator.share({ title: 'SplitMate settlement', text }); else { await navigator.clipboard.writeText(text); notify('Settlement copied'); } };
+  const registerPasskey = async () => {
+    setPasskeyBusy(true);
+    try {
+      const result = await supabase.auth.registerPasskey();
+      if (result.error) notify(result.error.message); else notify('Face ID or passkey is ready');
+    } catch (passkeyError) { notify(passkeyError instanceof Error ? passkeyError.message : 'Passkey setup was cancelled'); }
+    finally { setPasskeyBusy(false); }
+  };
   const receiptRow = (expense: Expense) => {
     const payer = members.find((member) => member.id === expense.payerId) ?? self; const isOpen = !expense.settled && swipedId === expense.id;
     return <div className={`swipe-shell ${expense.settled ? 'swipe-disabled' : ''}`} key={expense.id}>{!expense.settled && <button className="swipe-delete" onClick={() => void deleteExpense(expense)} aria-label={`Delete ${expense.merchant}`}><Trash2 size={19} /><span>Delete</span></button>}<button className={`receipt-row ${isOpen ? 'receipt-row-swiped' : ''}`} onTouchStart={(event) => { touchStart.current = event.touches[0].clientX; }} onTouchEnd={(event) => { if (expense.settled) return; const distance = event.changedTouches[0].clientX - touchStart.current; if (distance < -45) setSwipedId(expense.id); if (distance > 35) setSwipedId(null); }} onClick={() => { if (isOpen) setSwipedId(null); else openDetail(expense); }}><div className="receipt-thumb">{expense.image ? <img src={expense.image} alt="" /> : <ReceiptText size={21} />}</div><div className="receipt-main"><h3>{expense.merchant}</h3><p>{expense.category} · {new Date(`${expense.receiptDate}T00:00:00`).toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })}</p></div><div className="receipt-amount"><strong>{money.format(expense.amount)}</strong><span>{payer && <i style={{ background: payer.color }} />}{expense.payerName}</span></div><ChevronRight size={17} className="row-chevron" /></button></div>;
@@ -251,9 +274,9 @@ export default function HomePage() {
     return () => lifecycle.abort();
   }, [openUpload]);
 
-  if (authLoading) return <main className="loading-screen"><div className="auth-mark"><ReceiptText size={27} /></div><span className="loader" /><p>Opening SplitMate…</p></main>;
+  if (authLoading) return <main className="loading-screen"><img className="brand-logo loading-logo" src="/app-icon.svg" alt="SplitMate" /><span className="loader" /><p>Opening SplitMate…</p></main>;
   if (!user) return <AuthScreen />;
-  if (loading) return <main className="loading-screen"><div className="auth-mark"><ReceiptText size={27} /></div><span className="loader" /><p>Loading your household…</p></main>;
+  if (loading) return <main className="loading-screen"><img className="brand-logo loading-logo" src="/app-icon.svg" alt="SplitMate" /><span className="loader" /><p>Loading your household…</p></main>;
   if (!household || !self) return <HouseholdSetup user={user} onReady={() => void loadMembership()} />;
 
   return <main className="app-shell">
@@ -263,7 +286,7 @@ export default function HomePage() {
     <div className="app-frame"><header className="topbar"><div><p>{household.name}</p><h1>{tab === 'home' ? greeting : tab === 'receipts' ? 'Receipts' : 'Household'}</h1></div><button onClick={openUpload} className="circle-button" aria-label="Choose bill from Photos"><ImagePlus size={21} /></button></header>{error && <div className="error-banner"><span>{error}</span><button onClick={() => setRefreshKey((value) => value + 1)}>Retry</button></div>}
       {tab === 'home' && <div className="content-grid"><section className="stack"><div className="balance-card"><p>{cycleLabel}</p><strong>{money.format(total)}</strong><span>{money.format(share)} each · {activeExpenses.length} receipts</span><div className="member-stack">{members.map((member) => <Avatar key={member.id} member={member} small />)}</div></div><div className="source-actions"><button className="capture-button" onClick={openUpload}><ImagePlus size={22} /><span><strong>Choose bill from Photos</strong><small>Scanning image fills in the details</small></span><ChevronRight size={20} /></button><button className="camera-button" onClick={openCamera}><Camera size={18} /> Scan with camera</button></div><section><div className="section-heading"><h2>Recent receipts</h2><button onClick={() => setTab('receipts')}>See all</button></div><div className="list-card">{activeExpenses.length ? activeExpenses.slice(0, 5).map(receiptRow) : <div className="empty-state"><ReceiptText /><strong>No bills this cycle</strong><p>Choose one from Photos to get started.</p></div>}</div></section></section><section className="stack"><div className="section-heading"><h2>Settle up</h2><span>{members.length} people</span></div><div className="settlement-card">{!activeExpenses.length ? <div className="empty-state compact"><Check /><strong>Everything is settled</strong></div> : transfers.length ? transfers.map((transfer) => <div className="transfer-row" key={`${transfer.fromId}-${transfer.toId}`}><span><strong>{transfer.from}</strong> pays {transfer.to}</span><b>{money.format(transfer.amount)}</b></div>) : <div className="empty-state compact"><Check /><strong>Everyone is even</strong></div>}<div className="settlement-actions"><button disabled={!activeExpenses.length || saving} onClick={() => void shareSettlement()}><Share2 size={18} /> Share</button><button disabled={!activeExpenses.length || saving} onClick={() => void settleCycle()}><Check size={18} /> {saving ? 'Saving…' : 'Mark settled'}</button></div></div>{cycles.length > 0 && <section><div className="section-heading"><h2>Settlement history</h2></div><div className="list-card">{cycles.slice(0, 4).map((cycle) => <div className="history-row expanded" key={cycle.id}><div><strong>{new Date(cycle.settled_at).toLocaleDateString('en-AU', { day: 'numeric', month: 'long', year: 'numeric' })}</strong><span>{cycle.member_count} people · {cycle.transfers.length} transfers</span>{cycle.transfers.map((transfer) => <small key={`${transfer.fromId}-${transfer.toId}`}>{transfer.from} → {transfer.to} · {money.format(transfer.amount)}</small>)}</div><b>{money.format(cycle.total_amount)}</b></div>)}</div></section>}</section></div>}
       {tab === 'receipts' && <section className="single-column"><label className="search-field"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search merchant, category or person" /></label><div className="segmented"><button className={receiptFilter === 'active' ? 'selected' : ''} onClick={() => setReceiptFilter('active')}>Current</button><button className={receiptFilter === 'settled' ? 'selected' : ''} onClick={() => setReceiptFilter('settled')}>History</button></div><div className="list-card">{filteredExpenses.length ? filteredExpenses.map(receiptRow) : <div className="empty-state"><Search /><strong>No matching receipts</strong><p>Try a different search.</p></div>}</div></section>}
-      {tab === 'household' && <section className="single-column"><div className="invite-card"><div><p>Invite code</p><strong>{household.join_code}</strong><span>Share this code after someone creates an account.</span></div><button onClick={async () => { await navigator.clipboard.writeText(household.join_code); notify('Join code copied'); }}><Copy size={18} /> Copy</button></div><div className="section-heading"><h2>Members</h2><span>Every bill is split equally</span></div><div className="list-card">{members.map((member) => <div className="member-row" key={member.id}><Avatar member={member} /><div><strong>{member.name}</strong><span>{member.user_id === self.user_id ? 'You' : 'Household member'}</span></div></div>)}</div><button className="signout-button" onClick={() => void supabase.auth.signOut()}><LogOut size={18} /> Sign out</button></section>}
+      {tab === 'household' && <section className="single-column"><div className="invite-card"><div><p>Invite code</p><strong>{household.join_code}</strong><span>Share this code after someone creates an account.</span></div><button onClick={async () => { await navigator.clipboard.writeText(household.join_code); notify('Join code copied'); }}><Copy size={18} /> Copy</button></div><div className="section-heading"><h2>Members</h2><span>Every bill is split equally</span></div><div className="list-card">{members.map((member) => <div className="member-row" key={member.id}><Avatar member={member} /><div><strong>{member.name}</strong><span>{member.user_id === self.user_id ? 'You' : 'Household member'}</span></div></div>)}</div>{typeof PublicKeyCredential !== 'undefined' && <button className="security-card" disabled={passkeyBusy} onClick={() => void registerPasskey()}><span><Fingerprint size={23} /></span><div><strong>{passkeyBusy ? 'Opening security check…' : 'Set up Face ID or passkey'}</strong><small>Sign in next time without typing your password.</small></div><ChevronRight size={18} /></button>}<button className="signout-button" onClick={() => void supabase.auth.signOut()}><LogOut size={18} /> Sign out</button></section>}
     </div>
     <nav className="bottom-nav" aria-label="Primary navigation"><button className={tab === 'home' ? 'active' : ''} onClick={() => setTab('home')}><Home size={21} /><span>Home</span></button><button className={tab === 'receipts' ? 'active' : ''} onClick={() => setTab('receipts')}><ReceiptText size={21} /><span>Receipts</span></button><button className={tab === 'household' ? 'active' : ''} onClick={() => setTab('household')}><Users size={21} /><span>Household</span></button></nav>
     {sheetOpen && <div className="sheet-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) closeEditor(); }}><dialog open className="receipt-sheet" aria-labelledby="receipt-title"><div className="grabber" /><header><button className="sheet-close" onClick={closeEditor} disabled={saving}><X /></button><div><p>{detail ? 'Receipt details' : analyzing ? 'Scanning image' : 'Review details'}</p><h2 id="receipt-title">{detail?.settled ? 'Settled receipt' : detail ? 'Edit receipt' : 'New receipt'}</h2></div>{detail && !detail.settled ? <button className="sheet-delete" onClick={() => void deleteExpense(detail)}><Trash2 size={18} /> Delete</button> : <span />}</header>{draft.image && <img className="receipt-preview" src={draft.image} alt="Selected receipt" />}{analyzing && <div className="scan-status"><span className="loader small" />Scanning image…</div>}{draft.duplicate && <div className="warning-banner">This looks like a receipt already saved.</div>}<div className="editor-fields"><label className="field-label">Merchant<input disabled={detail?.settled} className="field-input" value={draft.merchant} onChange={(event) => setDraft({ ...draft, merchant: event.target.value })} /></label><div className="two-columns"><label className="field-label">Total (AUD)<input disabled={detail?.settled} className="field-input" inputMode="decimal" value={draft.amount} onChange={(event) => setDraft({ ...draft, amount: event.target.value })} /></label><label className="field-label">Category<select disabled={detail?.settled} className="field-input" value={draft.category} onChange={(event) => setDraft({ ...draft, category: event.target.value })}>{categories.map((category) => <option key={category}>{category}</option>)}</select></label></div><div className="two-columns"><label className="field-label">Receipt date<input disabled={detail?.settled} className="field-input" type="date" value={draft.receiptDate} onChange={(event) => setDraft({ ...draft, receiptDate: event.target.value })} /></label><label className="field-label">Paid by<select disabled={detail?.settled} className="field-input" value={draft.payerId} onChange={(event) => setDraft({ ...draft, payerId: event.target.value })}>{members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label></div><p className="privacy-note">Scanning sends this image securely to the receipt-reading service. All household members share the expense equally.</p>{detail?.settled ? <div className="settled-note"><Check size={17} /> Included in a completed settlement</div> : <>{(draft.file || detail?.imagePath) && <button className="rescan-button" disabled={analyzing || saving} onClick={() => void rescanDetail()}><RefreshCw size={17} /> Scan image again</button>}<button className="primary-button" disabled={analyzing || saving || !draft.payerId || !draft.merchant.trim() || !(Number(draft.amount) > 0)} onClick={() => void saveExpense()}>{saving ? 'Saving…' : detail ? 'Save changes' : 'Add receipt'} {!saving && <ArrowRight size={18} />}</button></>}</div></dialog></div>}

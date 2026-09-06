@@ -1,5 +1,5 @@
 const CACHE = 'splitmate-shell-v2';
-const SHELL = ['/', '/manifest.webmanifest', '/app-icon.svg', '/apple-touch-icon.png', '/icon-192.png', '/icon-512.png'];
+const SHELL = ['/', '/manifest.webmanifest', '/app-icon.svg', '/apple-touch-icon.png', '/icon-192.png', '/icon-512.png', '/icon-1024.png'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting()));
