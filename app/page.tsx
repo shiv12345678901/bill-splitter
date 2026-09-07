@@ -40,7 +40,10 @@ import {
 import { AuthScreen } from '@/components/splitmate/auth-screen';
 import { HouseholdSetup } from '@/components/splitmate/household-setup';
 import { HomeView } from '@/components/splitmate/home-view';
-import { ReceiptsView } from '@/components/splitmate/receipts-view';
+import {
+  ReceiptsView,
+  type ReceiptFilters,
+} from '@/components/splitmate/receipts-view';
 import { HouseholdView } from '@/components/splitmate/household-view';
 import { SettingsView } from '@/components/splitmate/settings-view';
 import {
@@ -50,10 +53,12 @@ import {
 import { ReceiptRow } from '@/components/splitmate/receipt-row';
 import {
   AppToast,
+  CustomSettlementDialog,
   DeleteConfirmation,
   SettlementReview,
 } from '@/components/splitmate/app-overlays';
 import { ReceiptEditor } from '@/components/splitmate/receipt-editor';
+import { userError } from '@/lib/user-error';
 
 declare global {
   interface Document {
@@ -67,6 +72,13 @@ declare global {
 }
 
 const InsightsView = lazy(() => import('./insights-view'));
+const emptyReceiptFilters: ReceiptFilters = {
+  category: '',
+  memberId: '',
+  from: '',
+  to: '',
+  sort: 'newest',
+};
 
 export default function HomePage() {
   const [user, setUser] = useState<User | null>(null);
@@ -95,6 +107,10 @@ export default function HomePage() {
     'active',
   );
   const [search, setSearch] = useState('');
+  const [receiptFilters, setReceiptFilters] =
+    useState<ReceiptFilters>(emptyReceiptFilters);
+  const [visibleReceipts, setVisibleReceipts] = useState(30);
+  const [receiptFetchLimit, setReceiptFetchLimit] = useState(200);
   const [loading, setLoading] = useState(true);
   const [dataLoading, setDataLoading] = useState(true);
   const [error, setError] = useState('');
@@ -105,6 +121,14 @@ export default function HomePage() {
   const [sheetExpanded, setSheetExpanded] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<Expense | null>(null);
   const [settlementReview, setSettlementReview] = useState(false);
+  const [customSettlementOpen, setCustomSettlementOpen] = useState(false);
+  const [rangeStart, setRangeStart] = useState('');
+  const [rangeEnd, setRangeEnd] = useState('');
+  const [customSettlement, setCustomSettlement] = useState<{
+    start: string;
+    end: string;
+  } | null>(null);
+  const [savedDraftAvailable, setSavedDraftAvailable] = useState(false);
   const [deletingAccount, setDeletingAccount] = useState(false);
   const [detail, setDetail] = useState<Expense | null>(null);
   const [draft, setDraft] = useState<Draft>(blankDraft);
@@ -173,7 +197,10 @@ export default function HomePage() {
         };
         setSelf(parsed.self);
         setHousehold(parsed.household);
-      } else setError(memberResult.error.message);
+      } else
+        setError(
+          userError(memberResult.error, 'Could not load your household.'),
+        );
       setLoading(false);
       return;
     }
@@ -253,7 +280,7 @@ export default function HomePage() {
         .eq('household_id', household.id)
         .is('deleted_at', null)
         .order('receipt_date', { ascending: false })
-        .limit(200),
+        .limit(receiptFetchLimit),
       supabase
         .from('settlement_cycles')
         .select('*')
@@ -295,7 +322,8 @@ export default function HomePage() {
         setMembers(parsed.members);
         setExpenses(parsed.expenses);
         setCycles(parsed.cycles);
-      } else setError(firstError.message);
+      } else
+        setError(userError(firstError, 'Could not refresh the household.'));
       setDataLoading(false);
       return;
     }
@@ -367,89 +395,101 @@ export default function HomePage() {
       if (!storageResult.error)
         await supabase.from('expenses').delete().eq('id', row.id);
     }
-  }, [household, online]);
+  }, [household, online, receiptFetchLimit]);
 
-  const syncOfflineReceipts = useCallback(async () => {
-    if (!online || !user || !household) return;
-    const queued = (await getOfflineReceipts()).filter(
-      (receipt) =>
-        receipt.userId === user.id && receipt.householdId === household.id,
-    );
-    let synced = 0;
-    let failed = 0;
-    for (const receipt of queued) {
-      let imagePath: string | null = null;
-      if (receipt.file) {
-        imagePath = `${user.id}/${receipt.id}.jpg`;
-        const upload = await supabase.storage
-          .from('receipts')
-          .upload(imagePath, receipt.file, {
-            contentType: 'image/jpeg',
-            upsert: false,
-          });
-        if (
-          upload.error &&
-          !upload.error.message.toLowerCase().includes('exist')
-        ) {
+  const syncOfflineReceipts = useCallback(
+    async (targetId?: string) => {
+      if (!online || !user || !household) return;
+      const queued = (await getOfflineReceipts())
+        .filter(
+          (receipt) =>
+            receipt.userId === user.id && receipt.householdId === household.id,
+        )
+        .filter((receipt) => !targetId || receipt.id === targetId);
+      let synced = 0;
+      let failed = 0;
+      const failures = new Map<string, string>();
+      for (const receipt of queued) {
+        let imagePath: string | null = null;
+        if (receipt.file) {
+          imagePath = `${user.id}/${receipt.id}.jpg`;
+          const upload = await supabase.storage
+            .from('receipts')
+            .upload(imagePath, receipt.file, {
+              contentType: 'image/jpeg',
+              upsert: false,
+            });
+          if (
+            upload.error &&
+            !upload.error.message.toLowerCase().includes('exist')
+          ) {
+            failed += 1;
+            failures.set(receipt.id, upload.error.message);
+            await saveOfflineReceipt({
+              ...receipt,
+              attempts: (receipt.attempts ?? 0) + 1,
+              syncError: upload.error.message,
+            });
+            continue;
+          }
+        }
+        const result = await supabase.from('expenses').insert({
+          id: receipt.id,
+          user_id: user.id,
+          household_id: household.id,
+          payer_member_id: receipt.payerId,
+          payer: receipt.payerName,
+          merchant: receipt.merchant,
+          amount: receipt.amount,
+          category: receipt.category,
+          notes: receipt.notes || null,
+          receipt_date: receipt.receiptDate,
+          currency: 'AUD',
+          image_path: imagePath,
+          image_original_name: receipt.file?.name ?? null,
+          image_mime_type: receipt.file?.type ?? null,
+          image_size_bytes: receipt.file?.size ?? null,
+          ocr_status: 'manual',
+          verified_at: receipt.createdAt,
+        });
+        if (result.error && result.error.code !== '23505') {
+          if (imagePath)
+            await supabase.storage.from('receipts').remove([imagePath]);
           failed += 1;
+          failures.set(receipt.id, result.error.message);
           await saveOfflineReceipt({
             ...receipt,
             attempts: (receipt.attempts ?? 0) + 1,
-            syncError: upload.error.message,
+            syncError: result.error.message,
           });
           continue;
         }
+        await removeOfflineReceipt(receipt.id);
+        synced += 1;
       }
-      const result = await supabase.from('expenses').insert({
-        id: receipt.id,
-        user_id: user.id,
-        household_id: household.id,
-        payer_member_id: receipt.payerId,
-        payer: receipt.payerName,
-        merchant: receipt.merchant,
-        amount: receipt.amount,
-        category: receipt.category,
-        notes: receipt.notes || null,
-        receipt_date: receipt.receiptDate,
-        currency: 'AUD',
-        image_path: imagePath,
-        image_original_name: receipt.file?.name ?? null,
-        image_mime_type: receipt.file?.type ?? null,
-        image_size_bytes: receipt.file?.size ?? null,
-        ocr_status: 'manual',
-        verified_at: receipt.createdAt,
-      });
-      if (result.error && result.error.code !== '23505') {
-        if (imagePath)
-          await supabase.storage.from('receipts').remove([imagePath]);
-        failed += 1;
-        await saveOfflineReceipt({
-          ...receipt,
-          attempts: (receipt.attempts ?? 0) + 1,
-          syncError: result.error.message,
-        });
-        continue;
+      if (synced) {
+        setRefreshKey((value) => value + 1);
+        notify(`${synced} offline receipt${synced === 1 ? '' : 's'} synced`);
       }
-      await removeOfflineReceipt(receipt.id);
-      synced += 1;
-    }
-    if (synced) {
-      setRefreshKey((value) => value + 1);
-      notify(`${synced} offline receipt${synced === 1 ? '' : 's'} synced`);
-    }
-    if (failed) {
-      setExpenses((current) =>
-        current.map((expense) =>
-          queued.some((receipt) => receipt.id === expense.id)
-            ? { ...expense, syncStatus: 'failed' }
-            : expense,
-        ),
-      );
-      notify(
-        `${failed} receipt${failed === 1 ? '' : 's'} could not sync · tap Retry`,
-      );
-    }
-  }, [online, user, household, notify]);
+      if (failed) {
+        setExpenses((current) =>
+          current.map((expense) =>
+            failures.has(expense.id)
+              ? {
+                  ...expense,
+                  syncStatus: 'failed',
+                  syncError: failures.get(expense.id),
+                }
+              : expense,
+          ),
+        );
+        notify(
+          `${failed} receipt${failed === 1 ? '' : 's'} could not sync · tap Retry`,
+        );
+      }
+    },
+    [online, user, household, notify],
+  );
 
   useEffect(() => {
     void supabase.auth.getSession().then(({ data }) => {
@@ -480,13 +520,49 @@ export default function HomePage() {
     else document.documentElement.dataset.theme = theme;
   }, [theme]);
   useEffect(() => {
+    if (!user) return;
+    queueMicrotask(() =>
+      setSavedDraftAvailable(
+        Boolean(window.localStorage.getItem(`splitmate-draft:${user.id}`)),
+      ),
+    );
+  }, [user]);
+  useEffect(() => {
+    if (
+      !user ||
+      !sheetOpen ||
+      detail ||
+      (!draft.merchant.trim() && !draft.amount && !draft.notes.trim())
+    )
+      return;
+    const saved = {
+      merchant: draft.merchant,
+      amount: draft.amount,
+      category: draft.category,
+      receiptDate: draft.receiptDate,
+      payerId: draft.payerId,
+      notes: draft.notes,
+    };
+    window.localStorage.setItem(
+      `splitmate-draft:${user.id}`,
+      JSON.stringify(saved),
+    );
+    queueMicrotask(() => setSavedDraftAvailable(true));
+  }, [user, sheetOpen, detail, draft]);
+  useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
       window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
     });
     return () => window.cancelAnimationFrame(frame);
   }, [tab]);
   useEffect(() => {
-    if (!sheetOpen && !confirmDelete && !settlementReview) return;
+    if (
+      !sheetOpen &&
+      !confirmDelete &&
+      !settlementReview &&
+      !customSettlementOpen
+    )
+      return;
     const scrollY = window.scrollY;
     const previous = {
       overflow: document.body.style.overflow,
@@ -504,7 +580,7 @@ export default function HomePage() {
       Object.assign(document.body.style, previous);
       window.scrollTo(0, scrollY);
     };
-  }, [sheetOpen, confirmDelete, settlementReview]);
+  }, [sheetOpen, confirmDelete, settlementReview, customSettlementOpen]);
   useEffect(() => {
     const goOnline = () => {
       setOnline(true);
@@ -570,6 +646,7 @@ export default function HomePage() {
             ocrStatus: 'offline',
             notes: receipt.notes,
             syncStatus: receipt.syncError ? 'failed' : 'pending',
+            syncError: receipt.syncError,
           }),
         );
       setExpenses((current) => [
@@ -684,17 +761,65 @@ export default function HomePage() {
       ),
     [members, activeExpenses],
   );
-  const filteredExpenses = useMemo(
+  const settlementExpenses = useMemo(
     () =>
-      expenses.filter(
-        (expense) =>
-          expense.settled === (receiptFilter === 'settled') &&
-          `${expense.merchant} ${expense.category} ${expense.payerName} ${expense.notes ?? ''}`
-            .toLowerCase()
-            .includes(search.trim().toLowerCase()),
-      ),
-    [expenses, receiptFilter, search],
+      customSettlement
+        ? activeExpenses.filter(
+            (expense) =>
+              expense.receiptDate >= customSettlement.start &&
+              expense.receiptDate <= customSettlement.end,
+          )
+        : activeExpenses,
+    [activeExpenses, customSettlement],
   );
+  const settlementTotal = useMemo(
+    () => settlementExpenses.reduce((sum, expense) => sum + expense.amount, 0),
+    [settlementExpenses],
+  );
+  const settlementTransfers = useMemo(
+    () =>
+      calculateTransfers(
+        members,
+        settlementExpenses.map((expense) => ({
+          amount: expense.amount,
+          payerId: expense.payerId,
+        })),
+      ),
+    [members, settlementExpenses],
+  );
+  const rangeExpenses = useMemo(
+    () =>
+      activeExpenses.filter(
+        (expense) =>
+          (!rangeStart || expense.receiptDate >= rangeStart) &&
+          (!rangeEnd || expense.receiptDate <= rangeEnd),
+      ),
+    [activeExpenses, rangeStart, rangeEnd],
+  );
+  const filteredExpenses = useMemo(() => {
+    const matches = expenses.filter(
+      (expense) =>
+        expense.settled === (receiptFilter === 'settled') &&
+        (!receiptFilters.category ||
+          expense.category === receiptFilters.category) &&
+        (!receiptFilters.memberId ||
+          expense.payerId === receiptFilters.memberId) &&
+        (!receiptFilters.from || expense.receiptDate >= receiptFilters.from) &&
+        (!receiptFilters.to || expense.receiptDate <= receiptFilters.to) &&
+        `${expense.merchant} ${expense.category} ${expense.payerName} ${expense.notes ?? ''}`
+          .toLowerCase()
+          .includes(search.trim().toLowerCase()),
+    );
+    return matches.sort((a, b) =>
+      receiptFilters.sort === 'highest'
+        ? b.amount - a.amount
+        : receiptFilters.sort === 'lowest'
+          ? a.amount - b.amount
+          : receiptFilters.sort === 'oldest'
+            ? a.receiptDate.localeCompare(b.receiptDate)
+            : b.receiptDate.localeCompare(a.receiptDate),
+    );
+  }, [expenses, receiptFilter, receiptFilters, search]);
   const allCategories = useMemo(
     () => [
       ...defaultCategories,
@@ -735,6 +860,10 @@ export default function HomePage() {
       void supabase.storage.from('receipts').remove([draft.imagePath]);
     }
     if (draft.image.startsWith('blob:')) URL.revokeObjectURL(draft.image);
+    if (keepUpload && user) {
+      window.localStorage.removeItem(`splitmate-draft:${user.id}`);
+      setSavedDraftAvailable(false);
+    }
     setSheetOpen(false);
     setSheetExpanded(false);
     setDetail(null);
@@ -787,6 +916,13 @@ export default function HomePage() {
             expense.merchant.toLowerCase() === merchant.toLowerCase() &&
             Math.abs(expense.amount - Number(amount)) < 0.01,
         ),
+        duplicateExpenseId:
+          expenses.find(
+            (expense) =>
+              expense.receiptDate === receiptDate &&
+              expense.merchant.toLowerCase() === merchant.toLowerCase() &&
+              Math.abs(expense.amount - Number(amount)) < 0.01,
+          )?.id ?? '',
       }));
     },
     [expenses],
@@ -926,6 +1062,24 @@ export default function HomePage() {
     setSheetExpanded(false);
     setSheetOpen(true);
   };
+  const resumeDraft = () => {
+    if (!user) return;
+    const saved = window.localStorage.getItem(`splitmate-draft:${user.id}`);
+    if (!saved) return;
+    try {
+      setDraft({
+        ...blankDraft(),
+        ...(JSON.parse(saved) as Partial<Draft>),
+        payerId:
+          (JSON.parse(saved) as Partial<Draft>).payerId || self?.id || '',
+      });
+      setDetail(null);
+      setSheetOpen(true);
+    } catch {
+      window.localStorage.removeItem(`splitmate-draft:${user.id}`);
+      setSavedDraftAvailable(false);
+    }
+  };
   const saveExpense = async () => {
     const amount = Number(draft.amount);
     if (
@@ -934,6 +1088,9 @@ export default function HomePage() {
       !draft.payerId ||
       !draft.merchant.trim() ||
       !(amount > 0) ||
+      amount > 999999.99 ||
+      !draft.receiptDate ||
+      draft.receiptDate > localDate() ||
       (detail && !isAdmin)
     )
       return;
@@ -1038,9 +1195,10 @@ export default function HomePage() {
           .delete()
           .eq('id', draft.scanJobId);
       notify(
-        saveError instanceof Error
-          ? saveError.message
-          : 'Could not save receipt',
+        userError(
+          saveError,
+          'Could not save receipt. Your draft is still safe.',
+        ),
       );
     } finally {
       setSaving(false);
@@ -1057,7 +1215,7 @@ export default function HomePage() {
       .from('receipts')
       .download(detail.imagePath);
     if (result.error) {
-      notify(result.error.message);
+      notify(userError(result.error));
       return;
     }
     await scanFile(
@@ -1098,7 +1256,7 @@ export default function HomePage() {
       .update({ deleted_at: new Date().toISOString() })
       .eq('id', expense.id);
     if (result.error) {
-      notify(result.error.message);
+      notify(userError(result.error));
       return;
     }
     setExpenses((current) => current.filter((item) => item.id !== expense.id));
@@ -1111,7 +1269,7 @@ export default function HomePage() {
         .from('expenses')
         .update({ deleted_at: null })
         .eq('id', expense.id);
-      if (restored.error) notify(restored.error.message);
+      if (restored.error) notify(userError(restored.error));
       else {
         setRefreshKey((value) => value + 1);
         notify('Receipt restored');
@@ -1125,17 +1283,50 @@ export default function HomePage() {
     setSwipedId(null);
     setConfirmDelete(expense);
   };
+  const openCustomSettlement = () => {
+    if (!activeExpenses.length) return;
+    const dates = activeExpenses.map((expense) => expense.receiptDate).sort();
+    setRangeStart(dates[0]);
+    setRangeEnd(dates[dates.length - 1]);
+    setCustomSettlementOpen(true);
+  };
+  const reviewCustomSettlement = () => {
+    if (
+      !rangeStart ||
+      !rangeEnd ||
+      rangeStart > rangeEnd ||
+      !rangeExpenses.length
+    )
+      return;
+    setCustomSettlement({ start: rangeStart, end: rangeEnd });
+    setCustomSettlementOpen(false);
+    setSettlementReview(true);
+  };
   const settleCycle = async () => {
-    if (!isAdmin || !household || !activeExpenses.length) return;
+    if (!isAdmin || !household || !settlementExpenses.length) return;
     setSaving(true);
-    const result = await supabase.rpc('settle_household', {
-      target_household: household.id,
-      transfer_summary: transfers,
-    });
+    const result = customSettlement
+      ? await supabase.rpc('settle_household_range', {
+          target_household: household.id,
+          date_from: customSettlement.start,
+          date_to: customSettlement.end,
+          transfer_summary: settlementTransfers,
+        })
+      : await supabase.rpc('settle_household', {
+          target_household: household.id,
+          transfer_summary: settlementTransfers,
+        });
     setSaving(false);
-    if (result.error) notify(result.error.message);
+    if (result.error)
+      notify(
+        userError(
+          result.error,
+          'The settlement could not be completed. Try again.',
+        ),
+      );
     else {
       setSettlementReview(false);
+      setCustomSettlement(null);
       setRefreshKey((value) => value + 1);
       notify('Cycle settled');
     }
@@ -1162,7 +1353,7 @@ export default function HomePage() {
         if (result.error.code === 'webauthn_credential_exists') {
           setPasskeyConfigured(true);
           notify('This passkey is already set up');
-        } else notify(result.error.message);
+        } else notify(userError(result.error));
       } else {
         setPasskeyConfigured(true);
         notify('Face ID or passkey is ready');
@@ -1200,7 +1391,7 @@ export default function HomePage() {
       target_member: self.id,
       new_name: profileName,
     });
-    if (result.error) notify(result.error.message);
+    if (result.error) notify(userError(result.error));
     else {
       setRefreshKey((value) => value + 1);
       void loadMembership();
@@ -1219,7 +1410,7 @@ export default function HomePage() {
       target_household: household.id,
       new_name: householdName,
     });
-    if (result.error) notify(result.error.message);
+    if (result.error) notify(userError(result.error));
     else {
       window.localStorage.removeItem(`splitmate-membership:${user.id}`);
       await loadMembership();
@@ -1233,7 +1424,7 @@ export default function HomePage() {
       name: newCategory.trim(),
       created_by: user.id,
     });
-    if (result.error) notify(result.error.message);
+    if (result.error) notify(userError(result.error));
     else {
       setNewCategory('');
       setRefreshKey((value) => value + 1);
@@ -1245,7 +1436,7 @@ export default function HomePage() {
       .from('household_categories')
       .delete()
       .eq('id', category.id);
-    if (result.error) notify(result.error.message);
+    if (result.error) notify(userError(result.error));
     else setRefreshKey((value) => value + 1);
   };
   const regenerateInvite = async () => {
@@ -1261,7 +1452,7 @@ export default function HomePage() {
     const result = await supabase.rpc('regenerate_household_invite', {
       target_household: household.id,
     });
-    if (result.error) notify(result.error.message);
+    if (result.error) notify(userError(result.error));
     else {
       window.localStorage.removeItem(`splitmate-membership:${user.id}`);
       await loadMembership();
@@ -1277,7 +1468,7 @@ export default function HomePage() {
     const result = await supabase.rpc('remove_household_member', {
       target_member: member.id,
     });
-    if (result.error) notify(result.error.message);
+    if (result.error) notify(userError(result.error));
     else {
       setRefreshKey((value) => value + 1);
       notify(`${member.name} removed`);
@@ -1289,7 +1480,7 @@ export default function HomePage() {
       target_member: member.id,
       new_role: role,
     });
-    if (result.error) notify(result.error.message);
+    if (result.error) notify(userError(result.error));
     else {
       if (member.user_id === user.id)
         window.localStorage.removeItem(`splitmate-membership:${user.id}`);
@@ -1306,7 +1497,7 @@ export default function HomePage() {
       target_expense: detail.id,
       report_reason: flagReason.trim() || null,
     });
-    if (result.error) notify(result.error.message);
+    if (result.error) notify(userError(result.error));
     else {
       setFlagReason('');
       setRefreshKey((value) => value + 1);
@@ -1318,7 +1509,7 @@ export default function HomePage() {
     const result = await supabase.rpc('resolve_receipt_flag', {
       target_flag: flag.id,
     });
-    if (result.error) notify(result.error.message);
+    if (result.error) notify(userError(result.error));
     else {
       setRefreshKey((value) => value + 1);
       notify('Report resolved');
@@ -1338,7 +1529,7 @@ export default function HomePage() {
     const result = await supabase.rpc('leave_household', {
       target_household: household.id,
     });
-    if (result.error) notify(result.error.message);
+    if (result.error) notify(userError(result.error));
     else {
       window.localStorage.removeItem(`splitmate-membership:${user.id}`);
       currentHouseholdId.current = null;
@@ -1572,9 +1763,9 @@ export default function HomePage() {
         onChange={(event) => void handleFile(event.target.files?.[0])}
       />
       {!online && (
-        <div className="network-banner">
+        <output className="network-banner">
           <WifiOff size={15} /> Offline · bills save on this iPhone
-        </div>
+        </output>
       )}
       <div className="app-frame">
         <AppHeader
@@ -1595,7 +1786,7 @@ export default function HomePage() {
           onUpload={openUpload}
         />
         {error && (
-          <div className="error-banner">
+          <div className="error-banner" role="alert">
             <span>{error}</span>
             <button onClick={() => setRefreshKey((value) => value + 1)}>
               Retry
@@ -1616,9 +1807,14 @@ export default function HomePage() {
             saving={saving}
             onUpload={openUpload}
             onRetrySync={() => void syncOfflineReceipts()}
+            onRetryOffline={(expense) => void syncOfflineReceipts(expense.id)}
             onShowReceipts={() => setTab('receipts')}
             onShare={() => void shareSettlement()}
             onReviewSettlement={() => setSettlementReview(true)}
+            onCustomSettlement={openCustomSettlement}
+            hasDraft={savedDraftAvailable}
+            onResumeDraft={resumeDraft}
+            onRemoveOffline={requestDelete}
             renderReceipt={receiptRow}
           />
         )}
@@ -1628,8 +1824,35 @@ export default function HomePage() {
             filter={receiptFilter}
             expenses={expenses}
             filteredExpenses={filteredExpenses}
-            onSearch={setSearch}
-            onFilter={setReceiptFilter}
+            categories={allCategories}
+            members={members}
+            filters={receiptFilters}
+            visibleCount={visibleReceipts}
+            canLoadMore={expenses.length >= receiptFetchLimit}
+            onSearch={(value) => {
+              setSearch(value);
+              setVisibleReceipts(30);
+            }}
+            onFilter={(value) => {
+              setReceiptFilter(value);
+              setVisibleReceipts(30);
+            }}
+            onFilters={(value) => {
+              setReceiptFilters(value);
+              setVisibleReceipts(30);
+            }}
+            onClearFilters={() => {
+              setReceiptFilters(emptyReceiptFilters);
+              setVisibleReceipts(30);
+            }}
+            onLoadMore={() => {
+              setVisibleReceipts((count) => count + 30);
+              if (
+                visibleReceipts >= filteredExpenses.length &&
+                expenses.length >= receiptFetchLimit
+              )
+                setReceiptFetchLimit((count) => count + 200);
+            }}
             renderReceipt={receiptRow}
           />
         )}
@@ -1697,12 +1920,30 @@ export default function HomePage() {
         )}
         <SettlementReview
           open={settlementReview}
-          expenses={activeExpenses}
-          total={total}
-          transfers={transfers}
+          expenses={settlementExpenses}
+          total={settlementTotal}
+          transfers={settlementTransfers}
+          periodLabel={
+            customSettlement
+              ? `${customSettlement.start} to ${customSettlement.end}`
+              : undefined
+          }
           saving={saving}
-          onCancel={() => setSettlementReview(false)}
+          onCancel={() => {
+            setSettlementReview(false);
+            setCustomSettlement(null);
+          }}
           onConfirm={() => void settleCycle()}
+        />
+        <CustomSettlementDialog
+          open={customSettlementOpen}
+          start={rangeStart}
+          end={rangeEnd}
+          count={rangeExpenses.length}
+          onStart={setRangeStart}
+          onEnd={setRangeEnd}
+          onCancel={() => setCustomSettlementOpen(false)}
+          onContinue={reviewCustomSettlement}
         />
       </div>
       <BottomNavigation active={tab} onChange={setTab} />
@@ -1729,6 +1970,15 @@ export default function HomePage() {
         onReportIncorrect={() => void reportIncorrect()}
         onRescan={() => void rescanDetail()}
         onSave={() => void saveExpense()}
+        onOpenDuplicate={(expenseId) => {
+          const duplicate = expenses.find(
+            (expense) => expense.id === expenseId,
+          );
+          if (duplicate) {
+            closeEditor();
+            openDetail(duplicate);
+          }
+        }}
       />
       <DeleteConfirmation
         expense={confirmDelete}

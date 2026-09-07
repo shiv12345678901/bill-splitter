@@ -1,4 +1,4 @@
-import { Check, Trash2 } from 'lucide-react';
+import { CalendarRange, Check, Trash2 } from 'lucide-react';
 import type { Expense, ToastState } from '@/lib/splitmate-models';
 import type { Transfer } from '@/lib/settlements';
 import { money } from '@/lib/splitmate-models';
@@ -11,6 +11,7 @@ export function SettlementReview({
   saving,
   onCancel,
   onConfirm,
+  periodLabel,
 }: {
   open: boolean;
   expenses: Expense[];
@@ -19,6 +20,7 @@ export function SettlementReview({
   saving: boolean;
   onCancel: () => void;
   onConfirm: () => void;
+  periodLabel?: string;
 }) {
   if (!open) return null;
   return (
@@ -36,8 +38,19 @@ export function SettlementReview({
         <p>
           This closes {expenses.length} receipt
           {expenses.length === 1 ? '' : 's'} totalling {money.format(total)} for
-          everyone.
+          everyone{periodLabel ? ` · ${periodLabel}` : ''}.
         </p>
+        <div className="settlement-receipts" aria-label="Receipts included">
+          {expenses.slice(0, 8).map((expense) => (
+            <span key={expense.id}>
+              <b>{expense.merchant}</b>
+              <strong>{money.format(expense.amount)}</strong>
+            </span>
+          ))}
+          {expenses.length > 8 && (
+            <small>+ {expenses.length - 8} more receipts</small>
+          )}
+        </div>
         <div className="settlement-review-list">
           {transfers.length ? (
             transfers.map((transfer) => (
@@ -70,6 +83,81 @@ export function SettlementReview({
   );
 }
 
+export function CustomSettlementDialog({
+  open,
+  start,
+  end,
+  count,
+  onStart,
+  onEnd,
+  onCancel,
+  onContinue,
+}: {
+  open: boolean;
+  start: string;
+  end: string;
+  count: number;
+  onStart: (value: string) => void;
+  onEnd: (value: string) => void;
+  onCancel: () => void;
+  onContinue: () => void;
+}) {
+  if (!open) return null;
+  const valid = Boolean(start && end && start <= end && count > 0);
+  return (
+    <div className="confirm-backdrop" role="presentation">
+      <dialog
+        open
+        className="confirm-card range-dialog"
+        aria-modal="true"
+        aria-labelledby="range-title"
+      >
+        <span className="confirm-icon settle-icon">
+          <CalendarRange size={24} />
+        </span>
+        <h2 id="range-title">Custom settlement</h2>
+        <p>
+          Choose the receipt dates to include. Already settled receipts stay
+          unchanged.
+        </p>
+        <div className="range-fields">
+          <label>
+            From
+            <input
+              type="date"
+              value={start}
+              max={end || undefined}
+              onChange={(event) => onStart(event.target.value)}
+            />
+          </label>
+          <label>
+            To
+            <input
+              type="date"
+              value={end}
+              min={start || undefined}
+              onChange={(event) => onEnd(event.target.value)}
+            />
+          </label>
+          <span>
+            {count} unsettled receipt{count === 1 ? '' : 's'} selected
+          </span>
+        </div>
+        <div className="confirm-actions">
+          <button onClick={onCancel}>Cancel</button>
+          <button
+            className="settle-confirm"
+            disabled={!valid}
+            onClick={onContinue}
+          >
+            Review
+          </button>
+        </div>
+      </dialog>
+    </div>
+  );
+}
+
 export function DeleteConfirmation({
   expense,
   onCancel,
@@ -93,8 +181,9 @@ export function DeleteConfirmation({
         </span>
         <h2 id="delete-title">Delete this receipt?</h2>
         <p>
-          {expense.merchant} will be removed for everyone in the household. You
-          can undo immediately after deleting.
+          {expense.syncStatus
+            ? `${expense.merchant} will be removed from this iPhone before it syncs.`
+            : `${expense.merchant} will be removed for everyone in the household. You can undo immediately after deleting.`}
         </p>
         <div>
           <button onClick={onCancel}>Cancel</button>

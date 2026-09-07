@@ -339,7 +339,11 @@ export default function InsightsView({
                     year: 'numeric',
                   })}
                 </strong>
-                <span>{cycle.member_count} people</span>
+                <span>
+                  {cycle.period_start && cycle.period_end
+                    ? `${new Date(`${cycle.period_start}T12:00:00`).toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })} – ${new Date(`${cycle.period_end}T12:00:00`).toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })}`
+                    : `${cycle.member_count} people`}
+                </span>
               </div>
               <b>{money.format(cycle.total_amount)}</b>
             </div>

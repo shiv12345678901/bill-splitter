@@ -7,11 +7,15 @@ import {
   WifiOff,
   ChevronRight,
   ReceiptText,
+  CalendarRange,
+  RotateCcw,
+  Trash2,
 } from 'lucide-react';
 import type { Expense, Member } from '@/lib/splitmate-models';
 import type { Transfer } from '@/lib/settlements';
 import { money } from '@/lib/splitmate-models';
 import { Avatar } from './avatar';
+import { userError } from '@/lib/user-error';
 
 type HomeViewProps = {
   cycleLabel: string;
@@ -29,6 +33,11 @@ type HomeViewProps = {
   onShowReceipts: () => void;
   onShare: () => void;
   onReviewSettlement: () => void;
+  onCustomSettlement: () => void;
+  onResumeDraft: () => void;
+  hasDraft: boolean;
+  onRemoveOffline: (expense: Expense) => void;
+  onRetryOffline: (expense: Expense) => void;
   renderReceipt: (expense: Expense) => ReactNode;
 };
 
@@ -49,6 +58,11 @@ export function HomeView(props: HomeViewProps) {
     onShowReceipts,
     onShare,
     onReviewSettlement,
+    onCustomSettlement,
+    onResumeDraft,
+    hasDraft,
+    onRemoveOffline,
+    onRetryOffline,
     renderReceipt,
   } = props;
   return (
@@ -80,16 +94,60 @@ export function HomeView(props: HomeViewProps) {
             <ChevronRight size={20} />
           </button>
         </div>
-        {expenses.some((expense) => expense.syncStatus === 'failed') && (
-          <div className="attention-card">
-            <WifiOff size={19} />
-            <div>
-              <strong>Receipt sync needs attention</strong>
-              <span>Your bill is safe on this iPhone.</span>
+        {hasDraft && (
+          <button className="draft-card" onClick={onResumeDraft}>
+            <RotateCcw size={19} />
+            <span>
+              <strong>Continue unfinished receipt</strong>
+              <small>Your entered details were saved on this iPhone.</small>
+            </span>
+            <ChevronRight size={18} />
+          </button>
+        )}
+        {expenses.some((expense) => expense.syncStatus) && (
+          <div className="sync-panel">
+            <div className="attention-card">
+              <WifiOff size={19} />
+              <div>
+                <strong>Offline receipts</strong>
+                <span>Your bills are safe on this iPhone.</span>
+              </div>
+              <button disabled={!online} onClick={onRetrySync}>
+                Sync all
+              </button>
             </div>
-            <button disabled={!online} onClick={onRetrySync}>
-              Retry
-            </button>
+            {expenses
+              .filter((expense) => expense.syncStatus)
+              .map((expense) => (
+                <div className="sync-row" key={expense.id}>
+                  <span>
+                    <strong>{expense.merchant}</strong>
+                    <small>
+                      {expense.syncStatus === 'failed'
+                        ? userError(
+                            expense.syncError,
+                            'Could not sync this receipt.',
+                          )
+                        : 'Waiting to sync'}
+                    </small>
+                  </span>
+                  {expense.syncStatus === 'failed' && (
+                    <button
+                      aria-label={`Retry ${expense.merchant}`}
+                      disabled={!online}
+                      onClick={() => onRetryOffline(expense)}
+                    >
+                      <RotateCcw size={17} />
+                    </button>
+                  )}
+                  <button
+                    aria-label={`Remove offline ${expense.merchant}`}
+                    onClick={() => onRemoveOffline(expense)}
+                  >
+                    <Trash2 size={17} />
+                  </button>
+                </div>
+              ))}
           </div>
         )}
         <section>
@@ -152,6 +210,12 @@ export function HomeView(props: HomeViewProps) {
                 onClick={onReviewSettlement}
               >
                 <Check size={18} /> Review settlement
+              </button>
+              <button
+                disabled={!activeExpenses.length || saving}
+                onClick={onCustomSettlement}
+              >
+                <CalendarRange size={18} /> Custom dates
               </button>
             </div>
           ) : (

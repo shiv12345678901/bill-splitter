@@ -9,6 +9,7 @@ import type {
   Member,
   ReceiptFlag,
 } from '@/lib/splitmate-models';
+import { localDate } from '@/lib/splitmate-models';
 
 type ReceiptEditorProps = {
   open: boolean;
@@ -33,6 +34,7 @@ type ReceiptEditorProps = {
   onReportIncorrect: () => void;
   onRescan: () => void;
   onSave: () => void;
+  onOpenDuplicate: (expenseId: string) => void;
 };
 
 export function ReceiptEditor(props: ReceiptEditorProps) {
@@ -59,12 +61,38 @@ export function ReceiptEditor(props: ReceiptEditorProps) {
     onReportIncorrect,
     onRescan,
     onSave,
+    onOpenDuplicate,
   } = props;
   const touchStart = useRef(0);
   if (!open) return null;
 
   const readOnly = Boolean(detail && (detail.settled || !isAdmin));
   const alreadyReported = flags.some((flag) => flag.reported_by === userId);
+  const amount = Number(draft.amount);
+  const merchantError = !draft.merchant.trim()
+    ? 'Enter the merchant name.'
+    : draft.merchant.trim().length > 80
+      ? 'Use 80 characters or fewer.'
+      : '';
+  const amountError = !draft.amount
+    ? 'Enter the receipt total.'
+    : !(amount > 0)
+      ? 'Enter a total greater than zero.'
+      : amount > 999999.99
+        ? 'Enter a total below $1,000,000.'
+        : '';
+  const dateError = !draft.receiptDate
+    ? 'Choose the receipt date.'
+    : draft.receiptDate > localDate()
+      ? 'Receipt date cannot be in the future.'
+      : '';
+  const canSave =
+    !analyzing &&
+    !saving &&
+    !merchantError &&
+    !amountError &&
+    !dateError &&
+    Boolean(draft.payerId);
 
   return (
     <div
@@ -138,10 +166,10 @@ export function ReceiptEditor(props: ReceiptEditorProps) {
           />
         )}
         {analyzing && (
-          <div className="scan-status">
+          <output className="scan-status" aria-live="polite">
             <span className="loader small" />
-            Scanning image securely…
-          </div>
+            Scanning image… You can review the fields while it finishes.
+          </output>
         )}
         {!online && !detail && (
           <div className="scan-status offline-status">
@@ -155,8 +183,13 @@ export function ReceiptEditor(props: ReceiptEditorProps) {
           </div>
         )}
         {draft.duplicate && (
-          <div className="warning-banner">
-            This looks like a receipt already saved.
+          <div className="warning-banner duplicate-warning">
+            <span>This matches a receipt already saved.</span>
+            {draft.duplicateExpenseId && (
+              <button onClick={() => onOpenDuplicate(draft.duplicateExpenseId)}>
+                Open existing
+              </button>
+            )}
           </div>
         )}
         {flags.map((flag) => (
@@ -177,10 +210,15 @@ export function ReceiptEditor(props: ReceiptEditorProps) {
               disabled={readOnly}
               className="field-input"
               value={draft.merchant}
+              maxLength={81}
+              aria-invalid={Boolean(merchantError)}
               onChange={(event) =>
                 onDraftChange({ ...draft, merchant: event.target.value })
               }
             />
+            {merchantError && (
+              <span className="field-error">{merchantError}</span>
+            )}
           </label>
           <div className="two-columns">
             <label className="field-label">
@@ -190,10 +228,14 @@ export function ReceiptEditor(props: ReceiptEditorProps) {
                 className="field-input"
                 inputMode="decimal"
                 value={draft.amount}
+                aria-invalid={Boolean(amountError)}
                 onChange={(event) =>
                   onDraftChange({ ...draft, amount: event.target.value })
                 }
               />
+              {amountError && (
+                <span className="field-error">{amountError}</span>
+              )}
             </label>
             <label className="field-label">
               Category
@@ -219,10 +261,13 @@ export function ReceiptEditor(props: ReceiptEditorProps) {
                 className="field-input"
                 type="date"
                 value={draft.receiptDate}
+                max={localDate()}
+                aria-invalid={Boolean(dateError)}
                 onChange={(event) =>
                   onDraftChange({ ...draft, receiptDate: event.target.value })
                 }
               />
+              {dateError && <span className="field-error">{dateError}</span>}
             </label>
             <label className="field-label">
               Paid by
@@ -295,13 +340,7 @@ export function ReceiptEditor(props: ReceiptEditorProps) {
               )}
               <button
                 className="primary-button"
-                disabled={
-                  analyzing ||
-                  saving ||
-                  !draft.payerId ||
-                  !draft.merchant.trim() ||
-                  !(Number(draft.amount) > 0)
-                }
+                disabled={!canSave}
                 onClick={onSave}
               >
                 {saving
@@ -310,7 +349,9 @@ export function ReceiptEditor(props: ReceiptEditorProps) {
                     ? 'Save offline'
                     : detail
                       ? 'Save changes'
-                      : 'Add receipt'}{' '}
+                      : draft.duplicate
+                        ? 'Save anyway'
+                        : 'Add receipt'}{' '}
                 {!saving && <ArrowRight size={18} />}
               </button>
             </>

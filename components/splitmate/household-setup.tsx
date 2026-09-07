@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { Users } from 'lucide-react';
 import type { User } from '@supabase/supabase-js';
 import { supabase } from '@/lib/supabase';
+import { userError } from '@/lib/user-error';
 
 export function HouseholdSetup({
   user,
@@ -43,7 +44,13 @@ export function HouseholdSetup({
             member_name: memberName,
           });
     setBusy(false);
-    if (result.error) setStatus(result.error.message);
+    if (result.error)
+      setStatus(
+        userError(
+          result.error,
+          'The household could not be created or joined.',
+        ),
+      );
     else onReady();
   };
   return (

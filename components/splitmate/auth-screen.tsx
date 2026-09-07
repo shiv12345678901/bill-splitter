@@ -11,6 +11,7 @@ import {
   Users,
 } from 'lucide-react';
 import { supabase, supabaseConfigured } from '@/lib/supabase';
+import { userError } from '@/lib/user-error';
 
 export function AuthScreen() {
   const [mode, setMode] = useState<'signin' | 'signup'>('signin');
@@ -32,7 +33,13 @@ export function AuthScreen() {
             options: { emailRedirectTo: window.location.href },
           });
     setBusy(false);
-    if (result.error) setStatus(result.error.message);
+    if (result.error)
+      setStatus(
+        userError(
+          result.error,
+          'Sign in failed. Check your email and password.',
+        ),
+      );
     else if (mode === 'signup' && !result.data.session)
       setStatus('Check your email to confirm your account.');
   };
@@ -44,20 +51,23 @@ export function AuthScreen() {
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
       redirectTo: window.location.origin,
     });
-    setStatus(error?.message ?? 'Password reset link sent.');
+    setStatus(
+      error
+        ? userError(error, 'Password reset could not be sent.')
+        : 'Password reset link sent.',
+    );
   };
   const passkeySignIn = async () => {
     setBusy(true);
     setStatus('');
     try {
       const result = await supabase.auth.signInWithPasskey();
-      if (result.error) setStatus(result.error.message);
+      if (result.error)
+        setStatus(
+          userError(result.error, 'Passkey sign-in was not completed.'),
+        );
     } catch (passkeyError) {
-      setStatus(
-        passkeyError instanceof Error
-          ? passkeyError.message
-          : 'Passkey sign-in was cancelled.',
-      );
+      setStatus(userError(passkeyError, 'Passkey sign-in was cancelled.'));
     } finally {
       setBusy(false);
     }

@@ -31,6 +31,7 @@ export type Expense = {
   ocrModel?: string;
   notes?: string;
   syncStatus?: 'pending' | 'failed';
+  syncError?: string;
 };
 export type Cycle = {
   id: string;
@@ -38,6 +39,8 @@ export type Cycle = {
   total_amount: number;
   member_count: number;
   transfers: Transfer[];
+  period_start?: string | null;
+  period_end?: string | null;
 };
 export type Activity = {
   id: number;
@@ -69,6 +72,7 @@ export type Draft = {
   ocrStatus: string;
   ocrProcessedAt: string | null;
   duplicate: boolean;
+  duplicateExpenseId: string;
   lowConfidence: boolean;
 };
 export type ToastState = {
@@ -107,6 +111,7 @@ export const blankDraft = (): Draft => ({
   ocrStatus: 'not_requested',
   ocrProcessedAt: null,
   duplicate: false,
+  duplicateExpenseId: '',
   lowConfidence: false,
 });
 
