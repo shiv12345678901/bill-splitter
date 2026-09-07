@@ -11,6 +11,8 @@ export type OfflineReceipt = {
   notes: string;
   file: File | null;
   createdAt: string;
+  attempts?: number;
+  syncError?: string;
 };
 
 const databaseName = 'splitmate-offline';

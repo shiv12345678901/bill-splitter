@@ -1,7 +1,7 @@
 import type { Metadata, Viewport } from 'next';
 import './globals.css';
 
-const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || 'https://bill-splitter.netlify.app';
+const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || 'https://ourpersonalbill.netlify.app';
 
 export const metadata: Metadata = {
   metadataBase: new URL(siteUrl),

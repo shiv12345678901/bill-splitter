@@ -1,9 +1,14 @@
 // @ts-expect-error Supabase Edge Functions resolve Deno npm specifiers at deploy time.
 import { createClient } from 'npm:@supabase/supabase-js@2';
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+const allowedOrigins = new Set([Deno.env.get('APP_ORIGIN') || 'https://ourpersonalbill.netlify.app', 'http://localhost:3000']);
+const responseHeaders = (request: Request) => {
+  const origin = request.headers.get('Origin');
+  return {
+    'Access-Control-Allow-Origin': origin && allowedOrigins.has(origin) ? origin : Deno.env.get('APP_ORIGIN') || 'https://ourpersonalbill.netlify.app',
+    'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+    'Vary': 'Origin',
+  };
 };
 
 declare const Deno: {
@@ -61,7 +66,8 @@ async function readReceipt(imageBase64: string, mimeType: string) {
 async function processJob(jobId: string, imagePath: string) {
   const admin = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!, { auth: { persistSession: false } });
   try {
-    await admin.from('receipt_scan_jobs').update({ status: 'processing', error_message: null }).eq('id', jobId);
+    const claim = await admin.from('receipt_scan_jobs').update({ status: 'processing', error_message: null }).eq('id', jobId).eq('status', 'queued').select('id').maybeSingle();
+    if (claim.error || !claim.data) return;
     const download = await admin.storage.from('receipts').download(imagePath);
     if (download.error) throw download.error;
     const result = await readReceipt(bytesToBase64(new Uint8Array(await download.data.arrayBuffer())), download.data.type || 'image/jpeg');
@@ -72,24 +78,32 @@ async function processJob(jobId: string, imagePath: string) {
 }
 
 Deno.serve(async (request) => {
+  const corsHeaders = responseHeaders(request);
+  const origin = request.headers.get('Origin');
+  if (origin && !allowedOrigins.has(origin)) return Response.json({ error: 'Origin not allowed' }, { status: 403, headers: corsHeaders });
   if (request.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders });
   if (request.method !== 'POST') return Response.json({ error: 'Method not allowed' }, { status: 405, headers: corsHeaders });
   const authorization = request.headers.get('Authorization');
   if (!authorization) return Response.json({ error: 'Sign in required' }, { status: 401, headers: corsHeaders });
   try {
-    const body = await request.json() as { jobId?: string; imageBase64?: string; mimeType?: string };
+    const client = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_ANON_KEY')!, { global: { headers: { Authorization: authorization } }, auth: { persistSession: false } });
+    const identity = await client.auth.getUser();
+    if (identity.error || !identity.data.user) return Response.json({ error: 'Sign in required' }, { status: 401, headers: corsHeaders });
+    const body = await request.json() as { jobId?: string };
     if (body.jobId) {
-      const client = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_ANON_KEY')!, { global: { headers: { Authorization: authorization } }, auth: { persistSession: false } });
-      const job = await client.from('receipt_scan_jobs').select('id,image_path,status').eq('id', body.jobId).single();
+      const since = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      const usage = await client.from('receipt_scan_jobs').select('id', { count: 'exact', head: true }).eq('user_id', identity.data.user.id).gte('created_at', since);
+      if ((usage.count ?? 0) > 12) return Response.json({ error: 'Hourly scan limit reached. Try again later or enter the bill manually.' }, { status: 429, headers: corsHeaders });
+      const job = await client.from('receipt_scan_jobs').select('id,user_id,image_path,status').eq('id', body.jobId).single();
       if (job.error || !job.data) return Response.json({ error: 'Scan job not found' }, { status: 404, headers: corsHeaders });
+      if (job.data.user_id !== identity.data.user.id || !job.data.image_path.startsWith(`${identity.data.user.id}/`)) return Response.json({ error: 'Scan job access denied' }, { status: 403, headers: corsHeaders });
       if (job.data.status === 'complete') return Response.json({ accepted: true, status: 'complete' }, { headers: corsHeaders });
       if (job.data.status === 'processing') return Response.json({ accepted: true, status: 'processing' }, { status: 202, headers: corsHeaders });
       const work = processJob(job.data.id, job.data.image_path);
       if (typeof EdgeRuntime !== 'undefined') EdgeRuntime.waitUntil(work); else await work;
       return Response.json({ accepted: true, status: 'queued' }, { status: 202, headers: { ...corsHeaders, 'Cache-Control': 'no-store' } });
     }
-    if (typeof body.imageBase64 !== 'string' || typeof body.mimeType !== 'string') throw new Error('A scan job is required.');
-    return Response.json(await readReceipt(body.imageBase64, body.mimeType), { headers: { ...corsHeaders, 'Cache-Control': 'no-store' } });
+    throw new Error('A scan job is required.');
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : 'Receipt scan failed.' }, { status: 400, headers: corsHeaders });
   }
