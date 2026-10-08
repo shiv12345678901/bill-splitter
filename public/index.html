@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en-AU">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f5f5f7" />
+    <title>SplitMate — Personal expenses</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%230071e3'/%3E%3Ctext x='32' y='44' text-anchor='middle' font-size='42' fill='white'%3E÷%3C/text%3E%3C/svg%3E"
+    />
+    <script src="/appearance.js"></script>
+    <link rel="stylesheet" href="/styles/app.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <aside class="sidebar" aria-label="Main navigation">
+      <a class="brand" href="#home"
+        ><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 7h12M6 17h12M12 7v10"/></svg></span
+        ><span>SplitMate<small>PERSONAL WORKSPACE</small></span></a
+      >
+      <span class="nav-label">WORKSPACE</span>
+      <nav>
+        <a href="#home" data-nav="home"
+          ><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v14H4z"/><path d="M8 9h8M8 13h5"/></svg></span>Current settlement</a
+        ><a href="#library" data-nav="library"
+          ><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="5" rx="1.5"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9"/><path d="M10 13h4"/></svg></span>Receipt library</a
+        ><a href="#cycles" data-nav="cycles"
+          ><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 10h18"/></svg></span>Cycles</a
+        ><a href="#history" data-nav="history"
+          ><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6.5A9 9 0 1 1 3 12"/><path d="M4 3v3.5h3.5M12 7v5l3 2"/></svg></span>History</a
+        >
+      </nav>
+      <div class="sidebar-bottom">
+        <nav>
+          <a href="#settings" data-nav="settings"
+            ><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z"/><path d="m19.4 15 .1.1 1.6 1.3-1.8 3.1-2-.8a8 8 0 0 1-2 1.2l-.3 2.1h-3.6l-.3-2.1a8 8 0 0 1-2-1.2l-2 .8-1.8-3.1L7 15.1a8 8 0 0 1 0-2.2l-1.7-1.4L7 8.4l2 .8a8 8 0 0 1 2-1.2l.3-2.1h3.6l.3 2.1a8 8 0 0 1 2 1.2l2-.8 1.8 3.1-1.6 1.4a8 8 0 0 1 0 2.1Z"/></svg></span>Settings</a
+          >
+        </nav>
+        <div class="conn-card" aria-label="Connection status">
+          <div class="conn-row">
+            <span id="connection-dot"></span>
+            <div><b>Local server</b><small id="server-status">Connecting…</small></div>
+          </div>
+          <div class="conn-row">
+            <span class="conn-dot" id="wa-dot"></span>
+            <div><b>WhatsApp</b><small id="wa-status">Checking…</small></div>
+          </div>
+          <div class="conn-row">
+            <span class="conn-dot" id="keys-dot"></span>
+            <div><b>Receipt recognition</b><small id="keys-status">Checking…</small></div>
+          </div>
+        </div>
+        <small id="save-status">Local &amp; personal</small>
+      </div>
+    </aside>
+    <main>
+      <header class="page-header">
+        <div>
+          <h1 id="page-title" tabindex="-1">Current settlement</h1>
+          <p id="page-subtitle">Shared expenses, simply settled.</p>
+        </div>
+        <div class="actions">
+          <span id="connection-badge" class="status-pill idle" role="status"
+            ><span class="dot" aria-hidden="true"></span
+            ><span id="connection-badge-text">Checking…</span></span
+          ><button id="save-header" class="secondary" data-action="save" hidden>
+            Save to history</button
+          ><button
+            id="sync-header"
+            class="secondary"
+            data-action="sync"
+            aria-label="↻ Sync receipts"
+            title="Load receipts from the settlement start date through today"
+          >
+            <span class="button-label">Sync receipts</span></button
+          ><button id="collect-header" class="primary" data-action="collect">
+            <span class="button-label">Collect receipts</span>
+          </button>
+        </div>
+      </header>
+      <div id="banners" aria-live="polite"></div>
+      <section id="workspace-header">
+        <div class="workspace-context">
+          <div>
+            <b id="workspace-name">My household</b
+            ><span id="workspace-status" class="badge">Draft</span>
+            <p id="workspace-period"></p>
+            <small id="workspace-marker" hidden></small>
+          </div>
+          <button id="edit-period" class="text-button" data-action="period">
+            Edit details
+          </button>
+        </div>
+        <nav class="tabs" aria-label="Settlement workflow">
+          <a href="#home" data-tab="home">Overview</a
+          ><a href="#receipts" data-tab="receipts">Receipts</a
+          ><a href="#settlements" data-tab="settlements">Payment plan</a>
+        </nav>
+        <ol class="workflow-rail" aria-label="Settlement progress">
+          <li data-workflow-step="collect"><span>1</span><b>Collect</b></li>
+          <li data-workflow-step="review"><span>2</span><b>Review</b></li>
+          <li data-workflow-step="settle"><span>3</span><b>Settle</b></li>
+        </ol>
+      </section>
+      <div id="content" tabindex="-1"></div>
+      <footer class="workspace-footer">
+        <span>Private workspace · AUD</span
+        ><button
+          id="restore-previous"
+          class="text-button"
+          data-action="restore"
+          hidden
+        >
+          Restore previous workspace
+        </button>
+      </footer>
+    </main>
+    <dialog id="dialog" aria-labelledby="dialog-title"></dialog>
+    <div id="lightbox" role="dialog" aria-modal="true" aria-label="Receipt preview" hidden></div>
+    <div id="toast" role="status" hidden></div>
+    <input
+      id="import-file"
+      type="file"
+      accept="application/json,.json"
+      hidden
+    />
+    <script src="/socket.io/socket.io.js"></script>
+    <script type="module" src="/js/app.mjs"></script>
+  </body>
+</html>

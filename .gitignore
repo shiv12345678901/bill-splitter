@@ -37,3 +37,16 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# local SplitMate financial data and verified backups
+/data/
+/user_config.json
+/.wwebjs_auth/
+/.wwebjs_cache/
+
+# local development and verification artifacts
+/.agents/
+/.impeccable/
+/.playwright-cli/
+/output/
+/skills-lock.json
