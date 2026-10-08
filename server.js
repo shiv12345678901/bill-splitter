@@ -3,6 +3,7 @@ const {
   loadUserConfig,
   saveUserConfig,
 } = require("./server/services/config.cjs");
+const { parseApiKeys } = require("./server/services/api-keys.cjs");
 const {
   MEDIA_CACHE_DIR,
   loadReceiptCache,
@@ -53,17 +54,6 @@ const PORT = process.env.PORT || 3000;
 require("./server/services/library.cjs").migrateSettlementCycles({
   groupStartDates: loadUserConfig().groupStartDates || {},
 });
-
-function parseApiKeys(val) {
-  if (!val) return [];
-  if (Array.isArray(val)) {
-    return val.map((k) => (k || "").trim()).filter((k) => k.length > 5);
-  }
-  return String(val)
-    .split(/[\n,;]+/)
-    .map((k) => k.trim())
-    .filter((k) => k.length > 5);
-}
 
 function loadEnvApiKeys() {
   const collected = [];
@@ -329,9 +319,23 @@ io.on("connection", (socket) => {
 
   // Update Gemini Keys on-the-fly (multi-key turbo)
   socket.on("config:set_gemini_keys", ({ keys }) => {
-    geminiApiKeys = parseApiKeys(keys);
-    geminiApiKey = geminiApiKeys[0] || "";
-    const count = geminiApiKeys.length;
+    if (typeof keys !== "string" || keys.length > 65536) {
+      socket.emit("config:keys_error", {
+        message: "Paste a valid key list smaller than 64 KB.",
+      });
+      return;
+    }
+    const parsedKeys = parseApiKeys(keys);
+    const count = parsedKeys.length;
+    if (!count) {
+      socket.emit("config:keys_error", {
+        message:
+          "No Gemini keys were found. Use one key per line or GEMINI_API_KEY_1=value.",
+      });
+      return;
+    }
+    geminiApiKeys = parsedKeys;
+    geminiApiKey = geminiApiKeys[0];
     console.log(
       `[Config] Updated Gemini API keys: ${count} active key(s). (Multi-Key Turbo: ${Math.min(Math.max(count, 1), 4)}x)`,
     );

@@ -194,9 +194,12 @@ socket.on("client:qr", (data) => {
 for (const event of ["config:keys_updated", "config:key_updated"])
   socket.on(event, (data) => {
     state.keys = data.keyCount || 0;
-    toast("Receipt recognition updated.");
+    toast(`${state.keys} receipt recognition key${state.keys === 1 ? "" : "s"} ready.`);
     emit();
   });
+socket.on("config:keys_error", (data) => {
+  toast(data?.message || "The Gemini keys could not be saved.");
+});
 socket.on("groups:list", (data) => {
   if (data.error) toast(data.error);
   else state.groups = data.groups || [];

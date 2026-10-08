@@ -13,6 +13,32 @@ const { cleanAndParseJson } = require("../server/services/ocr.cjs");
 const processReceipts = require("../server/services/receipt-workers.cjs");
 const { loadChatHistory } = require("../server/services/message-discovery.cjs");
 const library = require("../server/services/library.cjs");
+const { parseApiKeys } = require("../server/services/api-keys.cjs");
+
+test("API key parser accepts numbered env-file lines", () => {
+  assert.deepEqual(
+    parseApiKeys(`
+# Gemini rotation keys
+GEMINI_API_KEY_1=fake-key-one
+GEMINI_API_KEY_2="fake-key-two"
+export GEMINI_API_KEY3='fake-key-three'
+OTHER_SECRET=ignored-value
+`),
+    ["fake-key-one", "fake-key-two", "fake-key-three"],
+  );
+});
+
+test("API key parser accepts plain lists and removes duplicates", () => {
+  assert.deepEqual(
+    parseApiKeys(["fake-key-one, fake-key-two", "fake-key-one"]),
+    ["fake-key-one", "fake-key-two"],
+  );
+  assert.deepEqual(
+    parseApiKeys("GEMINI_API_KEYS=fake-key-one;fake-key-two"),
+    ["fake-key-one", "fake-key-two"],
+  );
+});
+
 function historyClient({ stalled = false } = {}) {
   let loads = 0;
   const messages = [{ t: 500 }, { t: 450 }, { t: 400 }];

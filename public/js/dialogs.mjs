@@ -113,13 +113,29 @@ export function updateConnection() {
 export function keys() {
   dialog(
     "Receipt recognition",
-    '<p class="muted">Enter a Gemini API key. It is sent to your local server and kept in memory until restart. It is never included in workspace backups.</p><label>API key<input type="password" name="key" required autocomplete="off" spellcheck="false"></label>' +
-      footer("Save key"),
+    '<p class="muted">Paste one key per line, or use numbered <code>GEMINI_API_KEY_1=value</code> lines. Keys are kept in server memory until restart and are never included in workspace backups.</p><label>Gemini API keys<textarea id="gemini-api-keys" name="keys" rows="8" required autocomplete="off" spellcheck="false" placeholder="GEMINI_API_KEY_1=your-key&#10;GEMINI_API_KEY_2=your-key"></textarea></label><label>Import an .env or text file<input id="gemini-key-file" type="file" accept=".env,.txt,text/plain"></label><p class="muted">Imported values remain visible here so you can check them before saving.</p>' +
+      footer("Save keys"),
     (form, root) => {
-      if (request("config:set_gemini_keys", { keys: form.get("key").trim() }))
+      const value = form.get("keys").trim();
+      if (!value) return toast("Add at least one Gemini API key.");
+      if (request("config:set_gemini_keys", { keys: value }))
         root.close();
     },
   );
+  const fileInput = $("#gemini-key-file");
+  fileInput?.addEventListener("change", async () => {
+    const file = fileInput.files?.[0];
+    if (!file) return;
+    if (file.size > 65536) {
+      fileInput.value = "";
+      return toast("Choose an .env or text file smaller than 64 KB.");
+    }
+    try {
+      $("#gemini-api-keys").value = await file.text();
+    } catch {
+      toast("That file could not be read. Paste the keys instead.");
+    }
+  });
 }
 export function aliases() {
   const entries = Object.entries(state.aliases);
