@@ -18,6 +18,7 @@ const {
   formatWhatsAppReport,
 } = require("./server/services/settlement.cjs");
 const { downloadMediaBuffer } = require("./server/services/media.cjs");
+const { createConfiguredSupabaseWorker } = require("./server/services/supabase-worker.cjs");
 const detectSettlementCycles = (groupId) =>
   require("./server/services/cycles.cjs").detectSettlementCycles(
     groupId,
@@ -48,6 +49,7 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || "127.0.0.1";
 
 // Upgrade legacy date-keyed cycles before the app begins serving them. The
 // migration writes a one-time backup and leaves ambiguous records unresolved.
@@ -391,7 +393,7 @@ io.on("connection", (socket) => {
 // -----------------------------------------------------------------------------
 // Start Server & Initialize WhatsApp
 // -----------------------------------------------------------------------------
-server.listen(PORT, "127.0.0.1", () => {
+server.listen(PORT, HOST, () => {
   console.log(`\n========================================================`);
   console.log(`🚀 SplitMate - WhatsApp Group Bill Splitter`);
   console.log(`🌐 Running at: http://localhost:${PORT}`);
@@ -408,4 +410,18 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`========================================================\n`);
 
   if (process.env.SPLITMATE_NO_WHATSAPP !== "1") initializeWhatsAppClient();
+
+  const supabaseWorkerEnabled = process.env.SUPABASE_WORKER_ENABLED !== "0";
+  const hasSupabaseUrl = Boolean(process.env.SUPABASE_URL);
+  const hasSupabaseServerKey = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY);
+  if (supabaseWorkerEnabled && hasSupabaseUrl && hasSupabaseServerKey) {
+    const worker = createConfiguredSupabaseWorker({
+      scanManager,
+      getConnection: () => ({ client, clientStatus, geminiApiKeys, geminiApiKey }),
+      loadUserConfig,
+    });
+    if (worker) worker.start();
+  } else if (process.env.SUPABASE_URL || hasSupabaseServerKey) {
+    console.warn("[Supabase] InstaBox worker is disabled until SUPABASE_URL and a server-only key are configured.");
+  }
 });

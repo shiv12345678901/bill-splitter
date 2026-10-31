@@ -491,7 +491,12 @@ function createScanManager(
     });
   }
 
-  return { prepare, run, cancel, resumePending, registerSocket };
+  async function runAndGet(jobId, options) {
+    await run(jobId, options);
+    return database.getScanJob(jobId);
+  }
+
+  return { prepare, run, runAndGet, cancel, resumePending, registerSocket };
 }
 
 module.exports = function registerScan(socket, getConnection, dependencies) {

@@ -9,7 +9,7 @@
     "dev": "node --watch server.js",
     "build": "node scripts/check.cjs",
     "check": "node scripts/check.cjs",
-    "test": "node --test tests/domain.test.mjs tests/server.test.cjs",
+    "test": "node --test tests/domain.test.mjs tests/server.test.cjs tests/supabase-worker.test.cjs",
     "preview:ui": "node tests/preview-server.cjs",
     "test:ui": "npx --yes --package @playwright/cli playwright-cli -s=splitmate-ui open http://127.0.0.1:4173 && npx --yes --package @playwright/cli playwright-cli -s=splitmate-ui run-code --filename tests/rebuild-flow.pw.js && npx --yes --package @playwright/cli playwright-cli -s=splitmate-ui run-code --filename tests/recovery-flow.pw.js && npx --yes --package @playwright/cli playwright-cli -s=splitmate-ui run-code --filename tests/sync-flow.pw.js && npx --yes --package @playwright/cli playwright-cli -s=splitmate-ui run-code --filename tests/scan-job-ui.pw.js"
   },
