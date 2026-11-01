@@ -1,0 +1,8 @@
+**
+!package.json
+!package-lock.json
+!server/
+!server/**
+!scripts/
+!scripts/worker-health.cjs
+!scripts/worker-pair.cjs

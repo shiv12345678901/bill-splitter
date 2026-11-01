@@ -92,6 +92,8 @@ Live WhatsApp authentication and group discovery were verified. Live receipt sca
 
 ## InstaBox Supabase worker
 
+Production Docker, private WhatsApp pairing, migration, operations, update and rollback commands are in [DEPLOY_INSTABOX.md](DEPLOY_INSTABOX.md).
+
 The worker is deliberately locked to `dry-run` by default:
 
 ```sh

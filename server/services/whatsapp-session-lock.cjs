@@ -1,6 +1,15 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+function processStamp(pid) {
+  if (process.platform !== "linux") return null;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const startTicks = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+    return `${fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim()}:${startTicks}`;
+  } catch { return null; }
+}
+
 function processIsAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -31,7 +40,8 @@ class WhatsAppSessionLock {
       } catch {
         throw new Error("WhatsApp owner lock is unreadable; verify no owner is running before removing it.");
       }
-      if (existing?.pid && processIsAlive(Number(existing.pid))) {
+      const stamp = processStamp(Number(existing?.pid));
+      if (existing?.pid && processIsAlive(Number(existing.pid)) && (!existing.startStamp || !stamp || existing.startStamp === stamp)) {
         throw new Error(
           `WhatsApp session is already owned by ${existing.owner || "another process"} (PID ${existing.pid}).`,
         );
@@ -42,7 +52,7 @@ class WhatsAppSessionLock {
 
     fs.writeFileSync(
       this.fd,
-      JSON.stringify({ pid: process.pid, owner: this.owner, acquiredAt: new Date().toISOString() }),
+      JSON.stringify({ pid: process.pid, owner: this.owner, startStamp: processStamp(process.pid), acquiredAt: new Date().toISOString() }),
       "utf8",
     );
     return this;

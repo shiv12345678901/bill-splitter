@@ -1,0 +1,37 @@
+services:
+  worker:
+    build: .
+    image: splitmate-worker:${WORKER_IMAGE_TAG:-local}
+    restart: unless-stopped
+    init: true
+    env_file: .env.worker
+    environment:
+      SESSION_DATA_PATH: /state/whatsapp
+      SPLITMATE_DATA_DIR: /state/data
+      SPLITMATE_RUNTIME_DIR: /state/run
+      SPLITMATE_CONTRACT_FILE: /run/secrets/worker_contract
+      TZ: Australia/Sydney
+    secrets:
+      - worker_contract
+    volumes:
+      - worker_state:/state
+    # No published ports, Docker socket, privileged mode or public admin UI.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+      - /home/node/.cache:rw,nosuid,size=256m,uid=1000,gid=1000
+      - /home/node/.config:rw,nosuid,size=64m,uid=1000,gid=1000
+    shm_size: 512mb
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+secrets:
+  worker_contract:
+    file: ./worker-contract.json
+volumes:
+  worker_state:

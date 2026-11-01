@@ -67,6 +67,7 @@ function fakeIntegration({ failInsert = false } = {}) {
   const expenses = ["edited", "new", "new"].map((id) => ({ id, date: "2026-10-01", paidBy: "Alex", merchant: "OCR merchant", amount: 10, category: "Groceries" }));
   const worker = createSupabaseWorker({
     mode: "dry-run",
+    transactionalWrites: false,
     workerId: "test-worker",
     settlementIdMode: "text",
     loadUserConfig: () => ({ defaultGroupId: "fixture-group", aliases: { sender: "Alex" } }),
@@ -240,9 +241,11 @@ test("a lost job lease stops processing before receipt writes", async () => {
   let scans = 0;
   const worker = createSupabaseWorker({
     mode: "live", schemaApproved: SCHEMA_APPROVAL, writeApproval: WRITE_APPROVAL,
+    contract: { approved: true },
+    transactionalWrites: false,
     client: {
       verifySchema: async () => {},
-      rpc: async () => [{ id: "recovered", lease_expires_at: new Date(Date.now() + 60000).toISOString() }],
+      rpc: async (name) => name === "instabox_worker_capabilities" ? { version: 2, writes_enabled: true } : [{ id: "recovered", lease_expires_at: new Date(Date.now() + 60000).toISOString() }],
       select: async () => [{ id: "p", start_date: "2026-10-01", end_date: "2026-10-31" }],
       update: async () => [],
       insert: async () => { throw new Error("no insert should occur after lease loss"); },

@@ -29,6 +29,10 @@ yarn-error.log*
 # local environment
 .env*
 !.env.example
+!.env.worker.example
+/worker-contract.json
+/schema-review.txt
+/backup/
 
 # deployment and generated files
 .vercel

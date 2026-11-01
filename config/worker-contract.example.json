@@ -1,0 +1,16 @@
+{
+  "verified": false,
+  "schemaReviewed": false,
+  "museRulesReviewed": false,
+  "legacySourceIdsReviewed": false,
+  "legacyWorkerStopped": false,
+  "dependencyAuditReviewed": false,
+  "reviewReference": "REPLACE with schema export and Muse review reference",
+  "sourceIdMode": "receipt-id",
+  "dateMode": "UNCONFIRMED",
+  "shareRounding": "UNCONFIRMED",
+  "zeroAmountPolicy": "UNCONFIRMED",
+  "members": [],
+  "aliases": {},
+  "settlementIdMode": "existing-only"
+}

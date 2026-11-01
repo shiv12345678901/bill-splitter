@@ -1,6 +1,8 @@
 require("dotenv").config();
 
 const path = require("node:path");
+const fs = require("node:fs");
+const { loadContract, createDiagnostics } = require("./services/worker-runtime.cjs");
 const { EventEmitter } = require("node:events");
 const { Client, LocalAuth } = require("whatsapp-web.js");
 const QRCode = require("qrcode");
@@ -37,6 +39,11 @@ let reconnectAttempt = 0;
 let initializing = false;
 let stopping = false;
 let sessionLock = null;
+let diagnostics = null;
+const runtimeDir = process.env.SPLITMATE_RUNTIME_DIR || path.resolve(__dirname, "../data/run");
+const qrFile = path.join(runtimeDir, "pairing-qr.txt");
+const contract = loadContract(process.env.SPLITMATE_CONTRACT_FILE);
+const userConfig = () => ({ ...loadUserConfig(), ...(contract.approved ? { aliases: contract.value.aliases } : {}) });
 
 const detectSettlementCycles = (groupId) =>
   require("./services/cycles.cjs").detectSettlementCycles(groupId, client);
@@ -63,7 +70,8 @@ const supabaseWorker = createConfiguredSupabaseWorker({
   scanManager,
   scanEvents: events,
   getConnection: () => ({ client, clientStatus, geminiApiKeys, geminiApiKey }),
-  loadUserConfig,
+  loadUserConfig: userConfig,
+  contract,
 });
 
 function scheduleReconnect() {
@@ -90,8 +98,10 @@ async function initializeWhatsApp() {
     }
     client = new Client({
       authStrategy: new LocalAuth({ dataPath: sessionDataPath }),
+      webVersionCache: { type: "local", path: path.join(sessionDataPath, "web-cache") },
       puppeteer: {
         headless: true,
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
@@ -106,10 +116,14 @@ async function initializeWhatsApp() {
     client.on("qr", async (qr) => {
       clientStatus = "QR_READY";
       try {
-        console.log(await QRCode.toString(qr, { type: "terminal", small: true }));
+        if (mode !== "pair") {
+          console.log("[WhatsApp] Pairing required. Stop the worker and use the documented private pairing command.");
+          return;
+        }
+        fs.writeFileSync(qrFile, await QRCode.toString(qr, { type: "terminal", small: true }), { mode: 0o600 });
+        console.log("[WhatsApp] Pairing QR available through the private container command; expires automatically.");
       } catch (error) {
         console.error("[WhatsApp] Could not render QR code:", error.message);
-        console.log(`[WhatsApp] Raw QR value: ${qr}`);
       }
     });
     client.on("authenticated", () => {
@@ -119,6 +133,7 @@ async function initializeWhatsApp() {
     client.on("ready", () => {
       clientStatus = "READY";
       reconnectAttempt = 0;
+      fs.rmSync(qrFile, { force: true });
       console.log("[WhatsApp] Ready. InstaBox can process claimed jobs.");
     });
     client.on("auth_failure", (message) => {
@@ -148,8 +163,11 @@ async function initializeWhatsApp() {
 async function shutdown(signal) {
   if (stopping) return;
   stopping = true;
+  setTimeout(() => process.exit(1), 35000).unref();
   console.log(`[Worker] ${signal}; shutting down.`);
   supabaseWorker?.stop();
+  diagnostics?.stop();
+  fs.rmSync(qrFile, { force: true });
   if (reconnectTimer) clearTimeout(reconnectTimer);
   try {
     await client?.destroy();
@@ -161,6 +179,19 @@ async function shutdown(signal) {
 }
 
 async function main() {
+  if (!["dry-run", "pair", "live"].includes(mode)) throw new Error("Invalid SUPABASE_WORKER_MODE.");
+  diagnostics = createDiagnostics(runtimeDir, () => ({
+    mode, stopping, whatsapp: clientStatus, schemaVerified: supabaseWorker?.schemaVerified || false,
+    contractApproved: contract.approved,
+    ready: mode === "live" && !!supabaseWorker?.schemaVerified && supabaseWorker.liveWritesApproved && clientStatus === "READY" && geminiApiKeys.length > 0 && !!supabaseWorker?.diagnostics?.writesEnabled && !supabaseWorker?.diagnostics?.lastError,
+    job: supabaseWorker?.diagnostics || null,
+  }));
+  fs.rmSync(qrFile, { force: true });
+  if (mode === "pair") {
+    sessionLock = new WhatsAppSessionLock(sessionDataPath, "instabox-private-pairing").acquire();
+    await initializeWhatsApp();
+    return;
+  }
   if (!supabaseWorker) {
     throw new Error("Configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY before starting the worker.");
   }
@@ -171,9 +202,11 @@ async function main() {
   }
   if (!supabaseWorker.liveWritesApproved) {
     throw new Error(
-      "Live mode is locked. Set SUPABASE_WORKER_SCHEMA_APPROVED and SUPABASE_WORKER_WRITE_CONFIRM to the documented confirmation values.",
+      `Live mode is locked: ${contract.reason || "set both environment confirmations"}`,
     );
   }
+  if (!geminiApiKeys.length || !process.env.SPLITMATE_WHATSAPP_GROUP_ID)
+    throw new Error("Live mode requires Gemini keys and an explicit WhatsApp group ID.");
 
   sessionLock = new WhatsAppSessionLock(sessionDataPath, "instabox-sync-worker").acquire();
   supabaseWorker.start();
@@ -191,5 +224,6 @@ process.on("exit", () => sessionLock?.release());
 main().catch((error) => {
   console.error(`[Worker] ${error.message}`);
   sessionLock?.release();
+  diagnostics?.stop();
   process.exitCode = 1;
 });

@@ -292,6 +292,9 @@ class SupabaseRestClient {
     }
     const bucket = await this.request("storage/v1", "bucket/bill-evidence");
     if (!bucket || bucket.public !== false) throw new Error("bill-evidence must be a private Storage bucket.");
+    const capabilities = await this.rpc("instabox_worker_capabilities", {});
+    if (capabilities?.version !== 2) throw new Error("Production safeguards migration is required.");
+    this.writeEnabled = capabilities.writes_enabled === true;
     this.columns = verified;
     return verified;
   }
@@ -344,6 +347,8 @@ function createSupabaseWorker({
   adapter = { validateReceipt, settlementForReceipts },
   localDatabase = database,
   imageLoader = localImageForLibrary,
+  contract = { approved: false, reason: "Missing reviewed production contract." },
+  transactionalWrites = true,
   logger = console,
 } = {}) {
   leaseSeconds = Math.max(30, leaseSeconds);
@@ -355,10 +360,14 @@ function createSupabaseWorker({
 
   const configured = () => Boolean(client);
   const liveWritesApproved =
-    mode === LIVE_MODE && schemaApproved === SCHEMA_APPROVAL && writeApproval === WRITE_APPROVAL;
+    mode === LIVE_MODE && schemaApproved === SCHEMA_APPROVAL && writeApproval === WRITE_APPROVAL && contract.approved;
+  let currentJob = null;
+  let lastPollAt = null;
+  let lastError = null;
   const schemaColumns = (table) => client.columns?.[table] || new Set(REQUIRED_COLUMNS[table] || []);
 
   async function updateJob(job, changes, { releaseLease = false } = {}) {
+    if (currentJob && changes.stage) currentJob.stage = changes.stage;
     const leaseExpiresAt = releaseLease
       ? null
       : new Date(Date.now() + leaseSeconds * 1000).toISOString();
@@ -425,6 +434,7 @@ function createSupabaseWorker({
       maxMessages: extra.max_messages || extra.maxMessages,
       useCheckpoint: extra.use_checkpoint ?? extra.useCheckpoint ?? false,
       sync: true,
+      aliases: config.aliases || {},
       cycleId: extra.cycle_id || extra.cycleId,
     };
   }
@@ -434,6 +444,15 @@ function createSupabaseWorker({
     const config = loadUserConfig ? loadUserConfig() : {};
     const aliases = { ...(config.aliases || {}) };
     const row = adapter.validateReceipt(expense, periodId, aliases);
+    if (contract.approved) {
+      if (!contract.value.members.includes(row.payer)) throw new Error("Payer is not in reviewed household membership.");
+      if (!row.amount_cents && contract.value.zeroAmountPolicy === "reject") throw new Error("Zero amount requires manual review.");
+      if (contract.value.dateMode === "Australia/Sydney") {
+        const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Australia/Sydney", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(row.captured_at));
+        const part = (type) => parts.find((p) => p.type === type).value;
+        row.date = `${part("year")}-${part("month")}-${part("day")}`;
+      }
+    }
     const existingRows = await client.select("receipts", {
       select: "id,image_url",
       id: encodeFilter("eq", row.id),
@@ -453,6 +472,7 @@ function createSupabaseWorker({
     }
 
     lease.assert();
+    if (transactionalWrites) return { inserted: !existing, id: row.id, row: { ...row, image_url: evidenceLocator } };
     if (existing) {
       // Existing rows may contain manual corrections or exclusions. Only fill missing evidence.
       if (!existing.image_url && evidenceLocator) {
@@ -467,7 +487,7 @@ function createSupabaseWorker({
   }
 
   async function syncReceipts(expenses, periodId, lease) {
-    const result = { inserted: 0, existing: 0, invalid: [] };
+    const result = { inserted: 0, existing: 0, invalid: [], rows: [] };
     const seen = new Set();
     for (const expense of expenses || []) {
       const id = String(expense?.id || "");
@@ -481,6 +501,7 @@ function createSupabaseWorker({
         continue;
       }
         const outcome = await persistReceipt(expense, periodId, lease);
+        if (outcome.row) result.rows.push(outcome.row);
         if (outcome.inserted) result.inserted++;
         else result.existing++;
     }
@@ -577,7 +598,7 @@ function createSupabaseWorker({
     };
     scanEvents?.on?.("scan:progress", progressHandler);
     try {
-      await scanManager.runAndGet(prepared.jobId);
+      await scanManager.runAndGet(prepared.jobId, { retryFailedOnly: ["partial", "failed"].includes(prepared.status) });
     } finally {
       scanEvents?.off?.("scan:progress", progressHandler);
       await progressQueue;
@@ -595,6 +616,17 @@ function createSupabaseWorker({
       stage_message: `Validating and saving ${expenses.length} receipt result(s)…`,
     });
     const saved = await syncReceipts(expenses, period.id, lease);
+    if (transactionalWrites) {
+      if (saved.invalid.length || localJob.status !== "complete") throw new Error("Scan is incomplete or failed validation; saved local results were retained for retry.");
+      if (!contract.approved) throw new Error("Production writes require a reviewed contract.");
+      lease.assert();
+      const result = await client.rpc("finalize_sync_request", {
+        p_job_id: String(job.id), p_worker_id: workerId, p_period_id: String(period.id),
+        p_receipts: saved.rows, p_members: contract.value.members,
+        p_rounding: contract.value.shareRounding, p_settlement_id_mode: contract.value.settlementIdMode,
+      });
+      return { finalized: true, resultSummary: result.result_summary };
+    }
     const allReceipts = await allPeriodReceipts(period.id);
     const config = loadUserConfig ? loadUserConfig() : {};
     const members = [...new Set(Object.values(config.aliases || {}).filter(Boolean))];
@@ -631,7 +663,7 @@ function createSupabaseWorker({
   }
 
   async function tick() {
-    if (stopped || ticking || !schemaVerified || !liveWritesApproved) return null;
+    if (stopped || ticking || !schemaVerified || !liveWritesApproved || client.writeEnabled !== true) return null;
     const connection = getConnection?.();
     if (!connection?.client || connection.clientStatus !== "READY") return null;
     const activeKeys = connection.geminiApiKeys?.length
@@ -645,9 +677,11 @@ function createSupabaseWorker({
     try {
       const job = await claimNext();
       if (!job) return null;
+      currentJob = { id: job.id, attempt: job.attempt_count };
       const lease = createLease(job);
       try {
         const result = await processClaimedJob(job, lease);
+        if (result.finalized) return result;
         lease.assert();
         await updateJob(
           job,
@@ -662,9 +696,13 @@ function createSupabaseWorker({
         );
         return result;
       } catch (error) {
+        lastError = error.message;
         logger.error(`[Supabase] Sync request ${job.id} failed:`, error.message);
         try {
-          await updateJob(
+          if (transactionalWrites) await client.rpc("retry_sync_request", {
+            p_job_id: String(job.id), p_worker_id: workerId, p_error: error.message || "Sync failed",
+          });
+          else await updateJob(
             job,
             {
               status: "failed",
@@ -681,6 +719,7 @@ function createSupabaseWorker({
         return null;
       } finally {
         lease.stop();
+        currentJob = null;
       }
     } finally {
       ticking = false;
@@ -695,9 +734,14 @@ function createSupabaseWorker({
         schemaVerified = true;
         logger.log("[Supabase] Required live columns verified; InstaBox worker is ready.");
       } catch (error) {
+        lastError = error.message;
         logger.warn(`[Supabase] Worker paused until schema verification succeeds: ${error.message}`);
         return;
       }
+    }
+    if (mode === LIVE_MODE && schemaVerified && liveWritesApproved) {
+      const capabilities = await client.rpc("instabox_worker_capabilities", {});
+      client.writeEnabled = capabilities?.version === 2 && capabilities.writes_enabled === true;
     }
     if (mode !== LIVE_MODE) {
       if (!guardLogged) {
@@ -719,8 +763,9 @@ function createSupabaseWorker({
   }
 
   async function safeTick() {
-    try { return await verifyAndTick(); }
-    catch (error) { logger.warn(`[Supabase] Poll failed; retrying next interval: ${error.message}`); }
+    lastPollAt = new Date().toISOString();
+    try { lastError = null; return await verifyAndTick(); }
+    catch (error) { lastError = error.message; logger.warn(`[Supabase] Poll failed; retrying next interval: ${error.message}`); }
   }
 
   function start() {
@@ -742,6 +787,7 @@ function createSupabaseWorker({
     stop,
     tick: verifyAndTick,
     processClaimedJob,
+    get diagnostics() { return { currentJob, lastPollAt, lastError, writesEnabled: client?.writeEnabled === true }; },
     get liveWritesApproved() {
       return liveWritesApproved;
     },
