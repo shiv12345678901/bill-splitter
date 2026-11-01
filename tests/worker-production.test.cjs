@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const YAML = require("yaml");
 const { loadContract, healthy, createDiagnostics } = require("../server/services/worker-runtime.cjs");
+const { DEFAULT_WHATSAPP_USER_AGENT, resolveWhatsAppUserAgent } = require("../server/services/whatsapp-user-agent.cjs");
 
 test("deployment configuration keeps state, drops privileges and publishes no admin ports", () => {
   const compose = YAML.parse(fs.readFileSync("docker-compose.yml", "utf8"));
@@ -53,4 +54,15 @@ test("pairing QR is never sent to logs or an HTTP listener", () => {
   assert.match(source, /fs.writeFileSync\(qrFile/);
   assert.doesNotMatch(source, /console\.log\(await QRCode|Raw QR|\.listen\(/);
   assert.match(source, /mode !== "pair"/);
+});
+
+test("worker uses the supported Client userAgent option with a configurable Chromium identity", () => {
+  assert.match(DEFAULT_WHATSAPP_USER_AGENT, /X11; Linux x86_64/);
+  assert.match(DEFAULT_WHATSAPP_USER_AGENT, /Chrome\/156\.0\.8078\.73/);
+  assert.equal(resolveWhatsAppUserAgent(), DEFAULT_WHATSAPP_USER_AGENT);
+  assert.equal(resolveWhatsAppUserAgent("  custom-browser-identity  "), "custom-browser-identity");
+  assert.throws(() => resolveWhatsAppUserAgent("bad\n--argument"), /control characters/);
+  const worker = fs.readFileSync("server/worker-sync.cjs", "utf8");
+  assert.match(worker, /userAgent: whatsappUserAgent/);
+  assert.doesNotMatch(worker, /puppeteer:\s*\{[^}]*userAgent:/s);
 });

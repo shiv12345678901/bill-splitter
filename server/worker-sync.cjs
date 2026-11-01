@@ -14,6 +14,7 @@ const { parseReceiptWithGemini } = require("./services/ocr.cjs");
 const { createScanManager } = require("./sockets/scan.cjs");
 const { createConfiguredSupabaseWorker, LIVE_MODE } = require("./services/supabase-worker.cjs");
 const { WhatsAppSessionLock } = require("./services/whatsapp-session-lock.cjs");
+const { resolveWhatsAppUserAgent } = require("./services/whatsapp-user-agent.cjs");
 
 function loadGeminiKeys() {
   const values = [];
@@ -43,6 +44,7 @@ let diagnostics = null;
 const runtimeDir = process.env.SPLITMATE_RUNTIME_DIR || path.resolve(__dirname, "../data/run");
 const qrFile = path.join(runtimeDir, "pairing-qr.txt");
 const contract = loadContract(process.env.SPLITMATE_CONTRACT_FILE);
+const whatsappUserAgent = resolveWhatsAppUserAgent();
 const userConfig = () => ({ ...loadUserConfig(), ...(contract.approved ? { aliases: contract.value.aliases } : {}) });
 
 const detectSettlementCycles = (groupId) =>
@@ -98,6 +100,7 @@ async function initializeWhatsApp() {
     }
     client = new Client({
       authStrategy: new LocalAuth({ dataPath: sessionDataPath }),
+      userAgent: whatsappUserAgent,
       webVersionCache: { type: "local", path: path.join(sessionDataPath, "web-cache") },
       puppeteer: {
         headless: true,

@@ -198,6 +198,7 @@ The SQL migrations are additive and should normally remain installed with writes
 - `GEMINI_API_KEY` or numbered Gemini keys.
 - `SPLITMATE_WHATSAPP_GROUP_ID`: explicit target group ID; live mode will not use the code default.
 - `SPLITMATE_WHATSAPP_GROUP_NAME`: display label.
+- `SPLITMATE_WHATSAPP_USER_AGENT`: top-level WhatsApp Web Client identity; the example matches InstaBox Chromium 156 and should be updated when the installed Chromium major changes.
 - `SPLITMATE_SUPABASE_POLL_MS=5000`.
 - `SPLITMATE_SYNC_LEASE_SECONDS=900`.
 - `SPLITMATE_SYNC_REQUESTED_BY=netlify-app`.
