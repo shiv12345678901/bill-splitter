@@ -245,7 +245,7 @@ test("a lost job lease stops processing before receipt writes", async () => {
     transactionalWrites: false,
     client: {
       verifySchema: async () => {},
-      rpc: async (name) => name === "instabox_worker_capabilities" ? { version: 2, writes_enabled: true } : [{ id: "recovered", lease_expires_at: new Date(Date.now() + 60000).toISOString() }],
+      rpc: async (name) => name === "instabox_worker_capabilities" ? { version: 3, writes_enabled: true } : [{ id: "recovered", lease_expires_at: new Date(Date.now() + 60000).toISOString() }],
       select: async () => [{ id: "p", start_date: "2026-10-01", end_date: "2026-10-31" }],
       update: async () => [],
       insert: async () => { throw new Error("no insert should occur after lease loss"); },

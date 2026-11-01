@@ -12,9 +12,9 @@ function loadContract(filename) {
     if (!["UTC", "Australia/Sydney"].includes(value.dateMode)) throw new Error("Unconfirmed date convention.");
     if (!["floor", "round"].includes(value.shareRounding)) throw new Error("Unconfirmed share rounding.");
     if (!["preserve", "reject"].includes(value.zeroAmountPolicy)) throw new Error("Unconfirmed zero-amount policy.");
-    if (!["existing-only", "text", "uuid"].includes(value.settlementIdMode)) throw new Error("Invalid settlement ID mode.");
-    if (!Array.isArray(value.members) || !value.members.length || value.members.some((m) => typeof m !== "string" || !m.trim() || m !== m.trim()) || new Set(value.members).size !== value.members.length)
-      throw new Error("Supply distinct canonical household member names.");
+    if (value.settlementIdMode !== "existing-only") throw new Error("Production settlement creation is disabled; use existing-only.");
+    if (!Array.isArray(value.members) || value.members.length !== 4 || value.members.some((m) => typeof m !== "string" || !m.trim() || m !== m.trim()) || new Set(value.members).size !== value.members.length)
+      throw new Error("Supply the four distinct canonical household member names.");
     if (!value.aliases || typeof value.aliases !== "object" || Object.values(value.aliases).some((m) => !value.members.includes(m))) throw new Error("Aliases must map to reviewed members.");
     return { approved: true, value };
   } catch (error) { return { approved: false, reason: error.message }; }

@@ -34,7 +34,7 @@ psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261101000000
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261101000001_instabox_production_safeguards.sql
 ```
 
-Migration 00000 only adds lease fields, claim indexes/function, and creates the private bucket if absent. Migration 00001 aborts if the supported core types or unique receipt identity cannot be proven. It adds retry fields, source identity columns/indexes, audit/control tables, restrictive frontend RLS, service-role-only functions, and transactional finalization. It does not delete, backfill, reassign, or overwrite existing receipt details. The database write switch remains off:
+Migration 00000 only adds lease fields, claim indexes/function, and creates the private bucket if absent. Migration 00001 aborts unless job IDs are UUID, receipt/period/settlement IDs are text, date fields match, authenticated read policies remain available, and unique receipt identity can be proven. It removes permissive PUBLIC read policies from receipts, periods and settlements while preserving the existing authenticated policies. It adds retry fields, source identity columns/indexes, audit/control tables, restrictive frontend guards, service-role-only functions, and transactional finalization. Finalization updates only receipt-derived totals on the existing `settlement_YYYY-MM-DD_current` row; it never creates a settlement or changes `settlements.owes` or payment-confirmation state. It does not delete, backfill, reassign, or overwrite existing receipt details. The database write switch remains off:
 
 ```sql
 select public.instabox_worker_capabilities();
@@ -56,7 +56,7 @@ docker compose build --pull
 docker compose config --quiet
 ```
 
-Edit `.env.worker` with the checklist below. Keep `SUPABASE_WORKER_MODE=dry-run` and leave both confirmation variables empty. Edit `worker-contract.json` only from reviewed evidence. Set every review boolean to true, supply a durable review reference, the exact members and aliases, and the confirmed date/rounding/zero-amount/settlement-ID settings. `dependencyAuditReviewed` must only be enabled after reviewing the current `npm audit --omit=dev` output and the upstream WhatsApp/Puppeteer advisories described below. This file is mounted as a read-only Docker secret and is ignored by Git.
+Edit `.env.worker` with the checklist below. Keep `SUPABASE_WORKER_MODE=dry-run` and leave both confirmation variables empty. Edit `worker-contract.json` only from reviewed evidence. Set every review boolean to true, supply a durable review reference, exactly four canonical members and their aliases, confirmed date/rounding/zero-amount settings, and keep `settlementIdMode` as `existing-only`. `dependencyAuditReviewed` must only be enabled after reviewing the current `npm audit --omit=dev` output and the upstream WhatsApp/Puppeteer advisories described below. This file is mounted as a read-only Docker secret and is ignored by Git.
 
 ## 3. Run dry-run
 

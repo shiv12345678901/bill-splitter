@@ -1,16 +1,32 @@
 -- REVIEW AGAINST A SCHEMA EXPORT FIRST. Apply with psql -v ON_ERROR_STOP=1.
--- No backfill, receipt deletion, source-ID guessing, or replacement of totals.
+-- No backfill, receipt deletion, source-ID guessing, settlement creation, or
+-- modification of settlement payment obligations (including settlements.owes).
 begin;
 do $$
 begin
   if exists(select 1 from information_schema.columns where table_schema='public' and
-    ((table_name='sync_requests' and column_name='status' and data_type<>'text') or
+    ((table_name='sync_requests' and column_name='id' and data_type<>'uuid') or
+     (table_name='sync_requests' and column_name='status' and data_type<>'text') or
+     (table_name='receipts' and column_name='id' and data_type<>'text') or
+     (table_name='receipts' and column_name='period_id' and data_type<>'text') or
+     (table_name='periods' and column_name='id' and data_type<>'text') or
+     (table_name='periods' and column_name in ('start_date','end_date') and data_type<>'date') or
+     (table_name='settlements' and column_name='id' and data_type<>'text') or
+     (table_name='settlements' and column_name='period_id' and data_type<>'text') or
+     (table_name='settlements' and column_name='owes' and data_type<>'jsonb') or
      (table_name='receipts' and column_name='date' and data_type<>'date') or
      (table_name='receipts' and column_name='amount_cents' and data_type not in ('integer','bigint')))) then
-    raise exception 'Unsupported status/date/amount type; review an explicit schema adapter';
+    raise exception 'Unsupported production ID/status/date/amount type; review an explicit schema adapter';
   end if;
   if not exists (select 1 from information_schema.columns where table_schema='public' and table_name='receipts' and column_name='id' and data_type='text') then
     raise exception 'Bundled adapter requires receipts.id text. Review legacy source mapping first.';
+  end if;
+  if not exists (select 1 from information_schema.columns where table_schema='public' and table_name='sync_requests' and column_name='id' and data_type='uuid')
+    or not exists (select 1 from information_schema.columns where table_schema='public' and table_name='periods' and column_name='id' and data_type='text')
+    or not exists (select 1 from information_schema.columns where table_schema='public' and table_name='settlements' and column_name='id' and data_type='text')
+    or not exists (select 1 from information_schema.columns where table_schema='public' and table_name='periods' and column_name='start_date' and data_type='date')
+    or not exists (select 1 from information_schema.columns where table_schema='public' and table_name='periods' and column_name='end_date' and data_type='date') then
+    raise exception 'Verified UUID job, text period/settlement IDs and date fields are required';
   end if;
   if exists(select 1 from public.receipts group by id having count(*) > 1) then
     raise exception 'Duplicate receipt IDs require manual review; migration will not delete data.';
@@ -32,7 +48,7 @@ create table if not exists public.instabox_worker_control (
 );
 insert into public.instabox_worker_control(singleton) values(true) on conflict do nothing;
 create table if not exists public.instabox_sync_audit (
-  job_id text primary key,
+  job_id uuid primary key,
   period_id text not null,
   previous_period jsonb not null,
   previous_settlements jsonb not null,
@@ -47,7 +63,7 @@ grant select on public.instabox_sync_audit to service_role;
 
 create or replace function public.instabox_worker_capabilities()
 returns jsonb language sql security definer set search_path=public,pg_temp as $$
-  select jsonb_build_object('version',2,'writes_enabled',writes_enabled) from public.instabox_worker_control where singleton;
+  select jsonb_build_object('version',3,'writes_enabled',writes_enabled) from public.instabox_worker_control where singleton;
 $$;
 
 create or replace function public.claim_sync_request(p_worker_id text, p_requested_by text default 'netlify-app', p_lease_seconds integer default 900)
@@ -72,7 +88,8 @@ begin
     from candidate where s.id=candidate.id returning s.*;
 end $$;
 
-create or replace function public.retry_sync_request(p_job_id text,p_worker_id text,p_error text)
+drop function if exists public.retry_sync_request(text,text,text);
+create or replace function public.retry_sync_request(p_job_id uuid,p_worker_id text,p_error text)
 returns void language plpgsql security definer set search_path=public,pg_temp as $$
 begin
   update public.sync_requests set
@@ -81,11 +98,12 @@ begin
     stage_message=case when attempt_count<max_attempts then 'Temporary failure; retry scheduled' else 'Sync failed after retries' end,
     error=left(p_error,2000), stage_updated_at=now(), lease_expires_at=null,
     next_attempt_at=now()+make_interval(secs=>least(300,5*power(2,least(attempt_count,6))::integer))
-    where id::text=p_job_id and worker_id=p_worker_id and status='processing' and lease_expires_at>now();
+    where id=p_job_id and worker_id=p_worker_id and status='processing' and lease_expires_at>now();
 end $$;
 
+drop function if exists public.finalize_sync_request(text,text,text,jsonb,text[],text,text);
 create or replace function public.finalize_sync_request(
-  p_job_id text,p_worker_id text,p_period_id text,p_receipts jsonb,p_members text[],
+  p_job_id uuid,p_worker_id text,p_period_id text,p_receipts jsonb,p_members text[],
   p_rounding text,p_settlement_id_mode text default 'existing-only'
 ) returns jsonb language plpgsql security definer set search_path=public,pg_temp as $$
 declare
@@ -94,14 +112,15 @@ declare
   shares bigint; v_member_totals jsonb; summary text; inserted integer:=0; affected integer;
 begin
   perform pg_advisory_xact_lock(17498013);
-  select * into j from public.sync_requests where id::text=p_job_id for update;
+  select * into j from public.sync_requests where id=p_job_id for update;
   -- A committed response lost in transit is a successful replay, regardless of lease.
   if j.status='done' and exists(select 1 from public.instabox_sync_audit where job_id=p_job_id and completed_at is not null) then
     return jsonb_build_object('result_summary',j.result_summary);
   end if;
   if not exists(select 1 from public.instabox_worker_control where singleton and writes_enabled) then raise exception 'Production writes disabled'; end if;
   if j.id is null or j.status<>'processing' or j.worker_id is distinct from p_worker_id or j.lease_expires_at<=now() or j.lease_expires_at is null then raise exception 'Lost job lease'; end if;
-  if coalesce(array_length(p_members,1),0)=0 or p_rounding not in ('floor','round') or p_rounding is null then raise exception 'Reviewed settlement rules required'; end if;
+  if coalesce(array_length(p_members,1),0)<>4 or p_rounding not in ('floor','round') or p_rounding is null then raise exception 'Four reviewed household members and settlement rules required'; end if;
+  if p_settlement_id_mode is distinct from 'existing-only' then raise exception 'Production requires an existing settlement; creation is disabled'; end if;
   if (select count(distinct m) from unnest(p_members) m)<>array_length(p_members,1) then raise exception 'Duplicate members'; end if;
   select * into p from public.periods where id::text=p_period_id for update;
   if p.id is null or p.status<>'CURRENT' then raise exception 'Only an existing CURRENT period may be refreshed'; end if;
@@ -139,14 +158,13 @@ begin
     into v_member_totals from unnest(p_members) m;
   select * into s from public.settlements where period_id::text=p_period_id order by calculated_at desc limit 1 for update;
   if s.id is null then
-    if p_settlement_id_mode not in ('text','uuid') then raise exception 'First settlement requires reviewed ID type'; end if;
-    s:=jsonb_populate_record(null::public.settlements,jsonb_build_object(
-      'id',case when p_settlement_id_mode='uuid' then md5('instabox-settlement:'||p_period_id) else 'instabox-settlement-'||p_period_id end,'period_id',p_period_id));
-    insert into public.settlements(id,period_id,total_cents,per_person_cents,member_totals,receipt_count,calculated_at)
-      values(s.id,s.period_id,total,shares,v_member_totals,count_receipts,now());
-  else
-    update public.settlements set total_cents=total,per_person_cents=shares,member_totals=v_member_totals,receipt_count=count_receipts,calculated_at=now() where id=s.id;
+    raise exception 'Existing CURRENT settlement required; payment obligations will not be synthesized';
   end if;
+  if s.id::text !~ '^settlement_[0-9]{4}-[0-9]{2}-[0-9]{2}_current$' then raise exception 'Unexpected CURRENT settlement ID convention'; end if;
+  -- These are receipt-derived display aggregates. Deliberately do not update
+  -- settlements.owes or any payment/confirmation field maintained by Muse/users.
+  update public.settlements set total_cents=total,per_person_cents=shares,
+    member_totals=v_member_totals,receipt_count=count_receipts,calculated_at=now() where id=s.id;
   update public.periods set total_cents=total,per_person_cents=shares,receipt_count=count_receipts where id=p.id;
   summary:=format('Sync complete: %s new receipt(s), %s receipt(s) in the period.',inserted,count_receipts);
   update public.sync_requests set status='done',stage='complete',stage_message='Sync complete',stage_updated_at=now(),result_summary=summary,error=null,lease_expires_at=null where id=j.id;
@@ -154,41 +172,59 @@ begin
   return jsonb_build_object('result_summary',summary);
 end $$;
 
-revoke all on function public.claim_sync_request(text,text,integer), public.retry_sync_request(text,text,text),
-  public.finalize_sync_request(text,text,text,jsonb,text[],text,text),public.instabox_worker_capabilities() from public,anon,authenticated;
-grant execute on function public.claim_sync_request(text,text,integer), public.retry_sync_request(text,text,text),
-  public.finalize_sync_request(text,text,text,jsonb,text[],text,text),public.instabox_worker_capabilities() to service_role;
+revoke all on function public.claim_sync_request(text,text,integer), public.retry_sync_request(uuid,text,text),
+  public.finalize_sync_request(uuid,text,text,jsonb,text[],text,text),public.instabox_worker_capabilities() from public,anon,authenticated;
+grant execute on function public.claim_sync_request(text,text,integer), public.retry_sync_request(uuid,text,text),
+  public.finalize_sync_request(uuid,text,text,jsonb,text[],text,text),public.instabox_worker_capabilities() to service_role;
 
 alter table public.sync_requests enable row level security;
 alter table public.receipts enable row level security;
 alter table public.periods enable row level security;
 alter table public.settlements enable row level security;
--- Restrictive policies constrain existing permissive policies as well. Preserve
--- existing grants/policies; service_role bypasses RLS. Household model matches frontend.
+-- Preserve the verified authenticated INSERT/SELECT policies on sync_requests.
+-- Restrictive policies constrain those existing permissive policies without
+-- replacing or renaming them; service_role bypasses RLS.
 grant select,insert on public.sync_requests to authenticated;
 revoke all on public.sync_requests,public.receipts,public.periods,public.settlements from anon,public;
 revoke update,delete on public.sync_requests from authenticated;
 grant select on public.receipts,public.periods,public.settlements to authenticated;
-drop policy if exists instabox_sync_read on public.sync_requests;
-drop policy if exists instabox_sync_insert on public.sync_requests;
 drop policy if exists instabox_sync_insert_guard on public.sync_requests;
 drop policy if exists instabox_sync_update_guard on public.sync_requests;
 drop policy if exists instabox_sync_delete_guard on public.sync_requests;
-drop policy if exists instabox_sync_anon_guard on public.sync_requests;
-create policy instabox_sync_read on public.sync_requests for select to authenticated using(requested_by='netlify-app');
-create policy instabox_sync_insert on public.sync_requests for insert to authenticated
-  with check(requested_by='netlify-app' and status='pending' and worker_id is null and lease_expires_at is null and attempt_count=0);
 create policy instabox_sync_insert_guard on public.sync_requests as restrictive for insert to authenticated
   with check(requested_by='netlify-app' and status='pending' and worker_id is null and lease_expires_at is null and attempt_count=0);
 create policy instabox_sync_update_guard on public.sync_requests as restrictive for update to authenticated using(false);
 create policy instabox_sync_delete_guard on public.sync_requests as restrictive for delete to authenticated using(false);
-create policy instabox_sync_anon_guard on public.sync_requests as restrictive for all to anon using(false) with check(false);
-drop policy if exists instabox_household_receipts_read on public.receipts;
-drop policy if exists instabox_household_periods_read on public.periods;
-drop policy if exists instabox_household_settlements_read on public.settlements;
-create policy instabox_household_receipts_read on public.receipts for select to authenticated using(true);
-create policy instabox_household_periods_read on public.periods for select to authenticated using(true);
-create policy instabox_household_settlements_read on public.settlements for select to authenticated using(true);
+do $$ begin
+  if not exists (
+    select 1 from pg_policies where schemaname='public' and tablename='sync_requests'
+      and cmd in ('SELECT','ALL') and 'authenticated'::name=any(roles)
+  ) or not exists (
+    select 1 from pg_policies where schemaname='public' and tablename='sync_requests'
+      and cmd in ('INSERT','ALL') and 'authenticated'::name=any(roles)
+  ) then raise exception 'Verified authenticated sync_requests INSERT/SELECT policies are missing'; end if;
+end $$;
+-- Remove only permissive SELECT policies granted to PUBLIC. Existing
+-- authenticated-read policies remain untouched and are required below.
+do $$
+declare policy_row record;
+begin
+  for policy_row in
+    select schemaname,tablename,policyname from pg_policies
+    where schemaname='public' and tablename in ('receipts','periods','settlements')
+      and cmd in ('SELECT','ALL') and permissive='PERMISSIVE'
+      and 'public'::name=any(roles)
+  loop
+    execute format('drop policy %I on %I.%I',policy_row.policyname,policy_row.schemaname,policy_row.tablename);
+  end loop;
+  if exists (
+    select 1 from (values('receipts'),('periods'),('settlements')) required(tablename)
+    where not exists (
+      select 1 from pg_policies p where p.schemaname='public' and p.tablename=required.tablename
+        and p.cmd in ('SELECT','ALL') and 'authenticated'::name=any(p.roles)
+    )
+  ) then raise exception 'Verified authenticated read policies are missing'; end if;
+end $$;
 -- Evidence is private; existing authenticated household read policy remains valid.
 do $$ begin
   if exists(select 1 from storage.buckets where id='bill-evidence' and public) then raise exception 'bill-evidence is public; review Storage before proceeding'; end if;

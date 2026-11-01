@@ -293,7 +293,7 @@ class SupabaseRestClient {
     const bucket = await this.request("storage/v1", "bucket/bill-evidence");
     if (!bucket || bucket.public !== false) throw new Error("bill-evidence must be a private Storage bucket.");
     const capabilities = await this.rpc("instabox_worker_capabilities", {});
-    if (capabilities?.version !== 2) throw new Error("Production safeguards migration is required.");
+    if (capabilities?.version !== 3) throw new Error("Production safeguards migration version 3 is required.");
     this.writeEnabled = capabilities.writes_enabled === true;
     this.columns = verified;
     return verified;
@@ -741,7 +741,7 @@ function createSupabaseWorker({
     }
     if (mode === LIVE_MODE && schemaVerified && liveWritesApproved) {
       const capabilities = await client.rpc("instabox_worker_capabilities", {});
-      client.writeEnabled = capabilities?.version === 2 && capabilities.writes_enabled === true;
+      client.writeEnabled = capabilities?.version === 3 && capabilities.writes_enabled === true;
     }
     if (mode !== LIVE_MODE) {
       if (!guardLogged) {
