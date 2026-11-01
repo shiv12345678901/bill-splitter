@@ -43,6 +43,12 @@ next-env.d.ts
 /user_config.json
 /.wwebjs_auth/
 /.wwebjs_cache/
+**/.wwebjs_auth/
+**/.wwebjs_cache/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
 
 # local development and verification artifacts
 /.agents/

@@ -49,7 +49,7 @@ SQLite uses foreign keys, unique message/cycle constraints, full synchronous com
 - WhatsApp session: `.wwebjs_auth/`.
 - Export/import: workspace JSON backups in Settings. They contain receipts and payment records, never API keys or authentication data. Image references require the original local media cache or connected WhatsApp session.
 - Scans are durable server jobs with queued, running, partial, failed, cancelled and complete states. Each image records its own outcome. Progress survives browser disconnects, unfinished work resumes after a server restart once WhatsApp is ready, and cancellation stops new image work while safely recording work already in flight.
-- **InstaBox/Supabase worker:** when `SUPABASE_URL` and a server-only `SUPABASE_SERVICE_ROLE_KEY` are configured, the same server polls `sync_requests` every five seconds. It atomically claims `pending` rows from the frontend (`requested_by = netlify-app`), reuses the WhatsApp/Gemini scan pipeline, uploads evidence to `bill-evidence`, preserves existing receipt edits, and updates `receipts`, `periods`, and `settlements` idempotently. The worker verifies the live Supabase columns before it claims its first job; schema or credential failures leave jobs untouched.
+- **InstaBox/Supabase worker:** run `npm run worker:sync` as a separate background process. It owns the persistent WhatsApp session, polls `sync_requests` every five seconds, atomically claims leased jobs from the frontend (`requested_by = netlify-app`), reuses the WhatsApp/Gemini scan pipeline, uploads private evidence to `bill-evidence`, preserves existing receipt edits and exclusions, and updates `receipts`, `periods`, and `settlements` idempotently. The normal web server and this worker cannot share the same WhatsApp profile at the same time; the session-owner lock makes that failure explicit.
 - Timeouts, quota limits, download failures and recognition errors are classified and retried with exponential backoff. The final reconciliation card shows processed, excluded, failed and skipped counts with reasons; **Retry failed images** leaves successful images untouched.
 - After the first successful load, the cached shell supports offline reload. Editing, calculations and exports work offline; scanning and local history require the server.
 
@@ -60,6 +60,8 @@ Recognition sends selected images to Google Gemini. The app does not send WhatsA
 ```text
 server.js                   Express startup and WhatsApp lifecycle
 server/services/            Recognition, media, discovery, workers, storage, calculations
+server/worker-sync.cjs      Standalone InstaBox Supabase worker entrypoint
+supabase/migrations/        Additive lease/RPC migration (review before applying)
 server/sockets/             Groups, participants, context, scan and history handlers
 public/index.html           Desktop shell
 public/js/app.mjs           Navigation and rendering
@@ -87,6 +89,41 @@ npm test
 `build` validates the source; native modules are served directly. For browser checks, start `npm run preview:ui` in another terminal, then run `npm run test:ui`. Port 4173 has no WhatsApp client or production data-writing handlers. Tests use fictional data and temporary directories.
 
 Live WhatsApp authentication and group discovery were verified. Live receipt scanning/OCR and real payment transfers were not exercised during the rebuild.
+
+## InstaBox Supabase worker
+
+The worker is deliberately locked to `dry-run` by default:
+
+```sh
+npm run worker:sync
+```
+
+In dry-run it verifies the configured Supabase REST schema and performs no job claim, database write, storage upload, WhatsApp login, or Gemini request. For production, apply and review `supabase/migrations/20261101000000_instabox_sync_request_leases.sql`, then use a server-only `.env` with:
+
+```text
+SUPABASE_WORKER_MODE=live
+SUPABASE_WORKER_SCHEMA_APPROVED=I_HAVE_CONFIRMED_SUPABASE_SCHEMA
+SUPABASE_WORKER_WRITE_CONFIRM=I_UNDERSTAND_SUPABASE_WORKER_WRITES
+```
+
+The worker also requires `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, at least one `GEMINI_API_KEY` value, and a WhatsApp group ID (or the existing `user_config.json` default). `SPLITMATE_SUPABASE_POLL_MS` defaults to 5000 and `SPLITMATE_SYNC_LEASE_SECONDS` defaults to 900. Never put the service-role key, WhatsApp session directory, local SQLite database, image cache, or `user_config.json` in Git.
+
+Before enabling live mode, confirm the actual database types and policies rather than relying on names alone:
+
+- No canonical `periods`/`receipts`/`settlements`/`sync_requests` table migration was present in either repository during this implementation. The frontend repository supplies the read/write field contract and only includes the bank-transfer and private-access SQL files, so the worker refuses live writes until the runtime schema check and the two explicit confirmations pass.
+- `sync_requests` contains the frontend fields `requested_by`, `status`, `stage`, `stage_message`, `stage_updated_at`, `result_summary`, `error`, `created_at`, plus the additive lease fields from the migration. The `claim_sync_request` RPC must be available to `service_role`.
+- `periods`, `receipts`, and `settlements` expose the fields listed in `REQUIRED_COLUMNS` in `server/services/supabase-worker.cjs`, with `receipts.amount_cents` and settlement totals represented as integer AUD cents. The worker does not overwrite an existing receipt row; it only fills a missing private image locator.
+- The private `bill-evidence` Storage bucket exists and the frontend's authenticated read policy is in place. Stored locators use `storage://bill-evidence/<period>/<message-id>.<extension>`.
+- The available SplitMate OCR rules use five categories and exclude transfer proofs. Muse's own worker and additional validation rules were not available in these repositories. Confirm its payer membership, period/date/timezone rules, zero-amount treatment and equal-share rounding before production. `createSupabaseWorker({ adapter })` explicitly accepts `validateReceipt(expense, periodId, aliases)` and `settlementForReceipts(rows, members)` replacements for a reviewed mapping; the bundled adapter preserves zero-amount review records and normalizes unknown categories to Other.
+- `SUPABASE_SETTLEMENT_ID_MODE=existing-only` is the default. First insertion requires confirming `settlements.id` and selecting `text` or `uuid`; both create deterministic IDs so an ambiguous network response cannot create another settlement on retry. Confirm `receipts.id` accepts stable WhatsApp message IDs and has a unique constraint; otherwise provide a reviewed ID adapter and source-ID mapping migration first.
+
+The worker claims one request at a time, renews its lease while scanning, retries an expired `processing` lease through the database RPC, and reports `pending`, `processing`, `done`, or `failed` together with `stage`, `stage_message`, `stage_updated_at`, `result_summary`, and `error`. The SQL file is additive and was not applied to any live project during development.
+
+All cooperating consumers must use `claim_sync_request`. Disable the legacy Muse poller during handover unless it adopts the same lease protocol: a new RPC cannot prevent an unmodified old poller from writing. Unleased `processing` jobs are left alone for operator review. Periods must already exist; this worker does not invent or close settlement boundaries. Date inputs use the existing scanner's process timezone (`TZ=Australia/Sydney` on the VM); the bundled receipt adapter stores the original capture instant and its UTC date, pending confirmation of Muse's date convention. Configure an adapter if Muse stores Sydney calendar dates.
+
+Receipt inserts ignore existing IDs, evidence uploads never overwrite objects, and missing image locators are filled only while still null. Pagination reads all saved period receipts for recomputation. Period and settlement refreshes are separate retryable requests, not one database transaction; after an interrupted refresh the next sync repairs totals from saved receipts. Database-side fencing/transactional finalization must be reviewed with the actual schema if independent writers will remain active. Failed image work and rejected records mark the request failed while retaining successful receipts; a new frontend sync reuses the local image/OCR cache.
+
+On the InstaBox VM, install Node 22.5+ and Chrome's Linux runtime dependencies, check out this branch, run `npm ci`, store `.env` outside Git, and keep `SESSION_DATA_PATH` (use an absolute path) and `SPLITMATE_DATA_DIR` on persistent disk. Run `npm run worker:sync` first in dry-run, then enable live mode after the above confirmations and link WhatsApp using the terminal QR. Use a process supervisor to restart the worker after VM reboot. Only one process may own a profile; for concurrent local UI access use `SPLITMATE_NO_WHATSAPP=1 npm start` with the worker owning WhatsApp. Dependency installation may require approving Puppeteer's install script or provisioning Chrome separately.
 
 ## Design rationale
 

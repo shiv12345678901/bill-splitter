@@ -18,7 +18,7 @@ const {
   formatWhatsAppReport,
 } = require("./server/services/settlement.cjs");
 const { downloadMediaBuffer } = require("./server/services/media.cjs");
-const { createConfiguredSupabaseWorker } = require("./server/services/supabase-worker.cjs");
+const { WhatsAppSessionLock } = require("./server/services/whatsapp-session-lock.cjs");
 const detectSettlementCycles = (groupId) =>
   require("./server/services/cycles.cjs").detectSettlementCycles(
     groupId,
@@ -95,6 +95,7 @@ let clientStatus = "DISCONNECTED"; // DISCONNECTED | INITIALIZING | QR_READY | A
 let lastQrRaw = null;
 let lastQrDataUrl = null;
 let connectedUser = null;
+let sessionLock = null;
 const scanManager = require("./server/sockets/scan.cjs").createScanManager(
   io,
   () => ({ client, clientStatus, geminiApiKeys, geminiApiKey }),
@@ -120,12 +121,13 @@ process.on("unhandledRejection", (err) => reportWhatsAppError("unhandled rejecti
 // -----------------------------------------------------------------------------
 // WhatsApp Client Lifecycle
 // -----------------------------------------------------------------------------
-function initializeWhatsAppClient() {
+async function initializeWhatsAppClient() {
   if (client) {
     try {
-      client.destroy();
+      await client.destroy();
     } catch (e) {
       console.warn("Error destroying existing client:", e.message);
+      return;
     }
   }
 
@@ -135,11 +137,24 @@ function initializeWhatsAppClient() {
   connectedUser = null;
   io.emit("client:status", { status: clientStatus });
 
-  const sessionDataPath = process.env.SESSION_DATA_PATH || "./.wwebjs_auth";
+  const sessionDataPath = path.resolve(
+    __dirname,
+    process.env.SESSION_DATA_PATH || "./.wwebjs_auth",
+  );
+  if (!sessionLock) {
+    try {
+      sessionLock = new WhatsAppSessionLock(sessionDataPath, "splitmate-server").acquire();
+    } catch (error) {
+      clientStatus = "ERROR";
+      console.error("[WhatsApp] Could not acquire the session owner lock:", error.message);
+      io.emit("client:status", { status: clientStatus, error: error.message });
+      return;
+    }
+  }
 
   client = new Client({
     authStrategy: new LocalAuth({
-      dataPath: path.resolve(__dirname, sessionDataPath),
+      dataPath: sessionDataPath,
     }),
     puppeteer: {
       headless: true,
@@ -316,6 +331,8 @@ io.on("connection", (socket) => {
     lastQrRaw = null;
     lastQrDataUrl = null;
     connectedUser = null;
+    sessionLock?.release();
+    sessionLock = null;
     io.emit("client:status", { status: "DISCONNECTED" });
   });
 
@@ -411,17 +428,6 @@ server.listen(PORT, HOST, () => {
 
   if (process.env.SPLITMATE_NO_WHATSAPP !== "1") initializeWhatsAppClient();
 
-  const supabaseWorkerEnabled = process.env.SUPABASE_WORKER_ENABLED !== "0";
-  const hasSupabaseUrl = Boolean(process.env.SUPABASE_URL);
-  const hasSupabaseServerKey = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY);
-  if (supabaseWorkerEnabled && hasSupabaseUrl && hasSupabaseServerKey) {
-    const worker = createConfiguredSupabaseWorker({
-      scanManager,
-      getConnection: () => ({ client, clientStatus, geminiApiKeys, geminiApiKey }),
-      loadUserConfig,
-    });
-    if (worker) worker.start();
-  } else if (process.env.SUPABASE_URL || hasSupabaseServerKey) {
-    console.warn("[Supabase] InstaBox worker is disabled until SUPABASE_URL and a server-only key are configured.");
-  }
 });
+
+process.on("exit", () => sessionLock?.release());

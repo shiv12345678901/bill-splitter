@@ -6,6 +6,7 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
+    "worker:sync": "node server/worker-sync.cjs",
     "dev": "node --watch server.js",
     "build": "node scripts/check.cjs",
     "check": "node scripts/check.cjs",
