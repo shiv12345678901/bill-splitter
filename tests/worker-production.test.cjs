@@ -18,6 +18,9 @@ test("deployment configuration keeps state, drops privileges and publishes no ad
   assert.match(dockerfile, /USER node/);
   assert.match(dockerfile, /HEALTHCHECK/);
   assert.match(dockerfile, /chromium/);
+  assert.match(dockerfile, /COPY package\.json package-lock\.json \.npmrc/);
+  assert.match(dockerfile, /npm ci --omit=dev --omit=optional/);
+  assert.match(fs.readFileSync(".npmrc", "utf8"), /^omit=optional$/m);
   assert.match(fs.readFileSync(".dockerignore", "utf8"), /^\*\*/);
 });
 

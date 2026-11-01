@@ -4,8 +4,8 @@ ENV NODE_ENV=production PUPPETEER_SKIP_DOWNLOAD=true PUPPETEER_EXECUTABLE_PATH=/
 RUN apt-get update && apt-get install -y --no-install-recommends chromium ca-certificates fonts-liberation tini \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+COPY package.json package-lock.json .npmrc ./
+RUN npm ci --omit=dev --omit=optional && npm cache clean --force
 COPY --chown=node:node server ./server
 COPY --chown=node:node scripts/worker-health.cjs ./scripts/worker-health.cjs
 COPY --chown=node:node scripts/worker-pair.cjs ./scripts/worker-pair.cjs
