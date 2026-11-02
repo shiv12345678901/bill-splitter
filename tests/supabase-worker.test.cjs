@@ -60,7 +60,7 @@ test("validation rejects impossible calendar dates, absent amounts and unknown p
   assert.equal(validateReceipt({ ...receipt, paidBy: "sender" }, "p", { sender: "Jamie" }).payer, "Jamie");
 });
 
-function fakeIntegration({ failInsert = false } = {}) {
+function fakeIntegration({ failInsert = false, periodStatus = "CURRENT" } = {}) {
   const receipts = new Map([["edited", { id: "edited", period_id: "p", merchant: "Manual edit", payer: "Alex", amount_cents: 999, date: "2026-10-01", is_excluded: true, image_url: "storage://bill-evidence/manual.jpg" }]]);
   const settlements = [];
   const uploads = [];
@@ -77,7 +77,7 @@ function fakeIntegration({ failInsert = false } = {}) {
     scanManager: { prepare: async () => ({ jobId: "local", expectedImages: 3 }), runAndGet: async () => {} },
     client: {
       select: async (table, query) => {
-        if (table === "periods") return [{ id: "p", start_date: "2026-10-01", end_date: "2026-10-31" }];
+        if (table === "periods") return [{ id: "p", status: periodStatus, start_date: "2026-10-01", end_date: "2026-10-31" }];
         if (table === "settlements") return settlements;
         if (query.id) return receipts.has(query.id.slice(3)) ? [receipts.get(query.id.slice(3))] : [];
         return [...receipts.values()].slice(query.offset || 0, (query.offset || 0) + query.limit);
@@ -118,6 +118,70 @@ test("replaying a scan preserves manual edits and exclusions, uploads private ev
 test("persistence failure fails the job instead of being swallowed as a validation warning", async () => {
   const { worker } = fakeIntegration({ failInsert: true });
   await assert.rejects(() => worker.processClaimedJob({ id: "job" }, { assert() {} }), /Supabase unavailable/);
+});
+
+test("the worker refuses to place receipts into a closed Supabase period", async () => {
+  const { worker } = fakeIntegration({ periodStatus: "CLOSED" });
+  await assert.rejects(
+    () => worker.processClaimedJob({ id: "job", period_id: "p" }, { assert() {} }),
+    /period is closed/i,
+  );
+});
+
+test("transactional publishing records pending-cycle metadata before finalizing receipts", async () => {
+  const rpcCalls = [];
+  const calculationMessage = { id: "calc-1", text: "Total = 40", timestamp: 1793500000 };
+  const worker = createSupabaseWorker({
+    mode: "dry-run",
+    transactionalWrites: true,
+    workerId: "test-worker",
+    contract: {
+      approved: true,
+      value: {
+        members: ["Alex", "Jamie", "Morgan", "Taylor"],
+        aliases: {},
+        shareRounding: "floor",
+        settlementIdMode: "existing-only",
+        zeroAmountPolicy: "preserve",
+      },
+    },
+    groupId: "fixture-group",
+    loadUserConfig: () => ({ aliases: {} }),
+    scanManager: {
+      prepare: async () => ({ jobId: "local", expectedImages: 1, status: "queued" }),
+      runAndGet: async () => {},
+    },
+    localDatabase: {
+      getScanJob: () => ({
+        status: "complete",
+        selectedCycleData: {
+          status: "PENDING_SETTLEMENT",
+          calculationMessage,
+          clearanceMessage: null,
+        },
+        result: { expenses: [{ id: "receipt-1", date: "2026-10-02", paidBy: "Alex", merchant: "Market", amount: 10, category: "Groceries" }] },
+        reconciliation: { failed: 0, queued: 0 },
+      }),
+    },
+    imageLoader: async () => ({ buffer: Buffer.from("image"), mimetype: "image/jpeg" }),
+    client: {
+      select: async (table) => table === "periods"
+        ? [{ id: "p", status: "CURRENT", start_date: "2026-10-01", end_date: "2026-10-31" }]
+        : [],
+      upload: async () => {},
+      update: async (table, filters, body) => table === "sync_requests" ? [{ id: "job", ...body }] : [],
+      rpc: async (name, body) => {
+        rpcCalls.push({ name, body });
+        return name === "finalize_sync_request" ? { result_summary: "done" } : null;
+      },
+    },
+  });
+  const result = await worker.processClaimedJob({ id: "11111111-1111-4111-8111-111111111111" }, { assert() {} });
+  assert.equal(result.finalized, true);
+  assert.deepEqual(rpcCalls.map((call) => call.name), ["record_period_cycle_state", "finalize_sync_request"]);
+  assert.equal(rpcCalls[0].body.p_cycle_status, "PENDING_SETTLEMENT");
+  assert.deepEqual(rpcCalls[0].body.p_calculation_message, calculationMessage);
+  assert.equal(rpcCalls[0].body.p_clearance_message, null);
 });
 
 test("settlement totals use cents, stable members, and exclude transfer proofs", () => {
@@ -306,8 +370,8 @@ test("a lost job lease stops processing before receipt writes", async () => {
     transactionalWrites: false,
     client: {
       verifySchema: async () => {},
-      rpc: async (name) => name === "instabox_worker_capabilities" ? { version: 3, writes_enabled: true } : [{ id: "recovered", lease_expires_at: new Date(Date.now() + 60000).toISOString() }],
-      select: async () => [{ id: "p", start_date: "2026-10-01", end_date: "2026-10-31" }],
+      rpc: async (name) => name === "instabox_worker_capabilities" ? { version: 4, writes_enabled: true } : [{ id: "recovered", lease_expires_at: new Date(Date.now() + 60000).toISOString() }],
+      select: async () => [{ id: "p", status: "CURRENT", start_date: "2026-10-01", end_date: "2026-10-31" }],
       update: async () => [],
       insert: async () => { throw new Error("no insert should occur after lease loss"); },
     },

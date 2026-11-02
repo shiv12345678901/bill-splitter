@@ -7,6 +7,7 @@ const database = require("../services/database.cjs");
 const library = require("../services/library.cjs");
 const { loadReceiptCache } = require("../services/storage.cjs");
 const { loadUserConfig } = require("../services/config.cjs");
+const { selectCycleForPeriod } = require("../services/cycle-state.cjs");
 const {
   calculateSettlement,
   formatWhatsAppReport,
@@ -93,9 +94,18 @@ function createScanManager(
     let selectedCycleData = null;
     let activeCheckpoint = null;
 
-    if (cycleId && detectSettlementCycles) {
+    if ((cycleId || sync) && detectSettlementCycles) {
       const cycles = await detectSettlementCycles(groupId);
-      const target = cycles.find((cycle) => cycle.id === cycleId);
+      const target = cycleId
+        ? cycles.find((cycle) => cycle.id === cycleId)
+        : selectCycleForPeriod(cycles, startDate);
+      if (!target) {
+        throw new Error(
+          cycleId
+            ? "The requested WhatsApp settlement cycle was not found."
+            : "The Supabase period cannot be mapped to exactly one WhatsApp settlement cycle; refusing to mix cycles.",
+        );
+      }
       if (target) {
         selectedCycleData = {
           id: target.id,
@@ -108,14 +118,19 @@ function createScanManager(
           groundTruth: target.groundTruth,
           groceryCount: target.groceryCount || 0,
           paymentCount: target.paymentCount || 0,
+          unclassifiedCount: target.unclassifiedCount || 0,
+          calculationMessage: target.calculationMessage || null,
+          clearanceMessage: target.clearanceMessage || null,
+          settlementConfirmed: target.settlementConfirmed === true,
         };
         startDate = target.startDate;
-        endDate = target.endDate;
+        if (target.endDate) endDate = target.endDate;
         activeCheckpoint = target.startCheckpoint || null;
         const seen = new Set();
         for (const message of [
           ...(target.groceryMessages || []),
           ...(target.paymentMessages || []),
+          ...(target.unclassifiedMessages || []),
         ]) {
           if (!message?.id || seen.has(message.id)) continue;
           seen.add(message.id);
@@ -273,8 +288,13 @@ function createScanManager(
       cycleRecord = await library.recordSettlementCycle({
         groupId: job.groupId,
         groupName: job.groupDisplayName,
-        startDate: job.checkpoint?.dateStr || job.request.startDate,
-        endDate: job.request.endDate,
+        startDate: job.selectedCycleData?.startDate || job.checkpoint?.dateStr || job.request.startDate,
+        endDate: job.selectedCycleData ? job.selectedCycleData.endDate : job.request.endDate,
+        status: job.selectedCycleData?.status,
+        calculationMessage: job.selectedCycleData?.calculationMessage,
+        clearanceMessage: job.selectedCycleData?.clearanceMessage,
+        settlementConfirmed: job.selectedCycleData?.settlementConfirmed,
+        unclassifiedCount: job.selectedCycleData?.unclassifiedCount,
         checkpoint: job.checkpoint,
         startBoundary: job.selectedCycleData?.startBoundary || job.checkpoint,
         endBoundary: job.selectedCycleData?.endBoundary || null,
@@ -496,7 +516,15 @@ function createScanManager(
     return database.getScanJob(jobId);
   }
 
-  return { prepare, run, runAndGet, cancel, resumePending, registerSocket };
+  return {
+    prepare,
+    run,
+    runAndGet,
+    cancel,
+    resumePending,
+    registerSocket,
+    detectCycles: async (groupId) => detectSettlementCycles ? detectSettlementCycles(groupId) : [],
+  };
 }
 
 module.exports = function registerScan(socket, getConnection, dependencies) {

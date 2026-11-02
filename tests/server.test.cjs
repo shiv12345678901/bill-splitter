@@ -613,6 +613,39 @@ test("rescanning one cycle updates its record instead of creating another", asyn
   assert.notEqual(updated.scannedAt, first.scannedAt);
 });
 
+test("incomplete redetection never reopens a scanned settled cycle", async () => {
+  const groupId = "incomplete-history-group";
+  const startBoundary = { id: "clear-start", text: "All settled", dateStr: "2026-10-01", timestamp: 100, source: "marker", confidence: "HIGH" };
+  const endBoundary = { id: "clear-end", text: "Clear up to date", dateStr: "2026-10-10", timestamp: 200, source: "marker", confidence: "HIGH" };
+  await library.recordSettlementCycle({
+    groupId,
+    groupName: "Test household",
+    startDate: "2026-10-01",
+    endDate: "2026-10-10",
+    status: "SETTLED",
+    settlementConfirmed: true,
+    startBoundary,
+    endBoundary,
+    clearanceMessage: endBoundary,
+    images: [],
+    totals: { totalPool: 0, fairShare: 0, memberTotals: {} },
+  });
+  await library.upsertDetectedCycles(groupId, "Test household", [{
+    id: "cycle_current",
+    status: "ACTIVE",
+    startDate: "2026-10-01",
+    endDate: null,
+    startBoundary,
+    endBoundary: null,
+    groceryCount: 0,
+    paymentCount: 0,
+  }]);
+  const saved = library.loadSettlementCycles().find((cycle) => cycle.groupId === groupId);
+  assert.equal(saved.status, "SETTLED");
+  assert.equal(saved.endBoundaryId, "clear-end");
+  assert.equal(saved.settlementConfirmed, true);
+});
+
 test("legacy cycle keys merge by group and checkpoint date", async () => {
   const groupId = "legacy-cycle-group";
   library.saveSettlementCycles([

@@ -45,8 +45,11 @@ function completenessFor(cycle) {
   const images = Array.isArray(cycle.images) ? cycle.images : [];
   const expected = Math.max(
     0,
-    Number(cycle.completeness?.expected ?? cycle.expectedMedia ??
-      (Number(cycle.groceryCount) || 0) + (Number(cycle.paymentCount) || 0)),
+    Number(cycle.completeness?.expected ?? cycle.expectedMedia ?? (
+      (Number(cycle.groceryCount) || 0) +
+      (Number(cycle.paymentCount) || 0) +
+      (Number(cycle.unclassifiedCount) || 0)
+    )),
   );
   const processed = Math.max(
     0,
@@ -87,10 +90,12 @@ function migrateCycle(cycle, { groupStartDates = {} } = {}) {
       confidence: cycle.endBoundaryConfidence,
     });
   }
-  const active = cycle.status === "ACTIVE";
+  const open = cycle.status === "ACTIVE" || cycle.status === "PENDING_SETTLEMENT";
+  const inferredBoundary = startBoundary?.source === "calculation" || endBoundary?.source === "calculation"
+    || startBoundary?.confidence === "LOW" || endBoundary?.confidence === "LOW";
   const issues = [];
   if (!startBoundary) issues.push("Missing immutable start boundary message ID");
-  if (!active && !endBoundary)
+  if (!open && !endBoundary)
     issues.push("Missing immutable end boundary message ID");
   if (startBoundary?.confidence === "LOW" || endBoundary?.confidence === "LOW")
     issues.push("A boundary was inferred from a settlement calculation");
@@ -100,6 +105,7 @@ function migrateCycle(cycle, { groupStartDates = {} } = {}) {
     `${groupId}|legacy:${crypto.randomUUID()}`;
   return {
     ...cycle,
+    status: inferredBoundary && cycle.status === "SETTLED" ? "UNCONFIRMED" : cycle.status,
     schemaVersion: 2,
     cycleKey,
     legacyCycleKey:
@@ -144,7 +150,7 @@ function validateCycles(cycles) {
         cycle.endBoundary.timestamp <= cycle.startBoundary.timestamp
       ) issues.add("End boundary is not after the start boundary");
       const next = group[index + 1];
-      if (next && cycle.status !== "ACTIVE") {
+      if (next && !["ACTIVE", "PENDING_SETTLEMENT"].includes(cycle.status)) {
         if (!cycle.endBoundaryId || !next.startBoundaryId) {
           issues.add("Cannot prove that this period meets the next period");
         } else if (cycle.endBoundaryId !== next.startBoundaryId) {

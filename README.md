@@ -16,7 +16,7 @@ Node.js 22.5 or newer is required. Open http://localhost:3000 and keep the termi
 1. Edit settlement details: choose the period and everyone sharing the costs, including people who have not bought anything.
 2. Collect receipt images from WhatsApp or add an expense manually.
    Before recognition starts, the app shows the number of images found, how many are already saved and the maximum Gemini requests required. Confirm **Start scan** after reviewing that estimate.
-   Use **Sync receipts** to refresh the current settlement cycle: it finds the newest "clear up to date" marker in the chat and loads every receipt from that point through today, preserving existing edits, exclusions and the period when the marker moves earlier. Loading failures are reported instead of silently showing an incomplete result.
+   Use **Sync receipts** to refresh the current settlement cycle. A calculation changes the cycle to `PENDING_SETTLEMENT` but does not close it. Only an explicit clearance message closes the cycle; images remain in that open cycle until then. Loading failures are reported instead of silently showing an incomplete result.
    By default, **Collect receipts** shows every settlement cycle found in the chat and scans the one you pick; the custom date-range option still searches for the newest marker itself. PDFs and other documents are ignored — only photos are collected.
 3. Review uncertain receipts in the list and detail workspace. Correct details, exclude duplicates, and undo accidental deletions. Unfinished edits survive navigation and reload. Re-scanning repairs receipts whose image previously failed to download. Filter the list by person or type (transfers, needs review, excluded), and open any receipt in a full-screen preview with next/previous navigation.
 4. Review the payment plan. Whole-cent calculations distribute remaining cents in alphabetical order. Confirm a payment only after money has changed hands. "Copy calculation" produces the household's chat format with each person's receipts added up.
@@ -26,7 +26,7 @@ Financial edits clear payment confirmations. Closed settlements and history reco
 
 ## Settlement cycles
 
-The **Cycles** page runs a full scan of the group chat and maps each settlement using immutable WhatsApp boundary message IDs. Every record stores explicit start and end boundaries plus expected, processed, failed and excluded media counts. Gaps, overlaps, low-confidence calculation fallbacks and legacy records without IDs are marked **Boundary review**; they are never silently accepted, and a workspace linked to one cannot be closed. **Repair** can split, merge or correct a boundary without deleting saved receipt images. A one-time `settlement_cycles.pre-v2.backup.json` protects the pre-migration records.
+The **Cycles** page runs a full scan of the group chat and maps each settlement using immutable WhatsApp boundary message IDs. `ACTIVE` means no calculation is present, `PENDING_SETTLEMENT` means a calculation exists but final clearance has not arrived, and `SETTLED` requires an explicit clearance message. Calculation messages are events, never boundaries. Existing calculation-inferred historical records remain preserved but migrate to `UNCONFIRMED`. Every record stores explicit boundaries plus expected, processed, failed, excluded and unclassified media counts. Gaps, overlaps and legacy records without IDs are marked **Boundary review**; they are never silently accepted.
 
 "Scan receipts" loads a cycle's media and records its calculation. Re-scanning the same immutable cycle overwrites that cycle only when its receipts or totals changed; frequent scans do not create new cycles. Boundary repairs clear unsafe totals until the affected period is scanned again.
 
@@ -92,7 +92,7 @@ Live WhatsApp authentication and group discovery were verified. Live receipt sca
 
 ## InstaBox Supabase worker
 
-Production Docker, private WhatsApp pairing, migration, operations, update and rollback commands are in [DEPLOY_INSTABOX.md](DEPLOY_INSTABOX.md).
+Production Docker, private WhatsApp pairing, migration, operations, update and rollback commands are in [DEPLOY_INSTABOX.md](DEPLOY_INSTABOX.md). The pending-settlement metadata migration is required before this version can enter live mode; it leaves the write switch off and never rotates periods or changes settlement obligations.
 
 The worker is deliberately locked to `dry-run` by default:
 
@@ -100,7 +100,7 @@ The worker is deliberately locked to `dry-run` by default:
 npm run worker:sync
 ```
 
-In dry-run it verifies the configured Supabase REST schema and performs no job claim, database write, storage upload, WhatsApp login, or Gemini request. For production, apply and review `supabase/migrations/20261101000000_instabox_sync_request_leases.sql`, then use a server-only `.env` with:
+In dry-run it verifies the configured Supabase REST schema and performs no job claim, database write, storage upload, WhatsApp login, or Gemini request. For production, review all three ordered migrations under `supabase/migrations/`, then use a server-only `.env` with:
 
 ```text
 SUPABASE_WORKER_MODE=live
@@ -121,7 +121,9 @@ Before enabling live mode, confirm the actual database types and policies rather
 
 The worker claims one request at a time, renews its lease while scanning, retries an expired `processing` lease through the database RPC, and reports `pending`, `processing`, `done`, or `failed` together with `stage`, `stage_message`, `stage_updated_at`, `result_summary`, and `error`. The SQL file is additive and was not applied to any live project during development.
 
-All cooperating consumers must use `claim_sync_request`. Disable the legacy Muse poller during handover unless it adopts the same lease protocol: a new RPC cannot prevent an unmodified old poller from writing. Unleased `processing` jobs are left alone for operator review. Periods must already exist; this worker does not invent or close settlement boundaries. Date inputs use the existing scanner's process timezone (`TZ=Australia/Sydney` on the VM); the bundled receipt adapter stores the original capture instant and its UTC date, pending confirmation of Muse's date convention. Configure an adapter if Muse stores Sydney calendar dates.
+All cooperating consumers must use `claim_sync_request`. Disable the legacy Muse poller during handover unless it adopts the same lease protocol: a new RPC cannot prevent an unmodified old poller from writing. Unleased `processing` jobs are left alone for operator review. Periods must already exist; this worker does not invent, close, extend or rotate Supabase periods. It refuses a non-`CURRENT` target and refuses an ambiguous WhatsApp-cycle mapping. WhatsApp day boundaries are explicitly evaluated in `Australia/Sydney`; the reviewed contract must still confirm the database receipt-date convention.
+
+The worker records only factual WhatsApp cycle metadata on the existing `CURRENT` period. A fixed Supabase `end_date` that ends before a still-open WhatsApp cycle is a deliberate production blocker: receipts outside that date fail validation instead of being moved into a closed period. Period rotation remains a separately reviewed Muse/operator action. The worker never guesses payment-step mappings or writes `bank_transfer_receipts`; recognized proofs are published only as excluded receipt evidence (when the reviewed zero-amount rule permits it), retain their source message IDs/private locators, and remain unverified until a separate review explicitly verifies a payment.
 
 Receipt inserts ignore existing IDs, evidence uploads never overwrite objects, and missing image locators are filled only while still null. Pagination reads all saved period receipts for recomputation. Period and settlement refreshes are separate retryable requests, not one database transaction; after an interrupted refresh the next sync repairs totals from saved receipts. Database-side fencing/transactional finalization must be reviewed with the actual schema if independent writers will remain active. Failed image work and rejected records mark the request failed while retaining successful receipts; a new frontend sync reuses the local image/OCR cache.
 

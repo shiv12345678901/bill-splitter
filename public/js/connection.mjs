@@ -239,10 +239,12 @@ socket.on("cycles:detected", (data) => {
   }
   if (pendingSync) {
     pendingSync = false;
-    const current = state.detectedCycles.find((c) => c.status === "ACTIVE");
+    const current = state.detectedCycles.find((c) =>
+      ["ACTIVE", "PENDING_SETTLEMENT"].includes(c.status),
+    );
     if (!current) {
       state.error =
-        'No "clear up to date" marker was found in this chat, so there is no current cycle to sync. Collect receipts with a custom date range instead.';
+        "No open WhatsApp settlement cycle could be identified safely. Scan cycles and review its boundaries first.";
       emit();
       return;
     }

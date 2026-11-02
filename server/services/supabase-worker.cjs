@@ -47,6 +47,10 @@ const REQUIRED_COLUMNS = {
     "total_cents",
     "per_person_cents",
     "receipt_count",
+    "whatsapp_cycle_status",
+    "whatsapp_calculation_message",
+    "whatsapp_clearance_message",
+    "whatsapp_cycle_updated_at",
   ],
   receipts: [
     "id",
@@ -315,7 +319,7 @@ class SupabaseRestClient {
     const bucket = await this.request("storage/v1", "bucket/bill-evidence");
     if (!bucket || bucket.public !== false) throw new Error("bill-evidence must be a private Storage bucket.");
     const capabilities = await this.rpc("instabox_worker_capabilities", {});
-    if (capabilities?.version !== 3) throw new Error("Production safeguards migration version 3 is required.");
+    if (capabilities?.version !== 4) throw new Error("Pending-settlement safeguards migration version 4 is required.");
     this.writeEnabled = capabilities.writes_enabled === true;
     this.columns = verified;
     return verified;
@@ -592,6 +596,9 @@ function createSupabaseWorker({
   async function processClaimedJob(job, lease) {
     const period = await currentPeriod(job.period_id || job.periodId || null);
     if (!period) throw new Error("No current settlement period is available in Supabase.");
+    if (period.status !== "CURRENT") {
+      throw new Error("The requested period is closed; refusing to move WhatsApp receipts into it.");
+    }
 
     const context = requestContext(job, period);
     if (!context.groupId) throw new Error("No WhatsApp group is configured for the Supabase worker.");
@@ -641,6 +648,17 @@ function createSupabaseWorker({
     if (transactionalWrites) {
       if (saved.invalid.length || localJob.status !== "complete") throw new Error("Scan is incomplete or failed validation; saved local results were retained for retry.");
       if (!contract.approved) throw new Error("Production writes require a reviewed contract.");
+      lease.assert();
+      const cycle = localJob.selectedCycleData;
+      if (!cycle) throw new Error("The scan has no verified WhatsApp cycle mapping.");
+      await client.rpc("record_period_cycle_state", {
+        p_job_id: String(job.id),
+        p_worker_id: workerId,
+        p_period_id: String(period.id),
+        p_cycle_status: cycle.status,
+        p_calculation_message: cycle.calculationMessage,
+        p_clearance_message: cycle.clearanceMessage,
+      });
       lease.assert();
       const result = await client.rpc("finalize_sync_request", {
         p_job_id: String(job.id), p_worker_id: workerId, p_period_id: String(period.id),
@@ -763,7 +781,7 @@ function createSupabaseWorker({
     }
     if (mode === LIVE_MODE && schemaVerified && liveWritesApproved) {
       const capabilities = await client.rpc("instabox_worker_capabilities", {});
-      client.writeEnabled = capabilities?.version === 3 && capabilities.writes_enabled === true;
+      client.writeEnabled = capabilities?.version === 4 && capabilities.writes_enabled === true;
     }
     if (mode !== LIVE_MODE) {
       if (!guardLogged) {

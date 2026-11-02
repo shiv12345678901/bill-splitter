@@ -150,6 +150,9 @@ function upsertDetectedCycles(groupId, groupName, cycles) {
       );
       const existing =
         matches.find((record) => record.scannedAt) || matches[0] || null;
+      const preserveVerifiedClosure = Boolean(
+        existing?.scannedAt && existing.endBoundary && !endBoundary,
+      );
       const record = {
         ...(existing || {}),
         schemaVersion: 2,
@@ -157,16 +160,20 @@ function upsertDetectedCycles(groupId, groupName, cycles) {
         groupId,
         groupName: groupName || existing?.groupName || "",
         detectedId: c.id,
-        status: c.status || "SETTLED",
+        status: preserveVerifiedClosure ? existing.status : c.status || "SETTLED",
         startDate: c.startDate,
-        endDate: c.endDate,
+        endDate: preserveVerifiedClosure ? existing.endDate : c.endDate,
         startBoundary,
-        endBoundary,
+        endBoundary: preserveVerifiedClosure ? existing.endBoundary : endBoundary,
         startBoundaryId: startBoundary.id,
-        endBoundaryId: endBoundary?.id || null,
+        endBoundaryId: preserveVerifiedClosure ? existing.endBoundaryId : endBoundary?.id || null,
         checkpoint: startBoundary.source === "configured" ? null : startBoundary,
         groceryCount: c.groceryCount ?? 0,
         paymentCount: c.paymentCount ?? 0,
+        unclassifiedCount: c.unclassifiedCount ?? 0,
+        calculationMessage: c.calculationMessage || null,
+        clearanceMessage: preserveVerifiedClosure ? existing.clearanceMessage : c.clearanceMessage || null,
+        settlementConfirmed: preserveVerifiedClosure ? existing.settlementConfirmed : c.settlementConfirmed === true,
         detectedAt: now,
         // Scanned details survive re-detection.
         imageCount: existing?.imageCount ?? null,
@@ -197,7 +204,7 @@ function upsertDetectedCycles(groupId, groupName, cycles) {
       if (duplicates.length < 2) continue;
       const keeper =
         duplicates.find((cycle) => cycle.scannedAt) ||
-        duplicates.find((cycle) => cycle.status === "ACTIVE") ||
+        duplicates.find((cycle) => ["ACTIVE", "PENDING_SETTLEMENT"].includes(cycle.status)) ||
         duplicates[0];
       for (const duplicate of duplicates) {
         if (duplicate === keeper || duplicate.scannedAt) continue;
@@ -232,6 +239,11 @@ function recordSettlementCycle(args) {
       images,
       totals,
       expectedMedia,
+      status,
+      calculationMessage,
+      clearanceMessage,
+      settlementConfirmed,
+      unclassifiedCount,
     } = args;
     const cycles = normaliseCycles(loadSettlementCycles());
     const startBoundary = normaliseBoundary(suppliedStart || checkpoint);
@@ -255,6 +267,11 @@ function recordSettlementCycle(args) {
       startBoundaryId: startBoundary.id,
       endBoundaryId: endBoundary?.id || null,
       checkpoint: startBoundary.source === "configured" ? null : startBoundary,
+      status: status || existing?.status || "ACTIVE",
+      calculationMessage: calculationMessage ?? existing?.calculationMessage ?? null,
+      clearanceMessage: clearanceMessage ?? existing?.clearanceMessage ?? null,
+      settlementConfirmed: settlementConfirmed ?? existing?.settlementConfirmed ?? false,
+      unclassifiedCount: unclassifiedCount ?? existing?.unclassifiedCount ?? 0,
       imageCount: images.length,
       images: images.map((image) => ({
         id: image.id,
@@ -282,6 +299,11 @@ function recordSettlementCycle(args) {
         startDate: cycle?.startDate,
         endDate: cycle?.endDate,
         checkpoint: cycle?.checkpoint || null,
+        status: cycle?.status,
+        calculationMessage: cycle?.calculationMessage || null,
+        clearanceMessage: cycle?.clearanceMessage || null,
+        settlementConfirmed: cycle?.settlementConfirmed === true,
+        unclassifiedCount: cycle?.unclassifiedCount || 0,
         imageCount: cycle?.imageCount,
         images: cycle?.images || [],
         totals: cycle?.totals || null,

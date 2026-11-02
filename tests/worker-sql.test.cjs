@@ -18,9 +18,11 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
       create table public.periods(id text primary key,start_date date,end_date date,status text,total_cents integer,per_person_cents integer,receipt_count integer);
       create table public.receipts(id text primary key,period_id text references public.periods(id),captured_at timestamptz,merchant text,amount_cents integer,payer text,category text,date date,is_excluded boolean,image_url text);
       create table public.settlements(id text primary key,period_id text references public.periods(id),total_cents integer,per_person_cents integer,member_totals jsonb,receipt_count integer,calculated_at timestamptz,owes jsonb);
+      create table public.bank_transfer_receipts(id uuid primary key,period_id text references public.periods(id),step_id text,from_name text,to_name text,amount_cents integer,transfer_date date,receipt_url text);
       insert into periods values('p','2026-10-01','2026-10-31','CURRENT',999,499,1);
       insert into receipts values('edited','p',now(),'Manual merchant',999,'Alex','Other','2026-10-02',true,'storage://bill-evidence/manual.jpg');
       insert into settlements values('settlement_2026-10-01_current','p',999,499,'{"Alex":999}',1,now(),'{"Alex":{"Jamie":250}}');
+      insert into bank_transfer_receipts values('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','p','step-1','Alex','Jamie',250,'2026-10-03','storage://bill-evidence/transfer.jpg');
       insert into sync_requests(id,requested_by,status) values('${jobId}','netlify-app','pending'),('${job2Id}','netlify-app','pending');
       insert into storage.buckets values('bill-evidence','bill-evidence',false);
       alter table sync_requests enable row level security;
@@ -44,7 +46,8 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     assert.equal((await q("select * from claim_sync_request('a')")).length, 0);
     assert.equal((await q("select total_cents from periods"))[0].total_cents, 999);
     await db.exec("update instabox_worker_control set writes_enabled=true");
-    assert.equal((await q("select instabox_worker_capabilities() as value"))[0].value.version, 3);
+    assert.equal((await q("select instabox_worker_capabilities() as value"))[0].value.version, 4);
+    assert.equal((await q("select verification_status from bank_transfer_receipts"))[0].verification_status, null);
     assert.equal((await q("select * from claim_sync_request('a')")).length, 1);
     assert.equal((await q("select * from claim_sync_request('b')")).length, 0);
     const rows = [
@@ -52,6 +55,16 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
       { id: "new", period_id: "p", captured_at: "2026-10-02T00:00:00Z", merchant: "Market", amount_cents: 101, payer: "Alex", category: "Groceries", date: "2026-10-02", is_excluded: false, image_url: "storage://bill-evidence/new.jpg" },
     ];
     const finalize = (owner, receipts = rows, rounding = "floor") => q("select finalize_sync_request($1::uuid,$2,'p',$3::jsonb,array['Alex','Jamie','Morgan','Taylor'],$4,'existing-only')", [jobId, owner, JSON.stringify(receipts), rounding]);
+    await q("select record_period_cycle_state($1::uuid,'a','p','PENDING_SETTLEMENT',$2::jsonb,null)", [jobId, JSON.stringify({ id: "calc-1", timestamp: 1793500000 })]);
+    assert.equal((await q("select whatsapp_cycle_status from periods where id='p'"))[0].whatsapp_cycle_status, "PENDING_SETTLEMENT");
+    await assert.rejects(
+      () => q("select record_period_cycle_state($1::uuid,'a','p','SETTLED',null,null)", [jobId]),
+      /clearance/i,
+    );
+    await assert.rejects(
+      () => q("select record_period_cycle_state($1::uuid,'a','p','SETTLED',null,$2::jsonb)", [jobId, JSON.stringify({ id: "calc-only", source: "calculation", confidence: "LOW" })]),
+      /clearance/i,
+    );
     await assert.rejects(() => finalize("b"), /lease/i);
     await assert.rejects(() => finalize("a", [...rows, { ...rows[1], id: "invalid", amount_cents: -1 }]), /Invalid receipt/);
     assert.equal((await q("select count(*)::integer as n from receipts"))[0].n, 1);
@@ -85,6 +98,8 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     assert.equal((await q("select status from sync_requests where id=$1", [job2Id]))[0].status, "failed");
     assert.equal((await q("select has_function_privilege('authenticated','public.finalize_sync_request(uuid,text,text,jsonb,text[],text,text)','execute') as allowed"))[0].allowed, false);
     assert.equal((await q("select has_function_privilege('service_role','public.finalize_sync_request(uuid,text,text,jsonb,text[],text,text)','execute') as allowed"))[0].allowed, true);
+    assert.equal((await q("select has_function_privilege('authenticated','public.record_period_cycle_state(uuid,text,text,text,jsonb,jsonb)','execute') as allowed"))[0].allowed, false);
+    assert.equal((await q("select has_function_privilege('service_role','public.record_period_cycle_state(uuid,text,text,text,jsonb,jsonb)','execute') as allowed"))[0].allowed, true);
     assert.equal((await q("select count(*)::integer n from pg_policies where schemaname='public' and tablename in ('receipts','periods','settlements') and permissive='PERMISSIVE' and 'public'::name=any(roles)"))[0].n, 0);
     assert.equal((await q("select count(*)::integer n from pg_policies where policyname like 'production_%'"))[0].n, 5);
     await db.exec("set role authenticated");

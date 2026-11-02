@@ -6,16 +6,21 @@ function cycleRow(c, i) {
   const scanned = Boolean(c.scannedAt);
   const unresolved = c.provenance?.status === "UNRESOLVED";
   const completeness = c.completeness || {};
-  const label =
-    c.status === "ACTIVE"
-      ? `Current cycle · since ${date(c.startDate)}`
-      : `${date(c.startDate)} – ${date(c.endDate)}`;
+  const open = ["ACTIVE", "PENDING_SETTLEMENT"].includes(c.status);
+  const label = open
+    ? `${c.status === "PENDING_SETTLEMENT" ? "Awaiting clearance" : "Current cycle"} · since ${date(c.startDate)}`
+    : `${date(c.startDate)} – ${date(c.endDate)}`;
   const meta = [
     c.checkpoint ? `Marker "${esc(c.checkpoint.text)}"` : null,
     `${c.groceryCount ?? 0} receipt photo${(c.groceryCount ?? 0) === 1 ? "" : "s"}`,
     c.paymentCount
       ? `${c.paymentCount} transfer proof${c.paymentCount === 1 ? "" : "s"}`
       : null,
+    c.unclassifiedCount
+      ? `${c.unclassifiedCount} unclassified image${c.unclassifiedCount === 1 ? "" : "s"}`
+      : null,
+    c.calculationMessage ? "Calculation available" : null,
+    c.clearanceMessage ? `Cleared ${esc(c.clearanceMessage.timeStr || "")}` : open ? "Final clearance not received" : null,
     `${completeness.expected ?? 0} expected`,
     `${completeness.processed ?? 0} processed`,
     `${completeness.failed ?? 0} failed`,
@@ -27,19 +32,16 @@ function cycleRow(c, i) {
     scanned
       ? `<span class="badge good-badge">Scanned ${date(c.scannedAt)}</span><strong>${money(c.totals?.totalPool ?? 0)}</strong>`
       : '<span class="badge">Not scanned</span>'
-  }<span class="badge ${unresolved ? "warning-badge" : "good-badge"}">${unresolved ? "Boundary review" : "Verified boundaries"}</span><span class="row-actions">${button("Repair", "repair-cycle", "secondary", `data-id="${esc(c.cycleKey)}"`)}${c.detectedId ? button(scanned ? "Scan again" : "Scan receipts", "run-cycle-scan", "secondary", `data-cycle="${esc(c.cycleKey)}"${state.scan?.active ? " disabled" : ""}`) : ""}</span></div>`;
+  }<span class="badge ${c.status === "PENDING_SETTLEMENT" || unresolved ? "warning-badge" : "good-badge"}">${c.status === "PENDING_SETTLEMENT" ? "Awaiting clearance" : c.status === "UNCONFIRMED" ? "Unconfirmed" : unresolved ? "Boundary review" : c.status === "SETTLED" ? "Settled" : "Active"}</span><span class="row-actions">${button("Repair", "repair-cycle", "secondary", `data-id="${esc(c.cycleKey)}"`)}${c.detectedId ? button(scanned ? "Scan again" : "Scan receipts", "run-cycle-scan", "secondary", `data-cycle="${esc(c.cycleKey)}"${state.scan?.active ? " disabled" : ""}`) : ""}</span></div>`;
 }
 
 export function cyclesPage() {
   const saved = state.savedCycles.filter(
     (c) => !state.work.groupId || c.groupId === state.work.groupId,
-  ).sort((a, b) =>
-    a.status === "ACTIVE"
-      ? -1
-      : b.status === "ACTIVE"
-        ? 1
-        : (b.startDate || "").localeCompare(a.startDate || ""),
-  );
+  ).sort((a, b) => {
+    const rank = (cycle) => ["ACTIVE", "PENDING_SETTLEMENT"].includes(cycle.status) ? 0 : 1;
+    return rank(a) - rank(b) || (b.startDate || "").localeCompare(a.startDate || "");
+  });
   const unresolved = saved.filter((c) => c.provenance?.status === "UNRESOLVED");
   const ready = state.online && state.status === "READY" && Boolean(state.keys);
   const detecting = state.detecting;

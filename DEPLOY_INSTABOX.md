@@ -32,9 +32,10 @@ Review `schema-review.txt` and the private bucket/policies. Keep the schema repo
 ```sh
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261101000000_instabox_sync_request_leases.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261101000001_instabox_production_safeguards.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261102000000_pending_settlement_cycle_state.sql
 ```
 
-Migration 00000 only adds lease fields, claim indexes/function, and creates the private bucket if absent. Migration 00001 aborts unless job IDs are UUID, receipt/period/settlement IDs are text, date fields match, authenticated read policies remain available, and unique receipt identity can be proven. It removes permissive PUBLIC read policies from receipts, periods and settlements while preserving the existing authenticated policies. It adds retry fields, source identity columns/indexes, audit/control tables, restrictive frontend guards, service-role-only functions, and transactional finalization. Finalization updates only receipt-derived totals on the existing `settlement_YYYY-MM-DD_current` row; it never creates a settlement or changes `settlements.owes` or payment-confirmation state. It does not delete, backfill, reassign, or overwrite existing receipt details. The database write switch remains off:
+Migration 00000 adds lease fields, claim indexes/function, and creates the private bucket if absent. Migration 00001 adds the verified production safeguards. Migration 00002 adds nullable WhatsApp cycle metadata to `periods`, nullable review fields to an existing `bank_transfer_receipts` table, and a service-role-only function that can update cycle fields only on the leased existing `CURRENT` period. It raises the capability contract to version 4. It does not backfill transfer verification, rotate periods, move receipts, alter settlement IDs/totals, or touch `settlements.owes`. Finalization updates only receipt-derived totals on the existing `settlement_YYYY-MM-DD_current` row; it never creates a settlement or changes payment obligations. The database write switch remains off:
 
 ```sql
 select public.instabox_worker_capabilities();

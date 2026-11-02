@@ -133,6 +133,55 @@ function migrateSchema() {
         .run("initial transactional storage", new Date().toISOString());
     });
   }
+  if (current < 2) {
+    // Keep scan_jobs.cycle_key pointing at the replacement `cycles` table.
+    // SQLite otherwise rewrites that foreign key to the temporary old name.
+    db.exec("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON");
+    transaction(() => {
+      db.exec(`
+        CREATE TEMP TABLE cycle_receipts_v1 AS SELECT * FROM cycle_receipts;
+        DROP TABLE cycle_receipts;
+        ALTER TABLE cycles RENAME TO cycles_v1;
+        CREATE TABLE cycles (
+          cycle_key TEXT PRIMARY KEY,
+          group_id TEXT NOT NULL,
+          group_name TEXT NOT NULL DEFAULT '',
+          detected_id TEXT,
+          status TEXT NOT NULL CHECK(status IN ('ACTIVE','PENDING_SETTLEMENT','SETTLED','UNCONFIRMED','LEGACY_CONFLICT','UNKNOWN')),
+          start_date TEXT,
+          end_date TEXT,
+          start_boundary_id TEXT,
+          end_boundary_id TEXT,
+          provenance_status TEXT NOT NULL DEFAULT 'UNRESOLVED' CHECK(provenance_status IN ('RESOLVED','UNRESOLVED')),
+          expected_media INTEGER NOT NULL DEFAULT 0 CHECK(expected_media >= 0),
+          processed_media INTEGER NOT NULL DEFAULT 0 CHECK(processed_media >= 0),
+          failed_media INTEGER NOT NULL DEFAULT 0 CHECK(failed_media >= 0),
+          excluded_media INTEGER NOT NULL DEFAULT 0 CHECK(excluded_media >= 0),
+          detected_at TEXT,
+          scanned_at TEXT,
+          payload_json TEXT NOT NULL
+        );
+        INSERT INTO cycles SELECT * FROM cycles_v1;
+        DROP TABLE cycles_v1;
+        CREATE UNIQUE INDEX cycle_start_boundary_unique
+          ON cycles(group_id, start_boundary_id) WHERE start_boundary_id IS NOT NULL;
+        CREATE INDEX cycle_group_dates_idx ON cycles(group_id, start_date, end_date);
+        CREATE TABLE cycle_receipts (
+          cycle_key TEXT NOT NULL REFERENCES cycles(cycle_key) ON DELETE CASCADE,
+          message_id TEXT NOT NULL REFERENCES receipt_records(message_id) ON DELETE RESTRICT,
+          position INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY(cycle_key, message_id)
+        );
+        INSERT INTO cycle_receipts SELECT * FROM cycle_receipts_v1;
+        DROP TABLE cycle_receipts_v1;
+      `);
+      db.prepare("INSERT INTO schema_migrations(version, name, applied_at) VALUES(2, ?, ?)")
+        .run("pending settlement cycle states", new Date().toISOString());
+    });
+    db.exec("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON");
+    const violation = db.prepare("PRAGMA foreign_key_check").get();
+    if (violation) throw new Error(`SQLite cycle-state migration broke a foreign key in ${violation.table}.`);
+  }
 }
 
 const parseJson = (value, fallback) => {
@@ -260,7 +309,7 @@ function putCycle(cycle) {
     cycle.groupId,
     cycle.groupName || "",
     cycle.detectedId || null,
-    ["ACTIVE", "SETTLED", "LEGACY_CONFLICT"].includes(cycle.status)
+    ["ACTIVE", "PENDING_SETTLEMENT", "SETTLED", "UNCONFIRMED", "LEGACY_CONFLICT"].includes(cycle.status)
       ? cycle.status
       : "UNKNOWN",
     cycle.startDate || null,
