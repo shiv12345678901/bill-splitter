@@ -160,6 +160,21 @@ function buildEvidencePath(periodId, receiptId, mimetype, fileName) {
   return `${safeObjectName(periodId)}/${safeObjectName(receiptId)}.${extensionFor(mimetype, fileName)}`;
 }
 
+function supabaseAuthHeaders(key) {
+  return {
+    apikey: key,
+    ...(String(key).startsWith("sb_secret_") ? {} : { Authorization: `Bearer ${key}` }),
+  };
+}
+
+function redactSupabaseKey(value, key) {
+  return String(value || "").split(String(key)).join("[REDACTED]");
+}
+
+function resolveSupabaseServerKey(env = process.env) {
+  return env.SUPABASE_SECRET_KEY || env.SUPABASE_SERVICE_ROLE_KEY;
+}
+
 function settlementForReceipts(receipts, members = []) {
   const visible = receipts.filter((receipt) => !receipt.is_excluded);
   const expenses = visible.map((receipt) => ({
@@ -196,8 +211,17 @@ class SupabaseRestClient {
     if (typeof fetchImpl !== "function") throw new Error("This Node runtime does not provide fetch.");
     this.url = String(url).replace(/\/$/, "");
     this.key = key;
+    this.authHeaders = supabaseAuthHeaders(key);
     this.fetch = fetchImpl;
     this.columns = {};
+  }
+
+  async send(target, options) {
+    try {
+      return await this.fetch(target, options);
+    } catch (error) {
+      throw new Error(redactSupabaseKey(error?.message || "Supabase request failed.", this.key));
+    }
   }
 
   async request(base, route, { method = "GET", query = {}, body, headers = {} } = {}) {
@@ -205,12 +229,11 @@ class SupabaseRestClient {
     for (const [key, value] of Object.entries(query)) {
       if (value !== undefined && value !== null) target.searchParams.set(key, String(value));
     }
-    const response = await this.fetch(target, {
+    const response = await this.send(target, {
       method,
       signal: AbortSignal.timeout(30000),
       headers: {
-        apikey: this.key,
-        Authorization: `Bearer ${this.key}`,
+        ...this.authHeaders,
         ...(body === undefined ? {} : { "Content-Type": "application/json" }),
         ...headers,
       },
@@ -225,7 +248,7 @@ class SupabaseRestClient {
     }
     if (!response.ok) {
       const detail = payload?.message || payload?.error_description || payload?.error || text;
-      throw new Error(`Supabase ${method} ${route} failed (${response.status}): ${detail}`);
+      throw new Error(redactSupabaseKey(`Supabase ${method} ${route} failed (${response.status}): ${detail}`, this.key));
     }
     return payload;
   }
@@ -259,21 +282,20 @@ class SupabaseRestClient {
 
   async upload(pathname, buffer, mimetype) {
     const target = new URL(`${this.url}/storage/v1/object/bill-evidence/${pathname}`);
-    const response = await this.fetch(target, {
+    const response = await this.send(target, {
       method: "POST",
       signal: AbortSignal.timeout(30000),
       headers: {
-        apikey: this.key,
-        Authorization: `Bearer ${this.key}`,
+        ...this.authHeaders,
         "Content-Type": mimetype || "image/jpeg",
-    "x-upsert": "false",
+        "x-upsert": "false",
       },
       body: buffer,
     });
     const text = await response.text();
     // Stable object names make an already uploaded image a successful retry.
     if (!response.ok && response.status !== 409 && !/"(?:statusCode|code)"\s*:\s*"?409/.test(text))
-      throw new Error(`Supabase evidence upload failed (${response.status}): ${text}`);
+      throw new Error(redactSupabaseKey(`Supabase evidence upload failed (${response.status}): ${text}`, this.key));
   }
 
   async verifySchema() {
@@ -799,7 +821,7 @@ function createSupabaseWorker({
 
 function createConfiguredSupabaseWorker(options = {}) {
   const url = options.url || process.env.SUPABASE_URL;
-  const key = options.key || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
+  const key = options.key || resolveSupabaseServerKey(process.env);
   if (!url || !key) return null;
   const client = options.client || new SupabaseRestClient({ url, key, fetchImpl: options.fetchImpl });
   return createSupabaseWorker({ ...options, client });
@@ -813,6 +835,7 @@ module.exports = {
   SCHEMA_APPROVAL,
   WRITE_APPROVAL,
   SupabaseRestClient,
+  resolveSupabaseServerKey,
   createSupabaseWorker,
   createConfiguredSupabaseWorker,
   centsFromAmount,

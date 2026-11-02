@@ -196,7 +196,7 @@ async function main() {
     return;
   }
   if (!supabaseWorker) {
-    throw new Error("Configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY before starting the worker.");
+    throw new Error("Configure SUPABASE_URL and SUPABASE_SECRET_KEY (or legacy SUPABASE_SERVICE_ROLE_KEY) before starting the worker.");
   }
   if (mode !== LIVE_MODE) {
     console.log("[Worker] Safe dry-run mode. Supabase schema will be checked; no jobs, WhatsApp session, or writes will run.");

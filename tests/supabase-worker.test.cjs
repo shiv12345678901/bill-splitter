@@ -11,6 +11,7 @@ const {
   validateReceipt,
   settlementForReceipts,
   SupabaseRestClient,
+  resolveSupabaseServerKey,
   REQUIRED_COLUMNS,
   createSupabaseWorker,
   SCHEMA_APPROVAL,
@@ -186,6 +187,66 @@ test("REST client calls the database claim RPC instead of a select-then-update r
     p_requested_by: "netlify-app",
     p_lease_seconds: 900,
   });
+});
+
+test("Supabase REST and Storage use the correct headers for modern secret and legacy JWT keys", async () => {
+  const credentials = [
+    { key: "sb_secret_modern-fixture", bearer: false },
+    { key: "eyJhbGciOiJIUzI1NiJ9.legacy-service-role-fixture", bearer: true },
+  ];
+
+  for (const credential of credentials) {
+    const calls = [];
+    const client = new SupabaseRestClient({
+      url: "https://example.supabase.co",
+      key: credential.key,
+      fetchImpl: async (url, options) => {
+        calls.push({ url: String(url), options });
+        return new Response(String(url).includes("/storage/v1/") ? "{}" : "[]", { status: 200 });
+      },
+    });
+
+    await client.select("sync_requests", { limit: 0 });
+    await client.upload("period/receipt.jpg", Buffer.from("image"), "image/jpeg");
+
+    assert.equal(calls.length, 2);
+    for (const call of calls) {
+      assert.equal(call.options.headers.apikey, credential.key);
+      if (credential.bearer)
+        assert.equal(call.options.headers.Authorization, `Bearer ${credential.key}`);
+      else
+        assert.equal("Authorization" in call.options.headers, false);
+    }
+  }
+});
+
+test("modern Supabase secret keys take precedence and are redacted from failures", async () => {
+  assert.equal(resolveSupabaseServerKey({
+    SUPABASE_SECRET_KEY: "sb_secret_preferred",
+    SUPABASE_SERVICE_ROLE_KEY: "legacy-fallback",
+  }), "sb_secret_preferred");
+  assert.equal(resolveSupabaseServerKey({ SUPABASE_SERVICE_ROLE_KEY: "legacy-only" }), "legacy-only");
+
+  const secret = "sb_secret_must-not-appear-in-logs";
+  const client = new SupabaseRestClient({
+    url: "https://example.supabase.co",
+    key: secret,
+    fetchImpl: async () => new Response(JSON.stringify({ message: `invalid ${secret}` }), { status: 401 }),
+  });
+  await assert.rejects(
+    () => client.select("sync_requests"),
+    (error) => !error.message.includes(secret) && error.message.includes("[REDACTED]"),
+  );
+
+  const transportClient = new SupabaseRestClient({
+    url: "https://example.supabase.co",
+    key: secret,
+    fetchImpl: async () => { throw new Error(`transport rejected ${secret}`); },
+  });
+  await assert.rejects(
+    () => transportClient.upload("period/receipt.jpg", Buffer.from("image"), "image/jpeg"),
+    (error) => !error.message.includes(secret) && error.message.includes("[REDACTED]"),
+  );
 });
 
 test("Supabase worker requires the additive lease columns", () => {

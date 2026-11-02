@@ -194,7 +194,8 @@ The SQL migrations are additive and should normally remain installed with writes
 ## Environment checklist
 
 - `SUPABASE_URL`: project URL, server only.
-- `SUPABASE_SERVICE_ROLE_KEY`: service-role/secret key, server only.
+- `SUPABASE_SECRET_KEY`: preferred modern `sb_secret_...` server key. It is sent only in the `apikey` header and must remain server-only.
+- `SUPABASE_SERVICE_ROLE_KEY`: legacy JWT fallback. When used, the worker preserves the legacy `apikey` plus `Authorization: Bearer` headers. If both variables are set, `SUPABASE_SECRET_KEY` wins.
 - `GEMINI_API_KEY` or numbered Gemini keys.
 - `SPLITMATE_WHATSAPP_GROUP_ID`: explicit target group ID; live mode will not use the code default.
 - `SPLITMATE_WHATSAPP_GROUP_NAME`: display label.

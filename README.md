@@ -108,7 +108,7 @@ SUPABASE_WORKER_SCHEMA_APPROVED=I_HAVE_CONFIRMED_SUPABASE_SCHEMA
 SUPABASE_WORKER_WRITE_CONFIRM=I_UNDERSTAND_SUPABASE_WORKER_WRITES
 ```
 
-The worker also requires `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, at least one `GEMINI_API_KEY` value, and a WhatsApp group ID (or the existing `user_config.json` default). `SPLITMATE_SUPABASE_POLL_MS` defaults to 5000 and `SPLITMATE_SYNC_LEASE_SECONDS` defaults to 900. Never put the service-role key, WhatsApp session directory, local SQLite database, image cache, or `user_config.json` in Git.
+The worker also requires `SUPABASE_URL`, preferably a modern `SUPABASE_SECRET_KEY` (`sb_secret_...`) or the legacy `SUPABASE_SERVICE_ROLE_KEY` fallback, at least one `GEMINI_API_KEY` value, and a WhatsApp group ID (or the existing `user_config.json` default). When both Supabase credentials exist, the modern secret key wins. `SPLITMATE_SUPABASE_POLL_MS` defaults to 5000 and `SPLITMATE_SYNC_LEASE_SECONDS` defaults to 900. Never put either server key, the WhatsApp session directory, local SQLite database, image cache, or `user_config.json` in Git.
 
 Before enabling live mode, confirm the actual database types and policies rather than relying on names alone:
 
