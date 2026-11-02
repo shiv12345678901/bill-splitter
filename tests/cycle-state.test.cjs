@@ -6,6 +6,7 @@ const {
   sydneyDate,
   sydneyStartTimestamp,
   selectCycleForPeriod,
+  planPeriodRollover,
 } = require("../server/services/cycle-state.cjs");
 const { migrateCycle } = require("../server/services/cycle-integrity.cjs");
 
@@ -85,6 +86,66 @@ test("message IDs are idempotent and grocery images after calculations remain gr
   ]);
   assert.equal(cycles[0].groceryCount, 1);
   assert.equal(cycles[0].paymentCount, 0);
+});
+
+test("31 October Sydney clearance rolls the CURRENT period to the open cycle containing 2 November receipts", () => {
+  const cycles = detect([
+    message("oct-receipt", "2026-10-30T01:00:00Z", "", { isMedia: true, classification: "grocery_receipt" }),
+    message("oct-clearance", "2026-10-31T12:30:00Z", "Clear up to date"),
+    message("nov-receipt", "2026-11-02T01:00:00Z", "", { isMedia: true, classification: "grocery_receipt" }),
+  ]);
+  const plan = planPeriodRollover(cycles, {
+    id: "period_2026-10-10",
+    status: "CURRENT",
+    start_date: "2026-10-10",
+    end_date: "2026-10-31",
+  });
+  assert.equal(plan.action, "rollover");
+  assert.equal(plan.closedCycle.endDate, "2026-10-31");
+  assert.equal(plan.nextCycle.startDate, "2026-10-31");
+  assert.deepEqual(plan.nextCycle.groceryMessages.map((item) => item.id), ["nov-receipt"]);
+  assert.equal(plan.newPeriodId, "period_2026-10-31");
+  assert.equal(plan.newSettlementId, "settlement_2026-10-31_current");
+});
+
+test("a clearance at Sydney midnight rolls the next cycle onto the following local day", () => {
+  const cycles = detect([
+    message("midnight-clearance", "2026-10-31T12:59:59Z", "All settled"),
+    message("after-midnight", "2026-10-31T13:00:01Z", "", { isMedia: true, classification: "grocery_receipt" }),
+  ]);
+  const plan = planPeriodRollover(cycles, {
+    status: "CURRENT", start_date: "2026-10-10", end_date: "2026-10-31",
+  });
+  assert.equal(plan.nextCycle.startDate, "2026-11-01");
+  assert.equal(plan.newPeriodId, "period_2026-11-01");
+  assert.deepEqual(plan.nextCycle.groceryMessages.map((item) => item.id), ["after-midnight"]);
+});
+
+test("rollover rejects date mismatches, missing next cycles and ambiguous cycle mappings", () => {
+  const cycles = detect([
+    message("clearance", "2026-10-31T12:30:00Z", "All cleared"),
+    message("nov-receipt", "2026-11-02T01:00:00Z", "", { isMedia: true, classification: "grocery_receipt" }),
+  ]);
+  assert.throws(() => planPeriodRollover(cycles, {
+    status: "CURRENT", start_date: "2026-10-10", end_date: "2026-11-02",
+  }), /end date/i);
+  assert.throws(() => planPeriodRollover(cycles.filter((cycle) => cycle.status === "SETTLED"), {
+    status: "CURRENT", start_date: "2026-10-10", end_date: "2026-10-31",
+  }), /next open/i);
+  assert.throws(() => planPeriodRollover([...cycles, { ...cycles[0], id: "duplicate-open" }], {
+    status: "CURRENT", start_date: "2026-10-10", end_date: "2026-10-31",
+  }), /exactly one|ambiguous/i);
+});
+
+test("delayed duplicate clearance messages without intervening cycle activity do not create extra cycles", () => {
+  const cycles = detect([
+    message("clearance-original", "2026-10-31T12:30:00Z", "Clear up to date"),
+    message("clearance-delayed-copy", "2026-11-01T12:30:00Z", "Everything is all settled"),
+    message("nov-receipt", "2026-11-02T01:00:00Z", "", { isMedia: true, classification: "grocery_receipt" }),
+  ]);
+  assert.equal(cycles.length, 2);
+  assert.equal(cycles[0].startBoundary.id, "clearance-original");
+  assert.deepEqual(cycles[0].groceryMessages.map((item) => item.id), ["nov-receipt"]);
 });
 
 test("out-of-order input is sorted and incomplete history remains explicit", () => {

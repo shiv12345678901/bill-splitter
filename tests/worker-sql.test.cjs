@@ -8,6 +8,7 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
   const db = new PGlite();
   const jobId = "11111111-1111-4111-8111-111111111111";
   const job2Id = "22222222-2222-4222-8222-222222222222";
+  const job3Id = "33333333-3333-4333-8333-333333333333";
   try {
     await db.exec(`
       create role anon; create role authenticated; create role service_role;
@@ -19,7 +20,7 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
       create table public.receipts(id text primary key,period_id text references public.periods(id),captured_at timestamptz,merchant text,amount_cents integer,payer text,category text,date date,is_excluded boolean,image_url text);
       create table public.settlements(id text primary key,period_id text references public.periods(id),total_cents integer,per_person_cents integer,member_totals jsonb,receipt_count integer,calculated_at timestamptz,owes jsonb);
       create table public.bank_transfer_receipts(id uuid primary key,period_id text references public.periods(id),step_id text,from_name text,to_name text,amount_cents integer,transfer_date date,receipt_url text);
-      insert into periods values('p','2026-10-01','2026-10-31','CURRENT',999,499,1);
+      insert into periods values('historical','2026-09-01','2026-09-30','CLOSED',500,125,1),('p','2026-10-01','2026-10-31','CURRENT',999,499,1);
       insert into receipts values('edited','p',now(),'Manual merchant',999,'Alex','Other','2026-10-02',true,'storage://bill-evidence/manual.jpg');
       insert into settlements values('settlement_2026-10-01_current','p',999,499,'{"Alex":999}',1,now(),'{"Alex":{"Jamie":250}}');
       insert into bank_transfer_receipts values('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','p','step-1','Alex','Jamie',250,'2026-10-03','storage://bill-evidence/transfer.jpg');
@@ -44,9 +45,9 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
       await db.exec(fs.readFileSync(`supabase/migrations/${name}`, "utf8"));
     const q = async (sql, args = []) => (await db.query(sql, args)).rows;
     assert.equal((await q("select * from claim_sync_request('a')")).length, 0);
-    assert.equal((await q("select total_cents from periods"))[0].total_cents, 999);
+    assert.equal((await q("select total_cents from periods where id='p'"))[0].total_cents, 999);
     await db.exec("update instabox_worker_control set writes_enabled=true");
-    assert.equal((await q("select instabox_worker_capabilities() as value"))[0].value.version, 4);
+    assert.equal((await q("select instabox_worker_capabilities() as value"))[0].value.version, 5);
     assert.equal((await q("select verification_status from bank_transfer_receipts"))[0].verification_status, null);
     assert.equal((await q("select * from claim_sync_request('a')")).length, 1);
     assert.equal((await q("select * from claim_sync_request('b')")).length, 0);
@@ -68,14 +69,14 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     await assert.rejects(() => finalize("b"), /lease/i);
     await assert.rejects(() => finalize("a", [...rows, { ...rows[1], id: "invalid", amount_cents: -1 }]), /Invalid receipt/);
     assert.equal((await q("select count(*)::integer as n from receipts"))[0].n, 1);
-    assert.equal((await q("select total_cents from periods"))[0].total_cents, 999);
+    assert.equal((await q("select total_cents from periods where id='p'"))[0].total_cents, 999);
     await finalize("a");
     await finalize("a");
     assert.equal((await q("select count(*)::integer as n from receipts"))[0].n, 2);
     const edited = (await q("select * from receipts where id='edited'"))[0];
     assert.equal(edited.merchant, "Manual merchant");
     assert.equal(edited.is_excluded, true);
-    assert.equal((await q("select total_cents from periods"))[0].total_cents, 101);
+    assert.equal((await q("select total_cents from periods where id='p'"))[0].total_cents, 101);
     assert.equal((await q("select per_person_cents from settlements"))[0].per_person_cents, 25);
     assert.deepEqual((await q("select owes from settlements"))[0].owes, { Alex: { Jamie: 250 } });
     assert.equal((await q("select id from settlements"))[0].id, "settlement_2026-10-01_current");
@@ -102,10 +103,50 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     assert.equal((await q("select has_function_privilege('service_role','public.record_period_cycle_state(uuid,text,text,text,jsonb,jsonb)','execute') as allowed"))[0].allowed, true);
     assert.equal((await q("select count(*)::integer n from pg_policies where schemaname='public' and tablename in ('receipts','periods','settlements') and permissive='PERMISSIVE' and 'public'::name=any(roles)"))[0].n, 0);
     assert.equal((await q("select count(*)::integer n from pg_policies where policyname like 'production_%'"))[0].n, 5);
+    await q("insert into sync_requests(id,requested_by,status) values($1,'netlify-app','pending')", [job3Id]);
+    await q("select * from claim_sync_request('rollover-worker')");
+    const clearanceTimestamp = Math.floor(new Date("2026-10-31T12:30:00Z").getTime() / 1000);
+    const clearance = { id: "clearance-31-oct", timestamp: clearanceTimestamp, source: "marker", confidence: "HIGH", text: "Clear up to date" };
+    const rolloverArgs = [
+      job3Id, "rollover-worker", "p", "2026-10-31", JSON.stringify(clearance),
+      "period_2026-10-31", "settlement_2026-10-31_current", "2026-10-31",
+      JSON.stringify({ ...clearance, dateStr: "2026-10-31" }), "ACTIVE", null,
+      ["Alex", "Jamie", "Morgan", "Taylor"],
+    ];
+    const rolloverSql = "select rollover_settlement_period($1::uuid,$2,$3,$4::date,$5::jsonb,$6,$7,$8::date,$9::jsonb,$10,$11::jsonb,$12::text[])";
+    await q("update instabox_worker_control set automatic_rollover_after='2026-11-02T00:00:00Z'");
+    await assert.rejects(() => q(rolloverSql, rolloverArgs), /explicitly reviewed approval/i);
+    await q("insert into instabox_rollover_approvals(old_period_id,clearance_message_id,new_period_id,reviewed_by) values('p','clearance-31-oct','period_2026-10-31','operator-test')");
+    await q("insert into periods(id,start_date,end_date,status,total_cents,per_person_cents,receipt_count) values('ambiguous-history','2026-08-01','2026-08-31','ARCHIVED',0,0,0)");
+    await assert.rejects(() => q(rolloverSql, rolloverArgs), /status convention/i);
+    await q("delete from periods where id='ambiguous-history'");
+    await q("insert into receipts(id,period_id,captured_at,merchant,amount_cents,payer,category,date,is_excluded,image_url) values('misassigned-november','p','2026-11-02T01:00:00Z','Wrong period',100,'Alex','Groceries','2026-11-02',false,'storage://bill-evidence/wrong.jpg')");
+    await assert.rejects(() => q(rolloverSql, rolloverArgs), /receipts after clearance/i);
+    await q("delete from receipts where id='misassigned-november'");
+    await q(rolloverSql, rolloverArgs);
+    await q(rolloverSql, rolloverArgs);
+    assert.equal((await q("select status from periods where id='p'"))[0].status, "CLOSED");
+    const opened = (await q("select * from periods where id='period_2026-10-31'"))[0];
+    assert.equal(opened.status, "CURRENT");
+    assert.equal(opened.end_date, null);
+    assert.equal(opened.whatsapp_start_boundary.id, "clearance-31-oct");
+    assert.deepEqual((await q("select id,owes from settlements where period_id='p'"))[0], {
+      id: "settlement_2026-10-01_current", owes: { Alex: { Jamie: 250 } },
+    });
+    const placeholder = (await q("select * from settlements where period_id='period_2026-10-31'"))[0];
+    assert.equal(placeholder.id, "settlement_2026-10-31_current");
+    assert.equal(placeholder.owes, null);
+    assert.equal(placeholder.payment_obligations_status, "UNINITIALIZED");
+    const novemberRows = [{ id: "nov-2", period_id: "period_2026-10-31", captured_at: "2026-11-02T01:00:00Z", merchant: "November Market", amount_cents: 400, payer: "Jamie", category: "Groceries", date: "2026-11-02", is_excluded: false, image_url: "storage://bill-evidence/nov-2.jpg" }];
+    await q("select finalize_sync_request($1::uuid,'rollover-worker','period_2026-10-31',$2::jsonb,array['Alex','Jamie','Morgan','Taylor'],'floor','existing-only')", [job3Id, JSON.stringify(novemberRows)]);
+    assert.equal((await q("select count(*)::integer n from receipts where period_id='period_2026-10-31'"))[0].n, 1);
+    assert.equal((await q("select owes from settlements where id='settlement_2026-10-31_current'"))[0].owes, null);
+    assert.equal((await q("select has_function_privilege('authenticated','public.rollover_settlement_period(uuid,text,text,date,jsonb,text,text,date,jsonb,text,jsonb,text[])','execute') as allowed"))[0].allowed, false);
+    assert.equal((await q("select has_function_privilege('service_role','public.rollover_settlement_period(uuid,text,text,date,jsonb,text,text,date,jsonb,text,jsonb,text[])','execute') as allowed"))[0].allowed, true);
     await db.exec("set role authenticated");
-    await assert.rejects(() => db.exec("insert into sync_requests(id,requested_by,status,worker_id) values('33333333-3333-4333-8333-333333333333','netlify-app','processing','evil')"), /row-level security/);
+    await assert.rejects(() => db.exec("insert into sync_requests(id,requested_by,status,worker_id) values('55555555-5555-4555-8555-555555555555','netlify-app','processing','evil')"), /row-level security/);
     await db.exec("insert into sync_requests(id,requested_by,status) values('44444444-4444-4444-8444-444444444444','netlify-app','pending')");
-    assert.equal((await q("select count(*)::integer n from receipts"))[0].n, 2);
+    assert.equal((await q("select count(*)::integer n from receipts"))[0].n, 3);
     await db.exec("reset role");
   } finally { await db.close(); }
 });

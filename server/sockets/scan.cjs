@@ -79,6 +79,7 @@ function createScanManager(
       startDate,
       endDate,
       cycleId,
+      cycleBoundaryId,
       maxMessages = 600,
       useCheckpoint = false,
       sync = false,
@@ -105,6 +106,9 @@ function createScanManager(
             ? "The requested WhatsApp settlement cycle was not found."
             : "The Supabase period cannot be mapped to exactly one WhatsApp settlement cycle; refusing to mix cycles.",
         );
+      }
+      if (cycleBoundaryId && target.startBoundary?.id !== cycleBoundaryId) {
+        throw new Error("The WhatsApp cycle boundary changed during discovery; refusing an ambiguous scan.");
       }
       if (target) {
         selectedCycleData = {

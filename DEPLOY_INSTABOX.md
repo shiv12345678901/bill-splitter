@@ -33,9 +33,10 @@ Review `schema-review.txt` and the private bucket/policies. Keep the schema repo
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261101000000_instabox_sync_request_leases.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261101000001_instabox_production_safeguards.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261102000000_pending_settlement_cycle_state.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261102000001_automatic_cycle_rollover.sql
 ```
 
-Migration 00000 adds lease fields, claim indexes/function, and creates the private bucket if absent. Migration 00001 adds the verified production safeguards. Migration 00002 adds nullable WhatsApp cycle metadata to `periods`, nullable review fields to an existing `bank_transfer_receipts` table, and a service-role-only function that can update cycle fields only on the leased existing `CURRENT` period. It raises the capability contract to version 4. It does not backfill transfer verification, rotate periods, move receipts, alter settlement IDs/totals, or touch `settlements.owes`. Finalization updates only receipt-derived totals on the existing `settlement_YYYY-MM-DD_current` row; it never creates a settlement or changes payment obligations. The database write switch remains off:
+Migration 00000 adds lease fields, claim indexes/function, and creates the private bucket if absent. Migration 00001 adds the verified production safeguards. Migration 00002 adds pending-cycle metadata. Migration 00003 adds guarded rollover and raises the capability contract to version 5. It permits an open-ended CURRENT period, derives the historical period status from existing rows, and creates a zero-total settlement placeholder with `owes = null` and `payment_obligations_status = 'UNINITIALIZED'`. It never invents transfers or marks payments complete. Clearances older than the migration's rollout watermark require an exact row in `instabox_rollover_approvals`; follow the separate reconciliation plan for the known 31 October boundary. None of these migrations enable writes, backfill verification, move receipts, rename settlement IDs, or touch historical `settlements.owes`.
 
 ```sql
 select public.instabox_worker_capabilities();

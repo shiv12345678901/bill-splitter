@@ -5,6 +5,7 @@ const crypto = require("node:crypto");
 const database = require("./database.cjs");
 const library = require("./library.cjs");
 const { calculateSettlement } = require("./settlement.cjs");
+const { planPeriodRollover, sydneyDate } = require("./cycle-state.cjs");
 
 const DEFAULT_POLL_MS = 5000;
 const DEFAULT_LEASE_SECONDS = 15 * 60;
@@ -51,6 +52,7 @@ const REQUIRED_COLUMNS = {
     "whatsapp_calculation_message",
     "whatsapp_clearance_message",
     "whatsapp_cycle_updated_at",
+    "whatsapp_start_boundary",
   ],
   receipts: [
     "id",
@@ -72,6 +74,7 @@ const REQUIRED_COLUMNS = {
     "member_totals",
     "receipt_count",
     "calculated_at",
+    "payment_obligations_status",
   ],
 };
 
@@ -319,7 +322,7 @@ class SupabaseRestClient {
     const bucket = await this.request("storage/v1", "bucket/bill-evidence");
     if (!bucket || bucket.public !== false) throw new Error("bill-evidence must be a private Storage bucket.");
     const capabilities = await this.rpc("instabox_worker_capabilities", {});
-    if (capabilities?.version !== 4) throw new Error("Pending-settlement safeguards migration version 4 is required.");
+    if (capabilities?.version !== 5) throw new Error("Automatic cycle rollover safeguards migration version 5 is required.");
     this.writeEnabled = capabilities.writes_enabled === true;
     this.columns = verified;
     return verified;
@@ -455,8 +458,9 @@ function createSupabaseWorker({
       runId: `supabase-${job.id}`,
       groupId: extra.group_id || extra.groupId || job.group_id || groupId || config.defaultGroupId,
       groupName: extra.group_name || extra.groupName || job.group_name || groupName || config.defaultGroupName,
-      startDate: extra.start_date || extra.startDate || period.start_date,
-      endDate: extra.end_date || extra.endDate || period.end_date || new Date().toISOString().slice(0, 10),
+      // Supabase periods, not browser-supplied payload fields, own the cycle range.
+      startDate: period.start_date,
+      endDate: period.end_date || sydneyDate(Math.floor(Date.now() / 1000)),
       maxMessages: extra.max_messages || extra.maxMessages,
       useCheckpoint: extra.use_checkpoint ?? extra.useCheckpoint ?? false,
       sync: true,
@@ -594,14 +598,62 @@ function createSupabaseWorker({
   }
 
   async function processClaimedJob(job, lease) {
-    const period = await currentPeriod(job.period_id || job.periodId || null);
+    let period = await currentPeriod(job.period_id || job.periodId || null);
     if (!period) throw new Error("No current settlement period is available in Supabase.");
     if (period.status !== "CURRENT") {
-      throw new Error("The requested period is closed; refusing to move WhatsApp receipts into it.");
+      const recoveredCurrent = await currentPeriod();
+      const closedBoundaryId = period.whatsapp_clearance_message?.id;
+      if (!closedBoundaryId || recoveredCurrent?.whatsapp_start_boundary?.id !== closedBoundaryId) {
+        throw new Error("The requested period is closed; refusing to move WhatsApp receipts into it.");
+      }
+      period = recoveredCurrent;
     }
 
-    const context = requestContext(job, period);
+    let context = requestContext(job, period);
     if (!context.groupId) throw new Error("No WhatsApp group is configured for the Supabase worker.");
+
+    if (typeof scanManager.detectCycles === "function") {
+      const cycles = await scanManager.detectCycles(context.groupId);
+      const rollover = planPeriodRollover(cycles, period);
+      if (rollover.action === "rollover") {
+        if (!transactionalWrites || !contract.approved) {
+          throw new Error("A verified cycle rollover requires the reviewed transactional production adapter.");
+        }
+        lease.assert();
+        await updateJob(job, {
+          stage: "rolling_over_period",
+          stage_message: "Closing the cleared period and opening the next WhatsApp cycle…",
+          error: null,
+        });
+        await client.rpc("rollover_settlement_period", {
+          p_job_id: String(job.id),
+          p_worker_id: workerId,
+          p_old_period_id: String(period.id),
+          p_old_end_date: rollover.closedCycle.endDate,
+          p_clearance_message: rollover.closedCycle.clearanceMessage,
+          p_new_period_id: rollover.newPeriodId,
+          p_new_settlement_id: rollover.newSettlementId,
+          p_new_start_date: rollover.nextCycle.startDate,
+          p_start_boundary: rollover.nextCycle.startBoundary,
+          p_new_cycle_status: rollover.nextCycle.status,
+          p_calculation_message: rollover.nextCycle.calculationMessage,
+          p_members: contract.value.members,
+        });
+        lease.assert();
+        period = await currentPeriod(rollover.newPeriodId);
+        if (!period || period.status !== "CURRENT") {
+          throw new Error("The rollover did not produce the expected CURRENT period.");
+        }
+        context = requestContext(job, period);
+        context.cycleId = rollover.nextCycle.id;
+        context.cycleBoundaryId = rollover.nextCycle.startBoundary?.id;
+      } else {
+        context.cycleId = rollover.cycle.id;
+        context.cycleBoundaryId = rollover.cycle.startBoundary?.id;
+      }
+    } else if (transactionalWrites) {
+      throw new Error("The production scanner cannot verify WhatsApp cycle rollover state.");
+    }
 
     lease.assert();
     await updateJob(job, {
@@ -781,7 +833,7 @@ function createSupabaseWorker({
     }
     if (mode === LIVE_MODE && schemaVerified && liveWritesApproved) {
       const capabilities = await client.rpc("instabox_worker_capabilities", {});
-      client.writeEnabled = capabilities?.version === 4 && capabilities.writes_enabled === true;
+      client.writeEnabled = capabilities?.version === 5 && capabilities.writes_enabled === true;
     }
     if (mode !== LIVE_MODE) {
       if (!guardLogged) {

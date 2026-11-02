@@ -152,7 +152,13 @@ function buildSettlementCycles({ groupId, aliases = {}, configuredGroupStart = n
     if (message.isNotification || !isExplicitClearanceMessage(message.body)) continue;
     const boundary = markerBoundary(message);
     const previous = markers.at(-1);
-    if (previous && previous.text.toLocaleLowerCase() === boundary.text.toLocaleLowerCase() && boundary.timestamp - previous.timestamp <= 600) continue;
+    if (previous) {
+      const meaningfulBetween = sorted.some((candidate) =>
+        candidate.timestamp > previous.timestamp && candidate.timestamp < boundary.timestamp &&
+        (candidate.isMedia || isCalculationMessage(candidate.body)),
+      );
+      if (!meaningfulBetween) continue;
+    }
     markers.push(boundary);
   }
   const cycles = [];
@@ -172,4 +178,42 @@ function selectCycleForPeriod(cycles, periodStartDate) {
   return matches.length === 1 ? matches[0] : null;
 }
 
-module.exports = { SYDNEY_TIME_ZONE, buildSettlementCycles, isCalculationMessage, isExplicitClearanceMessage, parseGroundTruth, selectCycleForPeriod, sydneyDate, sydneyStartTimestamp };
+function planPeriodRollover(cycles, period) {
+  if (!period || period.status !== "CURRENT" || !/^\d{4}-\d{2}-\d{2}$/.test(period.start_date || "")) {
+    throw new Error("A valid CURRENT Supabase period is required for cycle mapping.");
+  }
+  const matches = (cycles || []).filter((cycle) =>
+    cycle.startDate <= period.start_date && (cycle.endDate === null || cycle.endDate >= period.start_date),
+  );
+  if (matches.length !== 1) throw new Error("The CURRENT period does not map to exactly one WhatsApp cycle.");
+  const mappedCycle = matches[0];
+  if (["ACTIVE", "PENDING_SETTLEMENT"].includes(mappedCycle.status)) {
+    return { action: "continue", cycle: mappedCycle };
+  }
+  if (mappedCycle.status !== "SETTLED" || !mappedCycle.settlementConfirmed ||
+    mappedCycle.clearanceMessage?.source !== "marker" || mappedCycle.clearanceMessage?.confidence !== "HIGH") {
+    throw new Error("The mapped WhatsApp cycle is not closed by a verified explicit clearance marker.");
+  }
+  if (!period.end_date || period.end_date !== mappedCycle.endDate) {
+    throw new Error("The period end date does not match the verified WhatsApp clearance date.");
+  }
+  const openCycles = (cycles || []).filter((cycle) => ["ACTIVE", "PENDING_SETTLEMENT"].includes(cycle.status));
+  if (openCycles.length !== 1) throw new Error("The next open WhatsApp cycle is ambiguous.");
+  const nextCycle = openCycles[0];
+  const boundaryTimestamp = Number(mappedCycle.endBoundary?.timestamp);
+  if (!Number.isFinite(boundaryTimestamp)) throw new Error("The verified clearance has no stable timestamp.");
+  const expectedNextStartDate = sydneyDate(boundaryTimestamp + 1);
+  if (!mappedCycle.endBoundary?.id || nextCycle.startBoundary?.id !== mappedCycle.endBoundary.id ||
+    nextCycle.startDate !== expectedNextStartDate) {
+    throw new Error("The next WhatsApp cycle does not begin at the verified clearance boundary.");
+  }
+  return {
+    action: "rollover",
+    closedCycle: mappedCycle,
+    nextCycle,
+    newPeriodId: `period_${nextCycle.startDate}`,
+    newSettlementId: `settlement_${nextCycle.startDate}_current`,
+  };
+}
+
+module.exports = { SYDNEY_TIME_ZONE, buildSettlementCycles, isCalculationMessage, isExplicitClearanceMessage, parseGroundTruth, planPeriodRollover, selectCycleForPeriod, sydneyDate, sydneyStartTimestamp };

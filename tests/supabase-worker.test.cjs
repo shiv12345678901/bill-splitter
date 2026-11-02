@@ -128,6 +128,48 @@ test("the worker refuses to place receipts into a closed Supabase period", async
   );
 });
 
+test("a retry follows an already committed rollover only when boundary IDs match", async () => {
+  let preparedContext = null;
+  const worker = createSupabaseWorker({
+    mode: "dry-run",
+    transactionalWrites: false,
+    settlementIdMode: "text",
+    groupId: "fixture-group",
+    loadUserConfig: () => ({ aliases: {} }),
+    scanManager: {
+      prepare: async (context) => {
+        preparedContext = context;
+        return { jobId: "recovered-rollover", expectedImages: 0, status: "queued" };
+      },
+      runAndGet: async () => {},
+    },
+    localDatabase: {
+      getScanJob: () => ({ status: "complete", result: { expenses: [] }, reconciliation: { failed: 0, queued: 0 } }),
+    },
+    client: {
+      select: async (table, query = {}) => {
+        if (table === "periods" && query.id) return [{
+          id: "old", status: "CLOSED", start_date: "2026-10-10", end_date: "2026-10-31",
+          whatsapp_clearance_message: { id: "clearance-31-oct" },
+        }];
+        if (table === "periods") return [{
+          id: "period_2026-10-31", status: "CURRENT", start_date: "2026-10-31", end_date: null,
+          whatsapp_start_boundary: { id: "clearance-31-oct" },
+        }];
+        return [];
+      },
+      update: async (table, filters, body) => table === "sync_requests" ? [{ id: "job", ...body }] : [],
+      insert: async (table, row) => [row],
+    },
+  });
+  await worker.processClaimedJob({
+    id: "job", period_id: "old",
+    request: { start_date: "1999-01-01", end_date: "2099-12-31" },
+  }, { assert() {} });
+  assert.equal(preparedContext.startDate, "2026-10-31");
+  assert.notEqual(preparedContext.endDate, "2099-12-31");
+});
+
 test("transactional publishing records pending-cycle metadata before finalizing receipts", async () => {
   const rpcCalls = [];
   const calculationMessage = { id: "calc-1", text: "Total = 40", timestamp: 1793500000 };
@@ -148,6 +190,14 @@ test("transactional publishing records pending-cycle metadata before finalizing 
     groupId: "fixture-group",
     loadUserConfig: () => ({ aliases: {} }),
     scanManager: {
+      detectCycles: async () => [{
+        id: "cycle_current",
+        status: "ACTIVE",
+        settlementConfirmed: false,
+        startDate: "2026-10-01",
+        endDate: null,
+        startBoundary: { id: "start-1", source: "marker", confidence: "HIGH" },
+      }],
       prepare: async () => ({ jobId: "local", expectedImages: 1, status: "queued" }),
       runAndGet: async () => {},
     },
@@ -195,6 +245,75 @@ test("settlement totals use cents, stable members, and exclude transfer proofs",
   assert.equal(settlement.perPersonCents, 67);
   assert.deepEqual(settlement.memberTotals, { Alex: 101, Jamie: 100, Taylor: 0 });
   assert.equal(settlement.receiptCount, 2);
+});
+
+test("a verified clearance rolls forward before November receipts are scanned", async () => {
+  const rpcCalls = [];
+  let preparedContext = null;
+  const clearance = {
+    id: "clearance-31-oct", text: "Clear up to date", timestamp: 1793449800,
+    source: "marker", confidence: "HIGH",
+  };
+  const startBoundary = { ...clearance, dateStr: "2026-10-31" };
+  const worker = createSupabaseWorker({
+    mode: "dry-run",
+    transactionalWrites: true,
+    workerId: "rollover-worker",
+    contract: {
+      approved: true,
+      value: {
+        members: ["Alex", "Jamie", "Morgan", "Taylor"], aliases: {},
+        shareRounding: "floor", settlementIdMode: "existing-only", zeroAmountPolicy: "preserve",
+      },
+    },
+    groupId: "fixture-group",
+    loadUserConfig: () => ({ aliases: {} }),
+    scanManager: {
+      detectCycles: async () => [
+        { id: "cycle_current", status: "ACTIVE", settlementConfirmed: false, startDate: "2026-10-31", endDate: null, startBoundary },
+        { id: "cycle_hist_1", status: "SETTLED", settlementConfirmed: true, startDate: "2026-09-01", endDate: "2026-10-31", startBoundary: { id: "old-start" }, endBoundary: startBoundary, clearanceMessage: clearance },
+      ],
+      prepare: async (context) => {
+        preparedContext = context;
+        return { jobId: "local-rollover", expectedImages: 1, status: "queued" };
+      },
+      runAndGet: async () => {},
+    },
+    localDatabase: {
+      getScanJob: () => ({
+        status: "complete",
+        selectedCycleData: { status: "ACTIVE", calculationMessage: null, clearanceMessage: null },
+        result: { expenses: [{ id: "nov-2", date: "2026-11-02T01:00:00Z", paidBy: "Jamie", merchant: "November Market", amount: 4, category: "Groceries" }] },
+        reconciliation: { failed: 0, queued: 0 },
+      }),
+    },
+    imageLoader: async () => ({ buffer: Buffer.from("image"), mimetype: "image/jpeg" }),
+    client: {
+      select: async (table, query = {}) => {
+        if (table === "periods" && query.id === "eq.period_2026-10-31")
+          return [{ id: "period_2026-10-31", status: "CURRENT", start_date: "2026-10-31", end_date: null }];
+        if (table === "periods")
+          return [{ id: "period_2026-10-10", status: "CURRENT", start_date: "2026-10-10", end_date: "2026-10-31" }];
+        return [];
+      },
+      upload: async () => {},
+      update: async (table, filters, body) => table === "sync_requests" ? [{ id: "job", ...body }] : [],
+      rpc: async (name, body) => {
+        rpcCalls.push({ name, body });
+        return name === "finalize_sync_request" ? { result_summary: "done" } : {};
+      },
+    },
+  });
+  await worker.processClaimedJob({ id: "11111111-1111-4111-8111-111111111111" }, { assert() {} });
+  assert.deepEqual(rpcCalls.map((call) => call.name), [
+    "rollover_settlement_period", "record_period_cycle_state", "finalize_sync_request",
+  ]);
+  assert.equal(rpcCalls[0].body.p_old_period_id, "period_2026-10-10");
+  assert.equal(rpcCalls[0].body.p_new_period_id, "period_2026-10-31");
+  assert.equal(rpcCalls[0].body.p_new_settlement_id, "settlement_2026-10-31_current");
+  assert.equal(preparedContext.startDate, "2026-10-31");
+  assert.equal(preparedContext.cycleBoundaryId, "clearance-31-oct");
+  assert.equal(rpcCalls[2].body.p_period_id, "period_2026-10-31");
 });
 
 test("REST client sends conditional updates used for lease renewals", async () => {
@@ -370,7 +489,7 @@ test("a lost job lease stops processing before receipt writes", async () => {
     transactionalWrites: false,
     client: {
       verifySchema: async () => {},
-      rpc: async (name) => name === "instabox_worker_capabilities" ? { version: 4, writes_enabled: true } : [{ id: "recovered", lease_expires_at: new Date(Date.now() + 60000).toISOString() }],
+      rpc: async (name) => name === "instabox_worker_capabilities" ? { version: 5, writes_enabled: true } : [{ id: "recovered", lease_expires_at: new Date(Date.now() + 60000).toISOString() }],
       select: async () => [{ id: "p", status: "CURRENT", start_date: "2026-10-01", end_date: "2026-10-31" }],
       update: async () => [],
       insert: async () => { throw new Error("no insert should occur after lease loss"); },
