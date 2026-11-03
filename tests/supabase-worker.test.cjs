@@ -9,6 +9,7 @@ process.env.SPLITMATE_DATA_DIR = workerTestData;
 const {
   centsFromAmount,
   validateReceipt,
+  assertReceiptCycleAssignment,
   settlementForReceipts,
   SupabaseRestClient,
   resolveSupabaseServerKey,
@@ -18,6 +19,7 @@ const {
   WRITE_APPROVAL,
 } = require("../server/services/supabase-worker.cjs");
 const { WhatsAppSessionLock, clearStaleChromiumProfileLocks } = require("../server/services/whatsapp-session-lock.cjs");
+const timestamp = (value) => Math.floor(Date.parse(value) / 1000);
 
 test("Supabase receipt validation follows the available SplitMate cent and category rules", () => {
   assert.equal(centsFromAmount(12.345), 1235);
@@ -58,6 +60,118 @@ test("validation rejects impossible calendar dates, absent amounts and unknown p
   assert.throws(() => validateReceipt({ ...receipt, date: "2026-02-30" }, "p"), /invalid date/);
   assert.throws(() => validateReceipt(receipt, "p", { sender: "Jamie" }), /unmapped payer/);
   assert.equal(validateReceipt({ ...receipt, paidBy: "sender" }, "p", { sender: "Jamie" }).payer, "Jamie");
+});
+
+test("immutable boundaries separate receipts on the same Sydney clearance date", () => {
+  const clearanceTimestamp = timestamp("2026-10-31T12:30:00Z");
+  const beforeTimestamp = clearanceTimestamp - 1;
+  const afterTimestamp = clearanceTimestamp + 1;
+  const oldStart = {
+    id: "configured-october-start",
+    timestamp: timestamp("2026-10-09T13:00:00Z") - 1,
+  };
+  const clearance = { id: "clearance-31-oct", timestamp: clearanceTimestamp };
+  const oldPeriod = { id: "period_2026-10-10", start_date: "2026-10-10", end_date: "2026-10-31" };
+  const nextPeriod = {
+    id: "period_2026-10-31",
+    start_date: "2026-10-31",
+    end_date: null,
+    whatsapp_start_boundary: clearance,
+  };
+  const oldExpense = { id: "true_oct-before", date: new Date(beforeTimestamp * 1000).toISOString() };
+  const nextExpense = { id: "false_nov-after#page1", date: new Date(afterTimestamp * 1000).toISOString() };
+  const oldJob = {
+    selectedCycleData: {
+      id: "cycle_hist_1", startDate: "2026-10-10", endDate: "2026-10-31",
+      startBoundary: oldStart, endBoundary: clearance,
+    },
+    candidates: [{ id: oldExpense.id, timestamp: beforeTimestamp }],
+  };
+  const nextJob = {
+    selectedCycleData: {
+      id: "cycle_current", startDate: "2026-10-31", endDate: null,
+      startBoundary: clearance, endBoundary: null,
+    },
+    candidates: [{ id: nextExpense.id, timestamp: afterTimestamp }],
+  };
+
+  assert.equal(assertReceiptCycleAssignment({
+    expenses: [oldExpense], scanJob: oldJob, period: oldPeriod,
+    expectedCycleId: "cycle_hist_1", expectedBoundaryId: oldStart.id,
+  }), true);
+  assert.equal(assertReceiptCycleAssignment({
+    expenses: [nextExpense], scanJob: nextJob, period: nextPeriod,
+    expectedCycleId: "cycle_current", expectedBoundaryId: clearance.id,
+  }), true);
+  assert.throws(() => assertReceiptCycleAssignment({
+    expenses: [nextExpense],
+    scanJob: { ...oldJob, candidates: [{ id: nextExpense.id, timestamp: afterTimestamp }] },
+    period: oldPeriod, expectedCycleId: "cycle_hist_1", expectedBoundaryId: oldStart.id,
+  }), /ambiguous|mismatched/i);
+  assert.throws(() => assertReceiptCycleAssignment({
+    expenses: [oldExpense],
+    scanJob: { ...nextJob, candidates: [{ id: oldExpense.id, timestamp: beforeTimestamp }] },
+    period: nextPeriod, expectedCycleId: "cycle_current", expectedBoundaryId: clearance.id,
+  }), /ambiguous|mismatched/i);
+});
+
+test("Sydney midnight and daylight-saving boundary instants remain authoritative", () => {
+  for (const fixture of [
+    {
+      boundary: "2026-10-03T15:59:59Z",
+      receipt: "2026-10-03T16:00:00Z",
+      date: "2026-10-04",
+      id: "true_dst-receipt",
+    },
+    {
+      boundary: "2026-10-31T12:59:59Z",
+      receipt: "2026-10-31T13:00:00Z",
+      date: "2026-11-01",
+      id: "false_midnight-receipt",
+    },
+  ]) {
+    const boundaryTimestamp = timestamp(fixture.boundary);
+    const receiptTimestamp = timestamp(fixture.receipt);
+    const boundary = { id: `boundary-${fixture.id}`, timestamp: boundaryTimestamp };
+    const expense = { id: fixture.id, date: new Date(receiptTimestamp * 1000).toISOString() };
+    const scanJob = {
+      selectedCycleData: {
+        id: "cycle_current", startDate: fixture.date, endDate: null,
+        startBoundary: boundary, endBoundary: null,
+      },
+      candidates: [{ id: fixture.id, timestamp: receiptTimestamp }],
+    };
+    assert.equal(assertReceiptCycleAssignment({
+      expenses: [expense], scanJob,
+      period: { id: `period_${fixture.date}`, start_date: fixture.date, end_date: null, whatsapp_start_boundary: boundary },
+      expectedCycleId: "cycle_current", expectedBoundaryId: boundary.id,
+    }), true);
+  }
+});
+
+test("cycle assignment is retry-safe and rejects missing or ambiguous evidence", () => {
+  const startTimestamp = timestamp("2026-10-31T12:30:00Z");
+  const receiptTimestamp = startTimestamp + 10;
+  const boundary = { id: "clearance-31-oct", timestamp: startTimestamp };
+  const period = { id: "period_2026-10-31", start_date: "2026-10-31", end_date: null, whatsapp_start_boundary: boundary };
+  const ids = ["true_message-id", "false_message-id", "true_document-id#page1"];
+  const candidates = ids.map((id, index) => ({ id, timestamp: receiptTimestamp + index }));
+  const expenses = candidates.map(({ id, timestamp: sentAt }) => ({ id, date: new Date(sentAt * 1000).toISOString() }));
+  const scanJob = {
+    selectedCycleData: { id: "cycle_current", startDate: "2026-10-31", endDate: null, startBoundary: boundary, endBoundary: null },
+    candidates,
+  };
+  const input = { expenses, scanJob, period, expectedCycleId: "cycle_current", expectedBoundaryId: boundary.id };
+
+  assert.equal(assertReceiptCycleAssignment(input), true);
+  assert.equal(assertReceiptCycleAssignment(input), true);
+  assert.deepEqual(expenses.map((expense) => expense.id), ids);
+  assert.throws(() => assertReceiptCycleAssignment({ ...input, scanJob: { candidates } }), /no immutable/i);
+  assert.throws(() => assertReceiptCycleAssignment({ ...input, expenses: [{ id: "missing", date: expenses[0].date }] }), /not an authoritative member/i);
+  assert.throws(() => assertReceiptCycleAssignment({
+    ...input,
+    scanJob: { ...scanJob, candidates: [...candidates, { id: ids[0], timestamp: receiptTimestamp + 99 }] },
+  }), /conflicting immutable/i);
 });
 
 function fakeIntegration({ failInsert = false, periodStatus = "CURRENT" } = {}) {
@@ -113,6 +227,28 @@ test("replaying a scan preserves manual edits and exclusions, uploads private ev
   assert.equal(fixture.settlements.length, 1);
   assert.equal(fixture.settlements[0].total_cents, 1000);
   assert.equal(fixture.settlements[0].member_totals.Alex, 1000);
+});
+
+test("an existing WhatsApp receipt is never reassigned to another period", async () => {
+  const fixture = fakeIntegration();
+  fixture.receipts.set("new", {
+    id: "new",
+    period_id: "historical-period",
+    merchant: "Historical edit",
+    payer: "Jamie",
+    amount_cents: 777,
+    date: "2026-09-01",
+    is_excluded: true,
+    image_url: null,
+  });
+
+  await assert.rejects(
+    () => fixture.worker.processClaimedJob({ id: "job" }, { assert() {} }),
+    /belongs to another period/i,
+  );
+  assert.equal(fixture.receipts.get("new").period_id, "historical-period");
+  assert.equal(fixture.receipts.get("new").merchant, "Historical edit");
+  assert.equal(fixture.uploads.length, 0);
 });
 
 test("persistence failure fails the job instead of being swallowed as a validation warning", async () => {
@@ -173,6 +309,13 @@ test("a retry follows an already committed rollover only when boundary IDs match
 test("transactional publishing records pending-cycle metadata before finalizing receipts", async () => {
   const rpcCalls = [];
   const calculationMessage = { id: "calc-1", text: "Total = 40", timestamp: 1793500000 };
+  const startBoundary = {
+    id: "start-1",
+    timestamp: timestamp("2026-09-30T14:00:00Z") - 1,
+    source: "marker",
+    confidence: "HIGH",
+  };
+  const receiptTimestamp = timestamp("2026-10-02T01:00:00Z");
   const worker = createSupabaseWorker({
     mode: "dry-run",
     transactionalWrites: true,
@@ -196,7 +339,7 @@ test("transactional publishing records pending-cycle metadata before finalizing 
         settlementConfirmed: false,
         startDate: "2026-10-01",
         endDate: null,
-        startBoundary: { id: "start-1", source: "marker", confidence: "HIGH" },
+        startBoundary,
       }],
       prepare: async () => ({ jobId: "local", expectedImages: 1, status: "queued" }),
       runAndGet: async () => {},
@@ -205,11 +348,17 @@ test("transactional publishing records pending-cycle metadata before finalizing 
       getScanJob: () => ({
         status: "complete",
         selectedCycleData: {
+          id: "cycle_current",
+          startDate: "2026-10-01",
+          endDate: null,
+          startBoundary,
+          endBoundary: null,
           status: "PENDING_SETTLEMENT",
           calculationMessage,
           clearanceMessage: null,
         },
-        result: { expenses: [{ id: "receipt-1", date: "2026-10-02", paidBy: "Alex", merchant: "Market", amount: 10, category: "Groceries" }] },
+        candidates: [{ id: "receipt-1", timestamp: receiptTimestamp }],
+        result: { expenses: [{ id: "receipt-1", date: new Date(receiptTimestamp * 1000).toISOString(), paidBy: "Alex", merchant: "Market", amount: 10, category: "Groceries" }] },
         reconciliation: { failed: 0, queued: 0 },
       }),
     },
@@ -306,7 +455,12 @@ test("a verified clearance rolls forward before November receipts are scanned", 
     localDatabase: {
       getScanJob: () => ({
         status: "complete",
-        selectedCycleData: { status: "ACTIVE", calculationMessage: null, clearanceMessage: null },
+        selectedCycleData: {
+          id: "cycle_current", startDate: "2026-10-31", endDate: null,
+          startBoundary, endBoundary: null, status: "ACTIVE",
+          calculationMessage: null, clearanceMessage: null,
+        },
+        candidates: [{ id: "nov-2", timestamp: timestamp("2026-11-02T01:00:00Z") }],
         result: { expenses: [{ id: "nov-2", date: "2026-11-02T01:00:00Z", paidBy: "Jamie", merchant: "November Market", amount: 4, category: "Groceries" }] },
         reconciliation: { failed: 0, queued: 0 },
       }),
@@ -315,7 +469,7 @@ test("a verified clearance rolls forward before November receipts are scanned", 
     client: {
       select: async (table, query = {}) => {
         if (table === "periods" && query.id === "eq.period_2026-10-31")
-          return [{ id: "period_2026-10-31", status: "CURRENT", start_date: "2026-10-31", end_date: null }];
+          return [{ id: "period_2026-10-31", status: "CURRENT", start_date: "2026-10-31", end_date: null, whatsapp_start_boundary: startBoundary }];
         if (table === "periods")
           return [{ id: "period_2026-10-10", status: "CURRENT", start_date: "2026-10-10", end_date: "2026-10-31" }];
         return [];

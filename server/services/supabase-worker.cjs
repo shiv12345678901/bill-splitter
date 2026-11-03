@@ -152,6 +152,76 @@ function validateReceipt(expense, periodId, aliases = {}) {
   };
 }
 
+function assertReceiptCycleAssignment({
+  expenses = [],
+  scanJob,
+  period,
+  expectedCycleId,
+  expectedBoundaryId,
+}) {
+  const cycle = scanJob?.selectedCycleData;
+  if (!cycle?.id || !cycle.startBoundary?.id) {
+    throw new Error("The scan has no immutable WhatsApp cycle evidence; refusing to publish receipts.");
+  }
+  if (!expectedCycleId || cycle.id !== expectedCycleId) {
+    throw new Error("The durable scan job does not match the selected WhatsApp cycle.");
+  }
+  if (!expectedBoundaryId || cycle.startBoundary.id !== expectedBoundaryId) {
+    throw new Error("The durable scan job has an ambiguous or changed WhatsApp start boundary.");
+  }
+  const storedBoundaryId = period?.whatsapp_start_boundary?.id;
+  if (storedBoundaryId && storedBoundaryId !== cycle.startBoundary.id) {
+    throw new Error("The Supabase period does not match the selected WhatsApp start boundary.");
+  }
+
+  const startTimestamp = Number(cycle.startBoundary.timestamp);
+  const endTimestamp = cycle.endBoundary ? Number(cycle.endBoundary.timestamp) : null;
+  if (!Number.isSafeInteger(startTimestamp) || startTimestamp <= 0 ||
+      (cycle.endBoundary && (!cycle.endBoundary.id || !Number.isSafeInteger(endTimestamp) || endTimestamp <= startTimestamp))) {
+    throw new Error("The selected WhatsApp cycle has invalid boundary evidence.");
+  }
+  if (cycle.startDate !== sydneyDate(startTimestamp + 1) ||
+      (cycle.endBoundary && cycle.endDate !== sydneyDate(endTimestamp)) ||
+      (!cycle.endBoundary && cycle.endDate != null)) {
+    throw new Error("The selected WhatsApp cycle dates do not match its Sydney boundary instants.");
+  }
+  if (!period?.start_date || cycle.startDate > period.start_date ||
+      (cycle.endDate && cycle.endDate < period.start_date)) {
+    throw new Error("The selected WhatsApp cycle does not contain the Supabase period start date.");
+  }
+
+  const candidates = new Map();
+  for (const candidate of scanJob.candidates || []) {
+    const id = typeof candidate?.id === "string" ? candidate.id : "";
+    const timestamp = Number(candidate?.timestamp);
+    if (!id || !Number.isSafeInteger(timestamp) || timestamp <= startTimestamp ||
+        (endTimestamp !== null && timestamp >= endTimestamp)) {
+      throw new Error("A receipt candidate has ambiguous or mismatched WhatsApp cycle evidence.");
+    }
+    if (candidates.has(id) && candidates.get(id) !== timestamp) {
+      throw new Error(`Receipt ${id} has conflicting immutable WhatsApp timestamps.`);
+    }
+    const localDate = sydneyDate(timestamp);
+    if (localDate < period.start_date || (period.end_date && localDate > period.end_date)) {
+      throw new Error(`Receipt ${id} falls outside the selected Supabase period in Australia/Sydney.`);
+    }
+    candidates.set(id, timestamp);
+  }
+
+  for (const expense of expenses || []) {
+    const id = typeof expense?.id === "string" ? expense.id : "";
+    const timestamp = candidates.get(id);
+    if (!id || timestamp === undefined) {
+      throw new Error(`Receipt ${id || "(missing id)"} is not an authoritative member of the selected WhatsApp cycle.`);
+    }
+    const capturedTimestamp = Date.parse(expense.date);
+    if (!Number.isFinite(capturedTimestamp) || Math.floor(capturedTimestamp / 1000) !== timestamp) {
+      throw new Error(`Receipt ${id} timestamp does not match its immutable WhatsApp message timestamp.`);
+    }
+  }
+  return true;
+}
+
 function safeObjectName(value) {
   return String(value).replace(/[^a-zA-Z0-9_-]/g, "_");
 }
@@ -484,11 +554,17 @@ function createSupabaseWorker({
       }
     }
     const existingRows = await client.select("receipts", {
-      select: "id,image_url",
+      select: "id,period_id,image_url,source_message_id",
       id: encodeFilter("eq", row.id),
       limit: 1,
     });
     const existing = Array.isArray(existingRows) ? existingRows[0] : null;
+    if (existing && String(existing.period_id) !== String(periodId)) {
+      throw new Error(`Existing receipt ${row.id} belongs to another period; historical receipts are never reassigned.`);
+    }
+    if (existing?.source_message_id && existing.source_message_id !== row.id) {
+      throw new Error(`Existing receipt ${row.id} has conflicting WhatsApp source identity.`);
+    }
 
     let evidenceLocator = existing?.image_url || null;
     if (!evidenceLocator) {
@@ -692,6 +768,15 @@ function createSupabaseWorker({
     }
 
     const expenses = localJob.result?.expenses || [];
+    if (transactionalWrites || context.cycleId || context.cycleBoundaryId) {
+      assertReceiptCycleAssignment({
+        expenses,
+        scanJob: localJob,
+        period,
+        expectedCycleId: context.cycleId,
+        expectedBoundaryId: context.cycleBoundaryId,
+      });
+    }
     await updateJob(job, {
       stage: "saving_receipts",
       stage_message: `Validating and saving ${expenses.length} receipt result(s)…`,
@@ -910,5 +995,6 @@ module.exports = {
   createConfiguredSupabaseWorker,
   centsFromAmount,
   validateReceipt,
+  assertReceiptCycleAssignment,
   settlementForReceipts,
 };
