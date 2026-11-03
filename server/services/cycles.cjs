@@ -1,6 +1,7 @@
 const { loadUserConfig } = require("./config.cjs");
 const library = require("./library.cjs");
 const { buildSettlementCycles } = require("./cycle-state.cjs");
+const { ensureCollectionBridge } = require("./whatsapp-collection.cjs");
 const { isGenuineImageMessage, messageMimeType, messageType } = require("./whatsapp-media.cjs");
 const {
   discoveryStats,
@@ -48,14 +49,10 @@ async function detectSettlementCycles(groupId, client) {
     }
   }
 
+  await runWhatsAppOperation("prepare_collection_lookup", () => ensureCollectionBridge(client));
   const inPage = await runWhatsAppOperation("evaluate_history", () => client.pupPage.evaluate(async (gId) => {
     try {
-      const collection = window.require("WAWebCollections")?.Chat;
-      let chat = collection?.get(gId);
-      if (!chat && collection) {
-        const all = collection.getModelsArray ? collection.getModelsArray() : collection._models || [];
-        chat = all.find((model) => (model.id?._serialized || model.id?.$1 || model.id) === gId);
-      }
+      const chat = window.SplitMateWACollection?.findChat(gId);
       if (!chat) return { complete: false, error: "The selected WhatsApp group is unavailable.", messages: [] };
       try {
         const opener = window.require("WAWebChatOpenJob");
@@ -66,9 +63,7 @@ async function detectSettlementCycles(groupId, client) {
       if (loader?.loadEarlierMsgs) {
         let stalled = 0;
         for (let index = 0; index < 400; index += 1) {
-          const before = chat.msgs
-            ? chat.msgs.getModelsArray ? chat.msgs.getModelsArray() : chat.msgs._models || []
-            : [];
+          const before = window.SplitMateWACollection.messages(chat);
           const beforeOldest = Math.min(
             ...before.map((message) => Number(message.t || message.timestamp)).filter((value) => value > 0),
           );
@@ -77,9 +72,7 @@ async function detectSettlementCycles(groupId, client) {
             complete = true;
             break;
           }
-          const after = chat.msgs
-            ? chat.msgs.getModelsArray ? chat.msgs.getModelsArray() : chat.msgs._models || []
-            : [];
+          const after = window.SplitMateWACollection.messages(chat);
           const afterOldest = Math.min(
             ...after.map((message) => Number(message.t || message.timestamp)).filter((value) => value > 0),
           );
@@ -89,9 +82,7 @@ async function detectSettlementCycles(groupId, client) {
           await new Promise((resolve) => setTimeout(resolve, 60));
         }
       }
-      const models = chat.msgs
-        ? chat.msgs.getModelsArray ? chat.msgs.getModelsArray() : chat.msgs._models || []
-        : [];
+      const models = window.SplitMateWACollection.messages(chat);
       const messages = models.map((message) => {
         const id = typeof message.id === "string" ? message.id : message.id?._serialized || message.id?.$1 || "";
         const author = typeof message.author === "string"

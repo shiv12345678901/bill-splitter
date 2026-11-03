@@ -197,6 +197,7 @@ function recentClient(initialMessages, onSync = null) {
   const client = new EventEmitter();
   let visible = [...initialMessages];
   client.getState = async () => "CONNECTED";
+  client.pupPage = { evaluate: async () => true };
   client.getChatById = async () => ({
     fetchMessages: async () => [...visible],
     syncHistory: async () => {
@@ -204,6 +205,37 @@ function recentClient(initialMessages, onSync = null) {
       return true;
     },
   });
+  return client;
+}
+
+function collectionFallbackClient(messages) {
+  const client = new EventEmitter();
+  const chat = {
+    id: { _serialized: "group@g.us" },
+    msgs: { getModelsArray: () => [...messages] },
+  };
+  const window = {
+    require(name) {
+      if (name === "WAWebCollections") {
+        return { Chat: { get: () => null, getModelsArray: () => [chat] } };
+      }
+      if (name === "WAWebWidFactory") return { createWid: (id) => ({ _serialized: id }) };
+      if (name === "WAWebChatOpenJob") return { openChat: async () => {} };
+      if (name === "WAWebChatLoadMessages") return { loadEarlierMsgs: async () => [] };
+      return {};
+    },
+  };
+  client.getState = async () => "CONNECTED";
+  client.getChatById = async () => { throw "r"; };
+  client.searchMessages = async () => [];
+  client.pupPage = {
+    evaluate: (fn, ...args) =>
+      require("node:vm").runInNewContext(`(${fn.toString()})(...args)`, {
+        window,
+        args,
+        setTimeout,
+      }),
+  };
   return client;
 }
 
@@ -285,12 +317,41 @@ test("syncHistory false and unsupported sync remain optional and never prove del
   assert.equal(unsupportedSnapshot.retrievalVerified, true);
 });
 
+test("opaque getChatById failure falls back to the shared WhatsApp chat collection", async () => {
+  const messages = [
+    { id: { _serialized: "country-fresh-4926" }, t: 1793734200, type: "image", mimetype: "image/jpeg", from: { _serialized: "group@g.us" } },
+    { id: { _serialized: "country-fresh-2143" }, t: 1793734260, type: "image", mimetype: "image/jpeg", from: { _serialized: "group@g.us" } },
+  ];
+  const warnings = [];
+  const client = collectionFallbackClient(messages);
+  const snapshot = await refreshRecentMessageSnapshot("group@g.us", client, {
+    logger: { log() {}, warn: (message) => warnings.push(message) },
+  });
+  assert.equal(snapshot.retrievalVerified, true);
+  assert.equal(snapshot.source, "collection+events");
+  assert.equal(snapshot.historyTransfer, "unsupported");
+  assert.deepEqual(snapshot.messages.map((message) => message.id), ["country-fresh-4926", "country-fresh-2143"]);
+  assert.match(warnings[0], /chat lookup failed \(opaque library rejection\).*chat-collection lookup/i);
+
+  const cycles = await detectSettlementCycles("group@g.us", client);
+  assert.equal(
+    cycles.reduce((count, cycle) => count + cycle.groceryCount + cycle.paymentCount + cycle.unclassifiedCount, 0),
+    2,
+  );
+
+  await assert.rejects(
+    refreshRecentMessageSnapshot("missing@g.us", collectionFallbackClient(messages)),
+    /collection recent-message fetch failed \(resource unavailable\)/i,
+  );
+});
+
 test("required WhatsApp failures identify the operation and redact opaque rejections", async () => {
   const fetchFailure = recentClient([]);
   fetchFailure.getChatById = async () => ({ fetchMessages: async () => { throw "r"; } });
+  fetchFailure.pupPage.evaluate = async () => { throw "r"; };
   await assert.rejects(
     refreshRecentMessageSnapshot("group@g.us", fetchFailure),
-    (error) => /recent-message fetch failed \(opaque library rejection\)/i.test(error.message) && !/\br\b/i.test(error.message),
+    (error) => /collection recent-message fetch failed \(opaque library rejection\)/i.test(error.message) && !/\br\b/i.test(error.message),
   );
 
   const stateFailure = recentClient([]);
@@ -302,11 +363,16 @@ test("required WhatsApp failures identify the operation and redact opaque reject
 
   const chatFailure = recentClient([]);
   chatFailure.getChatById = async () => { throw new Error("sb_secret_private-value"); };
+  chatFailure.pupPage.evaluate = async () => { throw "r"; };
+  const warnings = [];
   await assert.rejects(
-    refreshRecentMessageSnapshot("group@g.us", chatFailure),
-    (error) => /chat lookup failed \(library operation failed\)/i.test(error.message) &&
-      !error.message.includes("sb_secret_private-value"),
+    refreshRecentMessageSnapshot("group@g.us", chatFailure, {
+      logger: { log() {}, warn: (message) => warnings.push(message) },
+    }),
+    /collection recent-message fetch failed \(opaque library rejection\)/i,
   );
+  assert.match(warnings[0], /chat lookup failed \(library operation failed\)/i);
+  assert.doesNotMatch(warnings[0], /sb_secret_private-value/);
 
   const mergeFailure = recentClient([]);
   mergeFailure.getChatById = async () => ({
@@ -320,7 +386,12 @@ test("required WhatsApp failures identify the operation and redact opaque reject
 
 test("Puppeteer page-evaluation failures are operation-labelled and redacted", async () => {
   const client = recentClient([]);
-  client.pupPage = { evaluate: async () => { throw "r"; } };
+  let pageCalls = 0;
+  client.pupPage = { evaluate: async () => {
+    pageCalls += 1;
+    if (pageCalls === 1) return true;
+    throw "r";
+  } };
   await assert.rejects(
     loadChatHistory(client, "group@g.us", 100, 1),
     /history page evaluation failed \(opaque library rejection\)/i,

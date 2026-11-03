@@ -1,4 +1,5 @@
 const { isGenuineImageMessage } = require("./whatsapp-media.cjs");
+const { ensureCollectionBridge } = require("./whatsapp-collection.cjs");
 const {
   mergeMessages,
   refreshRecentMessageSnapshot,
@@ -7,20 +8,10 @@ const {
 
 async function loadChatHistory(client, groupId, fetchLimit, startUnix = null) {
   const recentSnapshot = await refreshRecentMessageSnapshot(groupId, client);
+  await runWhatsAppOperation("prepare_collection_lookup", () => ensureCollectionBridge(client));
   const result = await runWhatsAppOperation("evaluate_history", () => client.pupPage.evaluate(
     async (gId, limit, cutoff) => {
-      const chatColl = window.require("WAWebCollections")?.Chat;
-      let c = chatColl?.get(gId);
-      if (!c && chatColl) {
-        const all = chatColl.getModelsArray() || [];
-        c = all.find((m) => {
-          const idStr =
-            m.id?._serialized ||
-            m.id?.$1 ||
-            (typeof m.id === "string" ? m.id : "");
-          return idStr === gId;
-        });
-      }
+      const c = window.SplitMateWACollection?.findChat(gId);
       if (!c) throw new Error("The selected WhatsApp group is unavailable.");
 
       // Open chat
@@ -43,20 +34,14 @@ async function loadChatHistory(client, groupId, fetchLimit, startUnix = null) {
       let stalled = 0;
       if (loader && typeof loader.loadEarlierMsgs === "function") {
         for (let i = 0; i < (cutoff === null ? 20 : 500); i++) {
-          const msgs = c.msgs
-            ? c.msgs.getModelsArray
-              ? c.msgs.getModelsArray()
-              : c.msgs._models || []
-            : [];
+          const msgs = window.SplitMateWACollection.messages(c);
           const oldest = Math.min(
             ...msgs.map((m) => Number(m.t || m.timestamp)).filter((t) => t > 0),
           );
           if (cutoff !== null ? oldest <= cutoff : msgs.length >= limit)
             return { complete: true, reason: cutoff !== null ? "cutoff-reached" : "limit-reached" };
           const earlier = await loader.loadEarlierMsgs({ chat: c });
-          const after = c.msgs?.getModelsArray
-            ? c.msgs.getModelsArray()
-            : c.msgs?._models || [];
+          const after = window.SplitMateWACollection.messages(c);
           const afterOldest = Math.min(
             ...after
               .map((m) => Number(m.t || m.timestamp))
@@ -95,23 +80,11 @@ async function readReceiptCandidates(
   useCheckpoint,
   recentMessages = [],
 ) {
+  await runWhatsAppOperation("prepare_collection_lookup", () => ensureCollectionBridge(client));
   const result = await runWhatsAppOperation("evaluate_candidates", () => client.pupPage.evaluate(
     (gId, sUnix, eUnix, useChk) => {
       try {
-        const chatColl = window.require("WAWebCollections")?.Chat;
-        let c = chatColl?.get(gId);
-        if (!c && chatColl) {
-          const all = chatColl.getModelsArray
-            ? chatColl.getModelsArray()
-            : chatColl._models || [];
-          c = all.find((m) => {
-            const idStr =
-              m.id?._serialized ||
-              m.id?.$1 ||
-              (typeof m.id === "string" ? m.id : "");
-            return idStr === gId;
-          });
-        }
+        const c = window.SplitMateWACollection?.findChat(gId);
         if (!c || !c.msgs)
           return {
             error: "The selected WhatsApp group is unavailable.",

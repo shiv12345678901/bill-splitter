@@ -1,5 +1,6 @@
 const crypto = require("node:crypto");
 const { isGenuineImageMessage, messageMimeType, messageType } = require("./whatsapp-media.cjs");
+const { fetchRecentCollectionMessages } = require("./whatsapp-collection.cjs");
 
 const clientStates = new WeakMap();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -7,11 +8,13 @@ const OPERATION_LABELS = {
   get_state: "connection-state check",
   get_chat: "chat lookup",
   fetch_recent: "recent-message fetch",
+  fetch_recent_collection: "collection recent-message fetch",
   sync_history: "optional peer-history request",
   merge_messages: "message merge",
   evaluate_history: "history page evaluation",
   evaluate_candidates: "candidate page evaluation",
   search_history: "history search",
+  prepare_collection_lookup: "chat-collection lookup preparation",
 };
 
 function errorCategory(error) {
@@ -203,7 +206,7 @@ async function refreshRecentMessageSnapshot(groupId, client, options = {}) {
   const wait = options.wait || sleep;
   const now = options.now || (() => Date.now());
 
-  if (!groupId || !client?.getChatById || !client?.getState) {
+  if (!groupId || !client?.getState || !client?.pupPage?.evaluate) {
     throw operationError("get_chat", new Error("operation unsupported"));
   }
   attachMessageSnapshotTracker(client, { logger });
@@ -214,19 +217,47 @@ async function refreshRecentMessageSnapshot(groupId, client, options = {}) {
   const operationOptions = { timeoutMs: operationTimeoutMs };
   const connectionState = await runWhatsAppOperation("get_state", () => client.getState(), operationOptions);
   if (connectionState !== "CONNECTED") throw operationError("get_state", new Error("client disconnected"));
-  const chat = await runWhatsAppOperation("get_chat", () => client.getChatById(groupId), operationOptions);
-  if (!chat?.fetchMessages) throw operationError("fetch_recent", new Error("operation unsupported"));
-
-  const fetchRecent = () => runWhatsAppOperation(
-    "fetch_recent",
-    () => chat.fetchMessages({ limit: recentLimit }),
-    operationOptions,
-  );
-  let messages = runMessageMerge(await fetchRecent(), state.groups.get(groupId));
+  let chat = null;
+  let initialMessages = null;
+  let retrievalSource = "collection+events";
+  if (typeof client.getChatById === "function") {
+    try {
+      chat = await runWhatsAppOperation("get_chat", () => client.getChatById(groupId), operationOptions);
+      if (typeof chat?.fetchMessages !== "function") chat = null;
+    } catch (error) {
+      logger.warn?.(`[WhatsApp:Recent] ${safeErrorMessage(error)} Trying the compatible chat-collection lookup.`);
+    }
+  }
+  if (chat) {
+    try {
+      initialMessages = await runWhatsAppOperation(
+        "fetch_recent",
+        () => chat.fetchMessages({ limit: recentLimit }),
+        operationOptions,
+      );
+      retrievalSource = "fetchMessages+events";
+    } catch (error) {
+      logger.warn?.(`[WhatsApp:Recent] ${safeErrorMessage(error)} Trying the compatible chat-collection reader.`);
+      chat = null;
+    }
+  }
+  const fetchRecent = chat
+    ? () => runWhatsAppOperation(
+      "fetch_recent",
+      () => chat.fetchMessages({ limit: recentLimit }),
+      operationOptions,
+    )
+    : () => runWhatsAppOperation(
+      "fetch_recent_collection",
+      () => fetchRecentCollectionMessages(client, groupId, recentLimit),
+      operationOptions,
+    );
+  if (!chat) initialMessages = await fetchRecent();
+  let messages = runMessageMerge(initialMessages, state.groups.get(groupId));
   let fingerprint = snapshotFingerprint(messages);
   const refreshStartedAt = now();
   let historyTransfer = "unsupported";
-  if (typeof chat.syncHistory === "function") {
+  if (typeof chat?.syncHistory === "function") {
     try {
       const requested = await runWhatsAppOperation("sync_history", () => chat.syncHistory(), operationOptions);
       historyTransfer = requested === true ? "requested" : "not-requested";
@@ -256,7 +287,7 @@ async function refreshRecentMessageSnapshot(groupId, client, options = {}) {
     retrievalVerified: true,
     freshness: "observed-connected-window",
     deliveryCompleteness: "unverified",
-    source: "fetchMessages+events",
+    source: retrievalSource,
     connectionState: finalConnectionState,
     historyTransfer,
     refreshedAt: new Date(now()).toISOString(),
