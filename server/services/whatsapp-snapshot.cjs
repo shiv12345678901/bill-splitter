@@ -1,7 +1,67 @@
+const crypto = require("node:crypto");
 const { isGenuineImageMessage, messageMimeType, messageType } = require("./whatsapp-media.cjs");
 
 const clientStates = new WeakMap();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const OPERATION_LABELS = {
+  get_state: "connection-state check",
+  get_chat: "chat lookup",
+  fetch_recent: "recent-message fetch",
+  sync_history: "optional peer-history request",
+  merge_messages: "message merge",
+  evaluate_history: "history page evaluation",
+  evaluate_candidates: "candidate page evaluation",
+  search_history: "history search",
+};
+
+function errorCategory(error) {
+  const value = String(error?.message || error || "").toLowerCase();
+  if (!value || value.length <= 2) return "opaque library rejection";
+  if (/timeout|timed out/.test(value)) return "operation timed out";
+  if (/stopped loading|could not finish loading/.test(value)) return "history loading stalled";
+  if (/execution context|context.*destroyed|detached frame/.test(value)) return "browser context changed";
+  if (/target closed|session closed|browser.*closed|page.*closed/.test(value)) return "browser session closed";
+  if (/protocol error/.test(value)) return "browser protocol failure";
+  if (/disconnect|not connected|socket/.test(value)) return "client disconnected";
+  if (/unsupported|not a function|cannot find module/.test(value)) return "operation unsupported";
+  if (/not found|unavailable|does not exist/.test(value)) return "resource unavailable";
+  return "library operation failed";
+}
+
+function operationError(operation, error) {
+  if (error?.name === "WhatsAppOperationError" && error.operation === operation) return error;
+  const category = errorCategory(error);
+  const label = OPERATION_LABELS[operation] || "operation";
+  const wrapped = new Error(`WhatsApp ${label} failed (${category}).`);
+  wrapped.name = "WhatsAppOperationError";
+  wrapped.code = `WHATSAPP_${operation.toUpperCase()}_FAILED`;
+  wrapped.operation = operation;
+  wrapped.category = category;
+  return wrapped;
+}
+
+function safeErrorMessage(error, fallback = "WhatsApp operation failed.") {
+  if (error?.name === "WhatsAppOperationError" && error.message) return error.message;
+  if (error instanceof Error && error.message) return operationError("unknown", error).message;
+  if (error !== undefined && error !== null) return operationError("unknown", error).message;
+  return fallback;
+}
+
+async function runWhatsAppOperation(operation, action, { timeoutMs = 10000 } = {}) {
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(action),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("operation timed out")), timeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    throw operationError(operation, error);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function serializedId(value) {
   if (typeof value === "string") return value;
@@ -62,6 +122,14 @@ function mergeMessages(...collections) {
     left.timestamp - right.timestamp || left.id.localeCompare(right.id));
 }
 
+function runMessageMerge(...collections) {
+  try {
+    return mergeMessages(...collections);
+  } catch (error) {
+    throw operationError("merge_messages", error);
+  }
+}
+
 function snapshotFingerprint(messages) {
   return messages.map((message) =>
     `${message.id}:${message.timestamp}:${message.type}:${message.mimetype}`).join("|");
@@ -76,20 +144,29 @@ function stateFor(client) {
   return state;
 }
 
-function attachMessageSnapshotTracker(client) {
+function attachMessageSnapshotTracker(client, { logger = console } = {}) {
   if (!client?.on) return;
   const state = stateFor(client);
   if (state.attached) return;
   state.attached = true;
+  const clearCache = () => state.cache.clear();
   const remember = (message) => {
-    const groupId = groupIdFor(message);
-    if (!groupId) return;
-    const existing = state.groups.get(groupId) || [];
-    state.groups.set(groupId, mergeMessages(existing, [message]).slice(-500));
-    state.cache.delete(groupId);
+    try {
+      const groupId = groupIdFor(message);
+      if (!groupId) return;
+      const existing = state.groups.get(groupId) || [];
+      state.groups.set(groupId, runMessageMerge(existing, [message]).slice(-500));
+      state.cache.delete(groupId);
+    } catch (error) {
+      logger.warn?.(`[WhatsApp:Events] ${safeErrorMessage(error)}`);
+    }
   };
   client.on("message", remember);
   client.on("message_create", remember);
+  client.on("disconnected", clearCache);
+  client.on("change_state", (connectionState) => {
+    if (connectionState !== "CONNECTED") clearCache();
+  });
 }
 
 function discoveryStats(messages) {
@@ -106,67 +183,82 @@ function discoveryStats(messages) {
   return { messageCount: messages.length, imageCount, rejectedCandidateCount, newestTimestamp };
 }
 
-async function refreshRecentMessageSnapshot(groupId, client, {
-  logger = console,
-  recentLimit = 250,
-  minimumWaitMs = Number(process.env.SPLITMATE_WHATSAPP_REFRESH_MIN_WAIT_MS) || 2000,
-  pollMs = Number(process.env.SPLITMATE_WHATSAPP_REFRESH_POLL_MS) || 500,
-  maxWaitMs = Number(process.env.SPLITMATE_WHATSAPP_REFRESH_MAX_WAIT_MS) || 6000,
-  cacheMs = Number(process.env.SPLITMATE_WHATSAPP_SNAPSHOT_CACHE_MS) || 5000,
-  wait = sleep,
-  now = () => Date.now(),
-} = {}) {
+function numericOption(value, fallback, minimum = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= minimum ? parsed : fallback;
+}
+
+function privateGroupLabel(groupId) {
+  return crypto.createHash("sha256").update(String(groupId)).digest("hex").slice(0, 10);
+}
+
+async function refreshRecentMessageSnapshot(groupId, client, options = {}) {
+  const logger = options.logger || console;
+  const recentLimit = numericOption(options.recentLimit, 250, 1);
+  const minimumWaitMs = numericOption(options.minimumWaitMs ?? process.env.SPLITMATE_WHATSAPP_REFRESH_MIN_WAIT_MS, 2000);
+  const pollMs = numericOption(options.pollMs ?? process.env.SPLITMATE_WHATSAPP_REFRESH_POLL_MS, 500, 1);
+  const maxWaitMs = numericOption(options.maxWaitMs ?? process.env.SPLITMATE_WHATSAPP_REFRESH_MAX_WAIT_MS, 6000, pollMs * 2);
+  const cacheMs = numericOption(options.cacheMs ?? process.env.SPLITMATE_WHATSAPP_SNAPSHOT_CACHE_MS, 5000);
+  const operationTimeoutMs = numericOption(options.operationTimeoutMs ?? process.env.SPLITMATE_WHATSAPP_OPERATION_TIMEOUT_MS, 10000, 100);
+  const wait = options.wait || sleep;
+  const now = options.now || (() => Date.now());
+
   if (!groupId || !client?.getChatById || !client?.getState) {
-    throw new Error("WhatsApp recent-message freshness cannot be verified.");
+    throw operationError("get_chat", new Error("operation unsupported"));
   }
-  attachMessageSnapshotTracker(client);
+  attachMessageSnapshotTracker(client, { logger });
   const state = stateFor(client);
   const cached = state.cache.get(groupId);
   if (cached && now() - cached.refreshedAtMs <= cacheMs) return cached;
 
-  const connectionState = await client.getState();
-  if (connectionState !== "CONNECTED") {
-    throw new Error(`WhatsApp recent-message freshness is unverified while state is ${connectionState || "unknown"}.`);
-  }
-  const chat = await client.getChatById(groupId);
-  if (!chat?.fetchMessages || !chat?.syncHistory) {
-    throw new Error("The installed WhatsApp client cannot refresh recent chat history safely.");
-  }
+  const operationOptions = { timeoutMs: operationTimeoutMs };
+  const connectionState = await runWhatsAppOperation("get_state", () => client.getState(), operationOptions);
+  if (connectionState !== "CONNECTED") throw operationError("get_state", new Error("client disconnected"));
+  const chat = await runWhatsAppOperation("get_chat", () => client.getChatById(groupId), operationOptions);
+  if (!chat?.fetchMessages) throw operationError("fetch_recent", new Error("operation unsupported"));
 
-  let messages = mergeMessages(await chat.fetchMessages({ limit: recentLimit }), state.groups.get(groupId));
+  const fetchRecent = () => runWhatsAppOperation(
+    "fetch_recent",
+    () => chat.fetchMessages({ limit: recentLimit }),
+    operationOptions,
+  );
+  let messages = runMessageMerge(await fetchRecent(), state.groups.get(groupId));
   let fingerprint = snapshotFingerprint(messages);
   const refreshStartedAt = now();
-  let syncRequested;
-  try {
-    syncRequested = await chat.syncHistory();
-  } catch (error) {
-    throw new Error(`WhatsApp recent-message refresh failed: ${error.message}`);
+  let historyTransfer = "unsupported";
+  if (typeof chat.syncHistory === "function") {
+    try {
+      const requested = await runWhatsAppOperation("sync_history", () => chat.syncHistory(), operationOptions);
+      historyTransfer = requested === true ? "requested" : "not-requested";
+    } catch (error) {
+      historyTransfer = "failed-optional";
+      logger.warn?.(`[WhatsApp:Recent] ${safeErrorMessage(error)} Continuing with supported recent-message retrieval.`);
+    }
   }
 
   let stableReads = 0;
-  while (now() - refreshStartedAt <= maxWaitMs) {
-    await wait(Math.max(0, pollMs));
-    const next = mergeMessages(await chat.fetchMessages({ limit: recentLimit }), state.groups.get(groupId));
+  const maximumPolls = Math.max(2, Math.ceil(maxWaitMs / pollMs));
+  for (let poll = 0; poll < maximumPolls; poll += 1) {
+    await wait(pollMs);
+    const next = runMessageMerge(await fetchRecent(), state.groups.get(groupId));
     const nextFingerprint = snapshotFingerprint(next);
     stableReads = nextFingerprint === fingerprint ? stableReads + 1 : 0;
     messages = next;
     fingerprint = nextFingerprint;
     if (now() - refreshStartedAt >= minimumWaitMs && stableReads >= 2) break;
   }
-  if (now() - refreshStartedAt > maxWaitMs || stableReads < 2) {
-    throw new Error("WhatsApp recent-message refresh did not converge; scan freshness is unverified.");
-  }
-  const finalConnectionState = await client.getState();
-  if (finalConnectionState !== "CONNECTED") {
-    throw new Error("WhatsApp disconnected during recent-message refresh; scan freshness is unverified.");
-  }
+  if (stableReads < 2) throw operationError("fetch_recent", new Error("operation timed out"));
+  const finalConnectionState = await runWhatsAppOperation("get_state", () => client.getState(), operationOptions);
+  if (finalConnectionState !== "CONNECTED") throw operationError("get_state", new Error("client disconnected"));
 
   const stats = discoveryStats(messages);
   const result = {
-    verified: true,
-    source: "syncHistory+fetchMessages+events",
+    retrievalVerified: true,
+    freshness: "observed-connected-window",
+    deliveryCompleteness: "unverified",
+    source: "fetchMessages+events",
     connectionState: finalConnectionState,
-    syncRequested: syncRequested === true,
+    historyTransfer,
     refreshedAt: new Date(now()).toISOString(),
     refreshedAtMs: now(),
     messages,
@@ -174,7 +266,7 @@ async function refreshRecentMessageSnapshot(groupId, client, {
   };
   state.cache.set(groupId, result);
   logger.log?.(
-    `[WhatsApp:Recent] group=${groupId} messages=${stats.messageCount} newest=${stats.newestTimestamp ? new Date(stats.newestTimestamp * 1000).toISOString() : "none"} images=${stats.imageCount} rejected=${stats.rejectedCandidateCount} freshness=verified`,
+    `[WhatsApp:Recent] group=${privateGroupLabel(groupId)} messages=${stats.messageCount} newest=${stats.newestTimestamp ? new Date(stats.newestTimestamp * 1000).toISOString() : "none"} images=${stats.imageCount} rejected=${stats.rejectedCandidateCount} retrieval=verified delivery_completeness=unverified history_transfer=${historyTransfer}`,
   );
   return result;
 }
@@ -182,7 +274,11 @@ async function refreshRecentMessageSnapshot(groupId, client, {
 module.exports = {
   attachMessageSnapshotTracker,
   discoveryStats,
+  errorCategory,
   mergeMessages,
   normaliseMessage,
+  operationError,
   refreshRecentMessageSnapshot,
+  runWhatsAppOperation,
+  safeErrorMessage,
 };

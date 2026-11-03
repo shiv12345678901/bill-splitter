@@ -15,7 +15,7 @@ const { createScanManager } = require("./sockets/scan.cjs");
 const { createConfiguredSupabaseWorker, LIVE_MODE } = require("./services/supabase-worker.cjs");
 const { WhatsAppSessionLock, clearStaleChromiumProfileLocks } = require("./services/whatsapp-session-lock.cjs");
 const { resolveWhatsAppUserAgent } = require("./services/whatsapp-user-agent.cjs");
-const { attachMessageSnapshotTracker } = require("./services/whatsapp-snapshot.cjs");
+const { attachMessageSnapshotTracker, safeErrorMessage } = require("./services/whatsapp-snapshot.cjs");
 
 function loadGeminiKeys() {
   const values = [];
@@ -155,13 +155,13 @@ async function initializeWhatsApp() {
       scheduleReconnect();
     });
     client.on("error", (error) => {
-      console.error("[WhatsApp] Client error:", error.message);
+      console.error(`[WhatsApp] Client error: ${safeErrorMessage(error)}`);
     });
 
     await client.initialize();
   } catch (error) {
     clientStatus = "DISCONNECTED";
-    console.error("[WhatsApp] Initialization failed:", error.message);
+    console.error(`[WhatsApp] Initialization failed: ${safeErrorMessage(error)}`);
     scheduleReconnect();
   } finally {
     initializing = false;
@@ -180,7 +180,7 @@ async function shutdown(signal) {
   try {
     await client?.destroy();
   } catch (error) {
-    console.warn("[WhatsApp] Shutdown warning:", error.message);
+    console.warn(`[WhatsApp] Shutdown warning: ${safeErrorMessage(error)}`);
   }
   sessionLock?.release();
   process.exit(signal === "fatal error" ? 1 : 0);

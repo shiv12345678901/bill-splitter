@@ -2,7 +2,13 @@ const { loadUserConfig } = require("./config.cjs");
 const library = require("./library.cjs");
 const { buildSettlementCycles } = require("./cycle-state.cjs");
 const { isGenuineImageMessage, messageMimeType, messageType } = require("./whatsapp-media.cjs");
-const { discoveryStats, mergeMessages, refreshRecentMessageSnapshot } = require("./whatsapp-snapshot.cjs");
+const {
+  discoveryStats,
+  mergeMessages,
+  refreshRecentMessageSnapshot,
+  runWhatsAppOperation,
+  safeErrorMessage,
+} = require("./whatsapp-snapshot.cjs");
 
 function messageId(message) {
   if (typeof message?.id === "string") return message.id;
@@ -18,7 +24,10 @@ async function detectSettlementCycles(groupId, client) {
   const searchedIds = new Set();
   for (const query of ["clear", "settled", "calculation", "total =="]) {
     try {
-      const matches = await client.searchMessages(query, { chatId: groupId, limit: 100, page: 0 });
+      const matches = await runWhatsAppOperation(
+        "search_history",
+        () => client.searchMessages(query, { chatId: groupId, limit: 100, page: 0 }),
+      );
       for (const message of matches || []) {
         const id = messageId(message);
         if (!id || searchedIds.has(id)) continue;
@@ -35,11 +44,11 @@ async function detectSettlementCycles(groupId, client) {
         });
       }
     } catch (error) {
-      console.warn(`[Cycles] History search for "${query}" failed:`, error.message);
+      console.warn(`[Cycles] Optional history search failed: ${safeErrorMessage(error)}`);
     }
   }
 
-  const inPage = await client.pupPage.evaluate(async (gId) => {
+  const inPage = await runWhatsAppOperation("evaluate_history", () => client.pupPage.evaluate(async (gId) => {
     try {
       const collection = window.require("WAWebCollections")?.Chat;
       let chat = collection?.get(gId);
@@ -116,7 +125,7 @@ async function detectSettlementCycles(groupId, client) {
     } catch (error) {
       return { complete: false, error: error?.message || "WhatsApp history discovery failed.", messages: [] };
     }
-  }, groupId);
+  }, groupId), { timeoutMs: 60000 });
 
   if (!inPage?.complete) {
     throw new Error(
@@ -138,7 +147,7 @@ async function detectSettlementCycles(groupId, client) {
   });
   const stats = discoveryStats(messages);
   console.log(
-    `[WhatsApp:Discovery] group=${groupId} messages=${stats.messageCount} newest=${stats.newestTimestamp ? new Date(stats.newestTimestamp * 1000).toISOString() : "none"} images=${stats.imageCount} rejected=${stats.rejectedCandidateCount} history=complete freshness=verified`,
+    `[WhatsApp:Discovery] messages=${stats.messageCount} newest=${stats.newestTimestamp ? new Date(stats.newestTimestamp * 1000).toISOString() : "none"} images=${stats.imageCount} rejected=${stats.rejectedCandidateCount} cycle_history=complete recent_delivery=${recent.deliveryCompleteness}`,
   );
   const cycles = buildSettlementCycles({
     groupId,
@@ -147,7 +156,10 @@ async function detectSettlementCycles(groupId, client) {
     messages,
   });
   cycles.snapshot = {
-    verified: recent.verified === true,
+    retrievalVerified: recent.retrievalVerified === true,
+    freshness: recent.freshness,
+    deliveryCompleteness: recent.deliveryCompleteness,
+    historyTransfer: recent.historyTransfer,
     refreshedAt: recent.refreshedAt,
     source: recent.source,
     ...stats,

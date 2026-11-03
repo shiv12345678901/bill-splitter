@@ -6,6 +6,7 @@ const database = require("./database.cjs");
 const library = require("./library.cjs");
 const { calculateSettlement } = require("./settlement.cjs");
 const { planPeriodRollover, sydneyDate } = require("./cycle-state.cjs");
+const { safeErrorMessage } = require("./whatsapp-snapshot.cjs");
 
 const DEFAULT_POLL_MS = 5000;
 const DEFAULT_LEASE_SECONDS = 15 * 60;
@@ -885,11 +886,14 @@ function createSupabaseWorker({
         );
         return result;
       } catch (error) {
-        lastError = error.message;
-        logger.error(`[Supabase] Sync request ${job.id} failed:`, error.message);
+        const failureMessage = error instanceof Error && error.message
+          ? error.message
+          : safeErrorMessage(error, "The sync failed.");
+        lastError = failureMessage;
+        logger.error(`[Supabase] Sync request ${job.id} failed:`, failureMessage);
         try {
           if (transactionalWrites) await client.rpc("retry_sync_request", {
-            p_job_id: String(job.id), p_worker_id: workerId, p_error: error.message || "Sync failed",
+            p_job_id: String(job.id), p_worker_id: workerId, p_error: failureMessage,
           });
           else await updateJob(
             job,
@@ -898,7 +902,7 @@ function createSupabaseWorker({
               stage: "failed",
               stage_message: "Sync failed",
               result_summary: null,
-              error: error.message || "The sync failed.",
+              error: failureMessage,
             },
             { releaseLease: true },
           );

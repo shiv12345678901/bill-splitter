@@ -104,7 +104,7 @@ test("sync loads back to settlement date even when message count limit is reache
 test("sync surfaces stalled loading instead of declaring an incomplete scan successful", async () => {
   await assert.rejects(
     loadChatHistory(historyClient({ stalled: true }), "group", 2, 100),
-    /stopped loading/,
+    /history page evaluation failed \(history loading stalled\)/,
   );
 });
 
@@ -223,7 +223,8 @@ test("recent refresh discovers new photos absent from a stale earlier collection
   client.searchMessages = async () => [];
   client.pupPage = { evaluate: async () => ({ complete: true, messages: old }) };
   const snapshot = await refreshRecentMessageSnapshot("group@g.us", client);
-  assert.equal(snapshot.verified, true);
+  assert.equal(snapshot.retrievalVerified, true);
+  assert.equal(snapshot.deliveryCompleteness, "unverified");
   assert.deepEqual(snapshot.messages.slice(-2).map((message) => message.id), ["country-fresh-4926", "country-fresh-2143"]);
   assert.equal(snapshot.imageCount, 5);
   const cycles = await detectSettlementCycles("group@g.us", client);
@@ -233,7 +234,7 @@ test("recent refresh discovers new photos absent from a stale earlier collection
   );
 });
 
-test("live message events invalidate an earlier verified snapshot without duplicating IDs", async () => {
+test("live message events invalidate an earlier observed snapshot without duplicating IDs", async () => {
   const oldMessage = { id: "old", timestamp: 1793577600, type: "image", mimetype: "image/jpeg", from: "group@g.us" };
   const client = recentClient([oldMessage]);
   attachMessageSnapshotTracker(client);
@@ -251,16 +252,79 @@ test("disconnected and failed refreshes remain explicitly unverified", async () 
   disconnected.getState = async () => "DISCONNECTED";
   await assert.rejects(
     refreshRecentMessageSnapshot("group@g.us", disconnected),
-    /freshness is unverified/i,
+    /connection-state check failed \(client disconnected\)/i,
   );
   disconnected.getState = async () => "CONNECTED";
-  assert.equal((await refreshRecentMessageSnapshot("group@g.us", disconnected)).verified, true);
+  assert.equal((await refreshRecentMessageSnapshot("group@g.us", disconnected)).retrievalVerified, true);
   const failed = recentClient([]);
+  const warnings = [];
   failed.getChatById = async () => ({
     fetchMessages: async () => [],
-    syncHistory: async () => { throw new Error("peer sync failed"); },
+    syncHistory: async () => { throw "r"; },
   });
-  await assert.rejects(refreshRecentMessageSnapshot("group@g.us", failed), /refresh failed/i);
+  const snapshot = await refreshRecentMessageSnapshot("group@g.us", failed, {
+    logger: { log() {}, warn: (message) => warnings.push(message) },
+  });
+  assert.equal(snapshot.retrievalVerified, true);
+  assert.equal(snapshot.historyTransfer, "failed-optional");
+  assert.match(warnings[0], /optional peer-history request failed \(opaque library rejection\)/i);
+  assert.doesNotMatch(warnings[0], /\br\b/i);
+});
+
+test("syncHistory false and unsupported sync remain optional and never prove delivery completeness", async () => {
+  const returnedFalse = recentClient([]);
+  returnedFalse.getChatById = async () => ({ fetchMessages: async () => [], syncHistory: async () => false });
+  const falseSnapshot = await refreshRecentMessageSnapshot("false@g.us", returnedFalse);
+  assert.equal(falseSnapshot.historyTransfer, "not-requested");
+  assert.equal(falseSnapshot.deliveryCompleteness, "unverified");
+
+  const unsupported = recentClient([]);
+  unsupported.getChatById = async () => ({ fetchMessages: async () => [] });
+  const unsupportedSnapshot = await refreshRecentMessageSnapshot("unsupported@g.us", unsupported);
+  assert.equal(unsupportedSnapshot.historyTransfer, "unsupported");
+  assert.equal(unsupportedSnapshot.retrievalVerified, true);
+});
+
+test("required WhatsApp failures identify the operation and redact opaque rejections", async () => {
+  const fetchFailure = recentClient([]);
+  fetchFailure.getChatById = async () => ({ fetchMessages: async () => { throw "r"; } });
+  await assert.rejects(
+    refreshRecentMessageSnapshot("group@g.us", fetchFailure),
+    (error) => /recent-message fetch failed \(opaque library rejection\)/i.test(error.message) && !/\br\b/i.test(error.message),
+  );
+
+  const stateFailure = recentClient([]);
+  stateFailure.getState = async () => { throw new Error("Protocol error: secret browser details"); };
+  await assert.rejects(
+    refreshRecentMessageSnapshot("group@g.us", stateFailure),
+    /connection-state check failed \(browser protocol failure\)/i,
+  );
+
+  const chatFailure = recentClient([]);
+  chatFailure.getChatById = async () => { throw new Error("sb_secret_private-value"); };
+  await assert.rejects(
+    refreshRecentMessageSnapshot("group@g.us", chatFailure),
+    (error) => /chat lookup failed \(library operation failed\)/i.test(error.message) &&
+      !error.message.includes("sb_secret_private-value"),
+  );
+
+  const mergeFailure = recentClient([]);
+  mergeFailure.getChatById = async () => ({
+    fetchMessages: async () => ({ [Symbol.iterator]: () => { throw "r"; } }),
+  });
+  await assert.rejects(
+    refreshRecentMessageSnapshot("group@g.us", mergeFailure),
+    /message merge failed \(opaque library rejection\)/i,
+  );
+});
+
+test("Puppeteer page-evaluation failures are operation-labelled and redacted", async () => {
+  const client = recentClient([]);
+  client.pupPage = { evaluate: async () => { throw "r"; } };
+  await assert.rejects(
+    loadChatHistory(client, "group@g.us", 100, 1),
+    /history page evaluation failed \(opaque library rejection\)/i,
+  );
 });
 
 test("sync preparation fails closed when cycle discovery has no freshness proof", async () => {
@@ -280,7 +344,7 @@ test("sync preparation fails closed when cycle discovery has no freshness proof"
     sync: true,
   });
   assert.equal(prepared, null);
-  assert.match(errorMessage, /freshness is unverified/i);
+  assert.match(errorMessage, /recent-message retrieval is unverified/i);
 });
 
 test("snapshot diagnostics separate genuine photos from missing or non-image media", () => {

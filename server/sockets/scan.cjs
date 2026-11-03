@@ -9,6 +9,7 @@ const { loadReceiptCache } = require("../services/storage.cjs");
 const { loadUserConfig } = require("../services/config.cjs");
 const { selectCycleForPeriod } = require("../services/cycle-state.cjs");
 const { tagReceiptDuplicates } = require("../services/receipt-dedup.cjs");
+const { safeErrorMessage } = require("../services/whatsapp-snapshot.cjs");
 const {
   calculateSettlement,
   formatWhatsAppReport,
@@ -100,8 +101,8 @@ function createScanManager(
     if ((cycleId || sync) && detectSettlementCycles) {
       const cycles = await detectSettlementCycles(groupId);
       messageFreshness = cycles.snapshot || null;
-      if (sync && messageFreshness?.verified !== true) {
-        throw new Error("WhatsApp message freshness is unverified; refusing to finalize this scan.");
+      if (sync && messageFreshness?.retrievalVerified !== true) {
+        throw new Error("WhatsApp recent-message retrieval is unverified; refusing to finalize this scan.");
       }
       const target = cycleId
         ? cycles.find((cycle) => cycle.id === cycleId)
@@ -231,7 +232,10 @@ function createScanManager(
       if (autoStart) void run(jobId);
       return job;
     } catch (error) {
-      emit("scan:error", { runId: jobId, message: error.message });
+      emit("scan:error", {
+        runId: jobId,
+        message: error instanceof Error && error.message ? error.message : safeErrorMessage(error),
+      });
       return null;
     }
   }
