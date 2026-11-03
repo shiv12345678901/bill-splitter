@@ -183,3 +183,28 @@ test("legacy calculation-boundary cycles migrate to unconfirmed without rewritin
   assert.equal(migrated.status, "UNCONFIRMED");
   assert.deepEqual(migrated.owes, owes);
 });
+
+test("receipt images cannot trigger calculation or clearance", () => {
+  const cycles = detect([
+    message("oct-clearance", "2026-10-31T12:30:00Z", "Clear up to date"),
+    message(
+      "nov-receipt",
+      "2026-11-02T05:08:00Z",
+      "Arjun = 40\nArpan = 20\nTotal = 60",
+      { isMedia: true, classification: "grocery_receipt" }
+    ),
+    message(
+      "image-clearance-caption",
+      "2026-11-02T06:00:00Z",
+      "All cleared up to today",
+      { isMedia: true, classification: "grocery_receipt" }
+    ),
+  ]);
+
+  assert.equal(cycles.length, 2);
+  assert.equal(cycles[0].status, "ACTIVE");
+  assert.equal(cycles[0].calculationMessage, null);
+  assert.equal(cycles[0].endBoundary, null);
+  assert.equal(cycles[1].status, "SETTLED");
+  assert.equal(cycles[1].endBoundary.id, "oct-clearance");
+});

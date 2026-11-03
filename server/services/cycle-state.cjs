@@ -111,7 +111,11 @@ function buildCycle({ id, messages, startBoundary, endBoundary, aliases, nowTs }
   const startTs = Number.isFinite(startBoundary?.timestamp) ? startBoundary.timestamp + 1 : messages[0]?.timestamp || nowTs;
   const endTs = endBoundary?.timestamp ?? null;
   const within = messages.filter((message) => message.timestamp >= startTs && (endTs === null || message.timestamp <= endTs));
-  const calculation = within.filter((message) => !message.isNotification && isCalculationMessage(message.body)).at(-1) || null;
+  const calculation = within.filter((message) =>
+    !message.isNotification &&
+    !message.isMedia &&
+    isCalculationMessage(message.body)
+  ).at(-1) || null;
   const groceryMessages = [];
   const paymentMessages = [];
   const unclassifiedMessages = [];
@@ -149,7 +153,7 @@ function buildSettlementCycles({ groupId, aliases = {}, configuredGroupStart = n
   if (!sorted.length && !configuredGroupStart) return [];
   const markers = [];
   for (const message of sorted) {
-    if (message.isNotification || !isExplicitClearanceMessage(message.body)) continue;
+    if (message.isNotification || message.isMedia || !isExplicitClearanceMessage(message.body)) continue;
     const boundary = markerBoundary(message);
     const previous = markers.at(-1);
     if (previous) {
