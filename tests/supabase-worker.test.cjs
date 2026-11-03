@@ -266,6 +266,13 @@ test("the worker refuses to place receipts into a closed Supabase period", async
 
 test("a retry follows an already committed rollover only when boundary IDs match", async () => {
   let preparedContext = null;
+  let staleLocalBoundary = false;
+  const recoveredBoundary = {
+    id: "clearance-31-oct",
+    timestamp: timestamp("2026-10-31T12:30:00Z"),
+    source: "marker",
+    confidence: "HIGH",
+  };
   const worker = createSupabaseWorker({
     mode: "dry-run",
     transactionalWrites: false,
@@ -273,6 +280,10 @@ test("a retry follows an already committed rollover only when boundary IDs match
     groupId: "fixture-group",
     loadUserConfig: () => ({ aliases: {} }),
     scanManager: {
+      detectCycles: async () => [{
+        id: "cycle_current", status: "ACTIVE", startDate: "2026-10-31", endDate: null,
+        startBoundary: recoveredBoundary, endBoundary: null,
+      }],
       prepare: async (context) => {
         preparedContext = context;
         return { jobId: "recovered-rollover", expectedImages: 0, status: "queued" };
@@ -280,10 +291,21 @@ test("a retry follows an already committed rollover only when boundary IDs match
       runAndGet: async () => {},
     },
     localDatabase: {
-      getScanJob: () => ({ status: "complete", result: { expenses: [] }, reconciliation: { failed: 0, queued: 0 } }),
+      getScanJob: () => ({
+        status: "complete",
+        selectedCycleData: {
+          id: "cycle_current", status: "ACTIVE", startDate: "2026-10-31", endDate: null,
+          startBoundary: staleLocalBoundary ? { ...recoveredBoundary, id: "stale-boundary" } : recoveredBoundary,
+          endBoundary: null,
+        },
+        candidates: [],
+        result: { expenses: [] },
+        reconciliation: { failed: 0, queued: 0 },
+      }),
     },
     client: {
       select: async (table, query = {}) => {
+        if (table === "instabox_rollover_approvals") return [];
         if (table === "periods" && query.id) return [{
           id: "old", status: "CLOSED", start_date: "2026-10-10", end_date: "2026-10-31",
           whatsapp_clearance_message: { id: "clearance-31-oct" },
@@ -304,6 +326,13 @@ test("a retry follows an already committed rollover only when boundary IDs match
   }, { assert() {} });
   assert.equal(preparedContext.startDate, "2026-10-31");
   assert.notEqual(preparedContext.endDate, "2099-12-31");
+  assert.equal(preparedContext.cycleBoundaryId, "clearance-31-oct");
+
+  staleLocalBoundary = true;
+  await assert.rejects(
+    () => worker.processClaimedJob({ id: "stale-job", period_id: "old" }, { assert() {} }),
+    /ambiguous or changed WhatsApp start boundary/i,
+  );
 });
 
 test("transactional publishing records pending-cycle metadata before finalizing receipts", async () => {
@@ -444,7 +473,7 @@ test("a verified clearance rolls forward before November receipts are scanned", 
     scanManager: {
       detectCycles: async () => [
         { id: "cycle_current", status: "ACTIVE", settlementConfirmed: false, startDate: "2026-10-31", endDate: null, startBoundary },
-        { id: "cycle_hist_1", status: "SETTLED", settlementConfirmed: true, startDate: "2026-09-01", endDate: "2026-10-31", startBoundary: { id: "old-start" }, endBoundary: startBoundary, clearanceMessage: clearance },
+        { id: "cycle_hist_1", status: "SETTLED", settlementConfirmed: true, startDate: "2026-09-01", endDate: "2026-10-31", startBoundary: { id: "old-start", timestamp: timestamp("2026-08-31T14:00:00Z") - 1 }, endBoundary: startBoundary, clearanceMessage: clearance },
       ],
       prepare: async (context) => {
         preparedContext = context;
@@ -468,6 +497,11 @@ test("a verified clearance rolls forward before November receipts are scanned", 
     imageLoader: async () => ({ buffer: Buffer.from("image"), mimetype: "image/jpeg" }),
     client: {
       select: async (table, query = {}) => {
+        if (table === "instabox_rollover_approvals") return [{
+          old_period_id: "period_2026-10-10",
+          clearance_message_id: "clearance-31-oct",
+          new_period_id: "period_2026-10-31",
+        }];
         if (table === "periods" && query.id === "eq.period_2026-10-31")
           return [{ id: "period_2026-10-31", status: "CURRENT", start_date: "2026-10-31", end_date: null, whatsapp_start_boundary: startBoundary }];
         if (table === "periods")

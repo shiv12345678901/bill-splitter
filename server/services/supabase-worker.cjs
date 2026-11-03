@@ -521,6 +521,17 @@ function createSupabaseWorker({
     return Array.isArray(rows) ? rows[0] || null : null;
   }
 
+  async function rolloverApproval(periodId) {
+    const rows = await client.select("instabox_rollover_approvals", {
+      select: "old_period_id,clearance_message_id,new_period_id",
+      old_period_id: encodeFilter("eq", periodId),
+      limit: 2,
+    });
+    if (!Array.isArray(rows)) throw new Error("Invalid rollover approval response.");
+    if (rows.length > 1) throw new Error("Multiple rollover approvals conflict for the CURRENT period.");
+    return rows[0] || null;
+  }
+
   function requestContext(job, period) {
     const extra = job.request || job.payload || job.params || {};
     const config = loadUserConfig ? loadUserConfig() : {};
@@ -690,7 +701,8 @@ function createSupabaseWorker({
 
     if (typeof scanManager.detectCycles === "function") {
       const cycles = await scanManager.detectCycles(context.groupId);
-      const rollover = planPeriodRollover(cycles, period);
+      const approval = await rolloverApproval(period.id);
+      const rollover = planPeriodRollover(cycles, { ...period, rollover_approval: approval });
       if (rollover.action === "rollover") {
         if (!transactionalWrites || !contract.approved) {
           throw new Error("A verified cycle rollover requires the reviewed transactional production adapter.");

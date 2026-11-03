@@ -6,6 +6,7 @@ const {
   sydneyDate,
   sydneyStartTimestamp,
   selectCycleForPeriod,
+  cycleForPeriod,
   planPeriodRollover,
 } = require("../server/services/cycle-state.cjs");
 const { migrateCycle } = require("../server/services/cycle-integrity.cjs");
@@ -99,6 +100,10 @@ test("31 October Sydney clearance rolls the CURRENT period to the open cycle con
     status: "CURRENT",
     start_date: "2026-10-10",
     end_date: "2026-10-31",
+    rollover_approval: {
+      clearance_message_id: "oct-clearance",
+      new_period_id: "period_2026-10-31",
+    },
   });
   assert.equal(plan.action, "rollover");
   assert.equal(plan.closedCycle.endDate, "2026-10-31");
@@ -115,6 +120,10 @@ test("a clearance at Sydney midnight rolls the next cycle onto the following loc
   ]);
   const plan = planPeriodRollover(cycles, {
     status: "CURRENT", start_date: "2026-10-10", end_date: "2026-10-31",
+    rollover_approval: {
+      clearance_message_id: "midnight-clearance",
+      new_period_id: "period_2026-11-01",
+    },
   });
   assert.equal(plan.nextCycle.startDate, "2026-11-01");
   assert.equal(plan.newPeriodId, "period_2026-11-01");
@@ -128,13 +137,78 @@ test("rollover rejects date mismatches, missing next cycles and ambiguous cycle 
   ]);
   assert.throws(() => planPeriodRollover(cycles, {
     status: "CURRENT", start_date: "2026-10-10", end_date: "2026-11-02",
+    rollover_approval: { clearance_message_id: "clearance" },
   }), /end date/i);
   assert.throws(() => planPeriodRollover(cycles.filter((cycle) => cycle.status === "SETTLED"), {
     status: "CURRENT", start_date: "2026-10-10", end_date: "2026-10-31",
+    rollover_approval: { clearance_message_id: "clearance" },
   }), /next open/i);
   assert.throws(() => planPeriodRollover([...cycles, { ...cycles[0], id: "duplicate-open" }], {
     status: "CURRENT", start_date: "2026-10-10", end_date: "2026-10-31",
+    rollover_approval: { clearance_message_id: "clearance" },
   }), /exactly one|ambiguous/i);
+});
+
+test("10 October and 31 October shared dates map through immutable boundaries", () => {
+  const cycles = detect([
+    message("previous-receipt", "2026-10-09T01:00:00Z", "", { isMedia: true, classification: "grocery_receipt" }),
+    message("clearance-10-oct", "2026-10-10T01:00:00Z", "All settled"),
+    message("october-receipt", "2026-10-20T01:00:00Z", "", { isMedia: true, classification: "grocery_receipt" }),
+    message("clearance-31-oct", "2026-10-31T12:30:00Z", "Clear up to date"),
+    message("november-receipt", "2026-11-02T01:00:00Z", "", { isMedia: true, classification: "grocery_receipt" }),
+  ]);
+  const period = {
+    id: "period_2026-10-10",
+    status: "CURRENT",
+    start_date: "2026-10-10",
+    end_date: "2026-10-31",
+    rollover_approval: {
+      clearance_message_id: "clearance-31-oct",
+      new_period_id: "period_2026-10-31",
+    },
+  };
+
+  assert.equal(cycles.length, 3);
+  assert.equal(selectCycleForPeriod(cycles, "2026-10-10").startBoundary.id, "clearance-10-oct");
+  assert.equal(selectCycleForPeriod(cycles, "2026-10-31").startBoundary.id, "clearance-31-oct");
+  assert.equal(cycleForPeriod(cycles, period).startBoundary.id, "clearance-10-oct");
+  const plan = planPeriodRollover(cycles, period);
+  assert.equal(plan.closedCycle.startBoundary.id, "clearance-10-oct");
+  assert.equal(plan.closedCycle.endBoundary.id, "clearance-31-oct");
+  assert.equal(plan.nextCycle.startBoundary.id, "clearance-31-oct");
+  assert.equal(plan.newPeriodId, "period_2026-10-31");
+});
+
+test("period mapping rejects missing, conflicting and duplicate boundary evidence", () => {
+  const cycles = detect([
+    message("clearance-10-oct", "2026-10-10T01:00:00Z", "All settled"),
+    message("october-receipt", "2026-10-20T01:00:00Z", "", { isMedia: true, classification: "grocery_receipt" }),
+    message("clearance-31-oct", "2026-10-31T12:30:00Z", "Clear up to date"),
+    message("november-receipt", "2026-11-02T01:00:00Z", "", { isMedia: true, classification: "grocery_receipt" }),
+  ]);
+  const october = cycles.find((cycle) => cycle.endBoundary?.id === "clearance-31-oct");
+  const period = { status: "CURRENT", start_date: "2026-10-10", end_date: "2026-10-31" };
+
+  assert.equal(cycleForPeriod(cycles, {
+    ...period,
+    whatsapp_start_boundary: { ...october.startBoundary, id: "wrong-start" },
+    rollover_approval: { clearance_message_id: "clearance-31-oct" },
+  }), null);
+  assert.equal(cycleForPeriod(cycles, {
+    ...period,
+    rollover_approval: { clearance_message_id: "missing-clearance" },
+  }), null);
+  assert.equal(cycleForPeriod([...cycles, { ...october, id: "duplicate-october" }], {
+    ...period,
+    rollover_approval: { clearance_message_id: "clearance-31-oct" },
+  }), null);
+  assert.throws(() => planPeriodRollover(cycles, {
+    ...period,
+    rollover_approval: {
+      clearance_message_id: "clearance-31-oct",
+      new_period_id: "period_wrong",
+    },
+  }), /different next period/i);
 });
 
 test("delayed duplicate clearance messages without intervening cycle activity do not create extra cycles", () => {

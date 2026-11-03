@@ -175,22 +175,73 @@ function buildSettlementCycles({ groupId, aliases = {}, configuredGroupStart = n
   return cycles.reverse();
 }
 
-function selectCycleForPeriod(cycles, periodStartDate) {
-  const matches = (cycles || []).filter((cycle) =>
-    cycle.startDate <= periodStartDate && (cycle.endDate === null || cycle.endDate >= periodStartDate),
+function sameBoundary(expected, actual) {
+  if (!expected?.id || !actual?.id || expected.id !== actual.id) return false;
+  const actualTimestamp = Number(actual.timestamp);
+  if (!Number.isSafeInteger(actualTimestamp) || actualTimestamp <= 0) return false;
+  if (expected.timestamp === undefined || expected.timestamp === null || expected.timestamp === "") return true;
+  const expectedTimestamp = Number(expected.timestamp);
+  return Number.isSafeInteger(expectedTimestamp) && expectedTimestamp === actualTimestamp;
+}
+
+function hasImmutableBoundaries(cycle) {
+  const startTimestamp = Number(cycle?.startBoundary?.timestamp);
+  if (!cycle?.startBoundary?.id || !Number.isSafeInteger(startTimestamp) || startTimestamp <= 0) return false;
+  if (!cycle.endBoundary) return cycle.endDate === null;
+  const endTimestamp = Number(cycle.endBoundary.timestamp);
+  return Boolean(cycle.endBoundary.id) && Number.isSafeInteger(endTimestamp) && endTimestamp > startTimestamp;
+}
+
+function cycleForPeriod(cycles, period) {
+  if (!period || !/^\d{4}-\d{2}-\d{2}$/.test(period.start_date || "")) return null;
+  const available = cycles || [];
+  const startBoundary = period.whatsapp_start_boundary;
+  const clearanceBoundary = period.whatsapp_clearance_message;
+  const approval = period.rollover_approval;
+  const approvedClearanceId = String(approval?.clearance_message_id || "");
+
+  if (startBoundary?.id || clearanceBoundary?.id || approvedClearanceId) {
+    const evidenceMatches = available.filter((cycle) =>
+      hasImmutableBoundaries(cycle) &&
+      (!startBoundary?.id || sameBoundary(startBoundary, cycle.startBoundary)) &&
+      (!clearanceBoundary?.id || sameBoundary(clearanceBoundary, cycle.endBoundary)) &&
+      (!approvedClearanceId || cycle.endBoundary?.id === approvedClearanceId),
+    );
+    if (evidenceMatches.length !== 1) return null;
+    const matched = evidenceMatches[0];
+    if (matched.startDate > period.start_date ||
+        (matched.endDate !== null && matched.endDate < period.start_date)) return null;
+    return matched;
+  }
+
+  // Legacy periods may predate stored boundary JSON. An exact cycle start is
+  // deterministic even when the preceding cycle ends on that same Sydney day.
+  const exactStarts = available.filter((cycle) =>
+    cycle.startDate === period.start_date && hasImmutableBoundaries(cycle),
   );
-  return matches.length === 1 ? matches[0] : null;
+  return exactStarts.length === 1 ? exactStarts[0] : null;
+}
+
+function selectCycleForPeriod(cycles, periodOrStartDate) {
+  if (periodOrStartDate && typeof periodOrStartDate === "object") {
+    return cycleForPeriod(cycles, periodOrStartDate);
+  }
+  const periodStartDate = periodOrStartDate;
+  const exactStarts = (cycles || []).filter((cycle) => cycle.startDate === periodStartDate);
+  if (exactStarts.length === 1) return exactStarts[0];
+  if (exactStarts.length > 1) return null;
+  const strictInterior = (cycles || []).filter((cycle) =>
+    cycle.startDate < periodStartDate && (cycle.endDate === null || cycle.endDate > periodStartDate),
+  );
+  return strictInterior.length === 1 ? strictInterior[0] : null;
 }
 
 function planPeriodRollover(cycles, period) {
   if (!period || period.status !== "CURRENT" || !/^\d{4}-\d{2}-\d{2}$/.test(period.start_date || "")) {
     throw new Error("A valid CURRENT Supabase period is required for cycle mapping.");
   }
-  const matches = (cycles || []).filter((cycle) =>
-    cycle.startDate <= period.start_date && (cycle.endDate === null || cycle.endDate >= period.start_date),
-  );
-  if (matches.length !== 1) throw new Error("The CURRENT period does not map to exactly one WhatsApp cycle.");
-  const mappedCycle = matches[0];
+  const mappedCycle = cycleForPeriod(cycles, period);
+  if (!mappedCycle) throw new Error("The CURRENT period does not map to exactly one verified WhatsApp cycle.");
   if (["ACTIVE", "PENDING_SETTLEMENT"].includes(mappedCycle.status)) {
     return { action: "continue", cycle: mappedCycle };
   }
@@ -211,13 +262,17 @@ function planPeriodRollover(cycles, period) {
     nextCycle.startDate !== expectedNextStartDate) {
     throw new Error("The next WhatsApp cycle does not begin at the verified clearance boundary.");
   }
+  const newPeriodId = `period_${nextCycle.startDate}`;
+  if (period.rollover_approval?.new_period_id && period.rollover_approval.new_period_id !== newPeriodId) {
+    throw new Error("The reviewed rollover approval targets a different next period.");
+  }
   return {
     action: "rollover",
     closedCycle: mappedCycle,
     nextCycle,
-    newPeriodId: `period_${nextCycle.startDate}`,
+    newPeriodId,
     newSettlementId: `settlement_${nextCycle.startDate}_current`,
   };
 }
 
-module.exports = { SYDNEY_TIME_ZONE, buildSettlementCycles, isCalculationMessage, isExplicitClearanceMessage, parseGroundTruth, planPeriodRollover, selectCycleForPeriod, sydneyDate, sydneyStartTimestamp };
+module.exports = { SYDNEY_TIME_ZONE, buildSettlementCycles, cycleForPeriod, isCalculationMessage, isExplicitClearanceMessage, parseGroundTruth, planPeriodRollover, selectCycleForPeriod, sydneyDate, sydneyStartTimestamp };
