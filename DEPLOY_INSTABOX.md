@@ -200,7 +200,7 @@ The SQL migrations are additive and should normally remain installed with writes
 - `SUPABASE_URL`: project URL, server only.
 - `SUPABASE_SECRET_KEY`: preferred modern `sb_secret_...` server key. It is sent only in the `apikey` header and must remain server-only.
 - `SUPABASE_SERVICE_ROLE_KEY`: legacy JWT fallback. When used, the worker preserves the legacy `apikey` plus `Authorization: Bearer` headers. If both variables are set, `SUPABASE_SECRET_KEY` wins.
-- `GEMINI_API_KEY` or numbered Gemini keys.
+- `GEMINI_API_KEY` or numbered Gemini keys. OCR uses the fixed stable `gemini-3.5-flash-lite` model. `SPLITMATE_GEMINI_REQUEST_TIMEOUT_MS` defaults to 30000 and cannot exceed 45000.
 - `SPLITMATE_WHATSAPP_GROUP_ID`: explicit target group ID; live mode will not use the code default.
 - `SPLITMATE_WHATSAPP_GROUP_NAME`: display label.
 - `SPLITMATE_WHATSAPP_USER_AGENT`: top-level WhatsApp Web Client identity; the example matches InstaBox Chromium 156 and should be updated when the installed Chromium major changes.

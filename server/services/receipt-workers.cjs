@@ -7,18 +7,25 @@ const {
 } = require("./storage.cjs");
 const library = require("./library.cjs");
 const { jpegPerceptualHash } = require("./receipt-dedup.cjs");
+const pendingOcrByContentHash = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const classifyScanError = (error) => {
   const message = String(error?.message || error || "").toLowerCase();
+  const status = Number(error?.status || error?.statusCode || error?.response?.status) || 0;
+  const code = String(error?.code || error?.cause?.code || "").toUpperCase();
   if (error?.code === "SCAN_CANCELLED") return "cancelled";
-  if (error?.code === "OCR_TIMEOUT" || /timed? out|timeout/.test(message))
+  if (["OCR_TIMEOUT", "GEMINI_REQUEST_TIMEOUT"].includes(error?.code) || /timed? out|timeout/.test(message))
     return "timeout";
-  if (/\b429\b|quota|resource exhausted|rate.?limit/.test(message))
+  if (status === 429 || /\b429\b|quota|resource exhausted|rate.?limit/.test(message))
     return "quota";
+  if ([408, 425, 500, 502, 503, 504].includes(status) ||
+    ["ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "ENETUNREACH", "ETIMEDOUT"].includes(code) ||
+    /temporar|service unavailable|bad gateway|gateway timeout|fetch failed|network error|socket hang up/.test(message))
+    return "temporary";
   if (/download|media|image data/.test(message)) return "download";
   return "api";
 };
-const isRetryable = (code) => ["timeout", "quota", "download", "api"].includes(code);
+const isRetryable = (code) => ["timeout", "quota", "temporary", "download"].includes(code);
 const withOcrTimeout = (promise, { controller, isAborted }) => {
   const configured = Number(process.env.SPLITMATE_OCR_TIMEOUT_MS);
   const timeoutMs = Number.isFinite(configured) && configured > 0
@@ -51,6 +58,19 @@ const withOcrTimeout = (promise, { controller, isAborted }) => {
     clearInterval(cancellationPoll);
   });
 };
+
+function sharedContentOcr(contentHash, producer) {
+  const existing = pendingOcrByContentHash.get(contentHash);
+  if (existing) return { shared: true, promise: existing };
+  const promise = Promise.resolve()
+    .then(producer)
+    .finally(() => {
+      if (pendingOcrByContentHash.get(contentHash) === promise)
+        pendingOcrByContentHash.delete(contentHash);
+    });
+  pendingOcrByContentHash.set(contentHash, promise);
+  return { shared: false, promise };
+}
 module.exports = async function processReceipts({
   client,
   groupId,
@@ -290,26 +310,30 @@ module.exports = async function processReceipts({
             console.log(
               `[OCR:Worker ${workerId + 1} (Key ${(workerId % activeKeys.length) + 1})] Analyzing photo from ${senderName} (${currentIndex + 1}/${candidateMessages.length})...`,
             );
-            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-              attempts = attempt;
-              apiCalls++;
-              try {
-                const key = activeKeys[(workerId + attempt - 1) % activeKeys.length];
-                const controller = new AbortController();
-                ocrResult = await withOcrTimeout(
-                  parseReceiptWithGemini(media.data, mime, key, {
-                    signal: controller.signal,
-                  }),
-                  { controller, isAborted },
-                );
-                break;
-              } catch (error) {
-                const code = classifyScanError(error);
-                error.scanErrorCode = code;
-                if (attempt >= maxAttempts || !isRetryable(code)) throw error;
-                await waitForRetry(attempt);
+            const shared = sharedContentOcr(contentHash, async () => {
+              for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                attempts = attempt;
+                apiCalls++;
+                try {
+                  const key = activeKeys[(workerId + attempt - 1) % activeKeys.length];
+                  const controller = new AbortController();
+                  return await withOcrTimeout(
+                    parseReceiptWithGemini(media.data, mime, key, {
+                      signal: controller.signal,
+                    }),
+                    { controller, isAborted },
+                  );
+                } catch (error) {
+                  const code = classifyScanError(error);
+                  error.scanErrorCode = code;
+                  if (attempt >= maxAttempts || !isRetryable(code)) throw error;
+                  await waitForRetry(attempt);
+                }
               }
-            }
+              throw new Error("Receipt recognition exhausted its retry budget.");
+            });
+            if (shared.shared) source = "content-cache";
+            ocrResult = await shared.promise;
             await library.recordImage({
               id: cacheKey,
               groupId,
@@ -490,3 +514,4 @@ module.exports = async function processReceipts({
 };
 
 module.exports.classifyScanError = classifyScanError;
+module.exports.isRetryable = isRetryable;

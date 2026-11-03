@@ -17,7 +17,6 @@
   },
   "dependencies": {
     "@google/genai": "^2.21.0",
-    "@google/generative-ai": "^0.24.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",

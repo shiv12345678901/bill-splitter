@@ -39,7 +39,7 @@ Every image collected from WhatsApp is saved locally with its scanned data:
 - `data/backups/` — daily verified SQLite backups; the five newest backups are retained.
 - `data/json-backup-pre-sqlite/` — verified copies of legacy JSON stores created during the one-time migration.
 
-SQLite uses foreign keys, unique message/cycle constraints, full synchronous commits and write-ahead logging. Startup runs integrity and foreign-key checks. Scans reuse the library automatically: already-saved images are never downloaded again, already-read images are never sent to Gemini again, and totals stay visible in the **Receipt library** tab without a WhatsApp connection. Recognition runs up to four receipts in parallel (one per Gemini API key), with each result committed independently.
+SQLite uses foreign keys, unique message/cycle constraints, full synchronous commits and write-ahead logging. Startup runs integrity and foreign-key checks. Scans reuse the library automatically: already-saved images are never downloaded again, already-read images are never sent to Gemini again, and simultaneous copies of identical image bytes share one in-flight request. Totals stay visible in the **Receipt library** tab without a WhatsApp connection. Recognition uses the stable low-latency `gemini-3.5-flash-lite` model and runs up to four distinct receipts in parallel (one per Gemini API key), with each result committed independently.
 
 ## Data and recovery
 
@@ -108,7 +108,7 @@ SUPABASE_WORKER_SCHEMA_APPROVED=I_HAVE_CONFIRMED_SUPABASE_SCHEMA
 SUPABASE_WORKER_WRITE_CONFIRM=I_UNDERSTAND_SUPABASE_WORKER_WRITES
 ```
 
-The worker also requires `SUPABASE_URL`, preferably a modern `SUPABASE_SECRET_KEY` (`sb_secret_...`) or the legacy `SUPABASE_SERVICE_ROLE_KEY` fallback, at least one `GEMINI_API_KEY` value, and a WhatsApp group ID (or the existing `user_config.json` default). When both Supabase credentials exist, the modern secret key wins. `SPLITMATE_SUPABASE_POLL_MS` defaults to 5000 and `SPLITMATE_SYNC_LEASE_SECONDS` defaults to 900. Never put either server key, the WhatsApp session directory, local SQLite database, image cache, or `user_config.json` in Git.
+The worker also requires `SUPABASE_URL`, preferably a modern `SUPABASE_SECRET_KEY` (`sb_secret_...`) or the legacy `SUPABASE_SERVICE_ROLE_KEY` fallback, at least one `GEMINI_API_KEY` value, and a WhatsApp group ID (or the existing `user_config.json` default). When both Supabase credentials exist, the modern secret key wins. Gemini requests default to a 30-second deadline and are capped at 45 seconds by `SPLITMATE_GEMINI_REQUEST_TIMEOUT_MS`. Only rate limits, timeouts, temporary network failures and HTTP 5xx responses are retried; permanent authentication, validation and model errors fail immediately. Logs include model, duration and status but never API keys or receipt contents. `SPLITMATE_SUPABASE_POLL_MS` defaults to 5000 and `SPLITMATE_SYNC_LEASE_SECONDS` defaults to 900. Never put either server key, the WhatsApp session directory, local SQLite database, image cache, or `user_config.json` in Git.
 
 Before enabling live mode, confirm the actual database types and policies rather than relying on names alone:
 

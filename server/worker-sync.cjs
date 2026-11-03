@@ -50,7 +50,7 @@ const userConfig = () => ({ ...loadUserConfig(), ...(contract.approved ? { alias
 const detectSettlementCycles = (groupId) =>
   require("./services/cycles.cjs").detectSettlementCycles(groupId, client);
 const parseWithGemini = (data, mime, key, options) =>
-  parseReceiptWithGemini(data, mime, key, geminiApiKeys, options);
+  parseReceiptWithGemini(data, mime, key, [], options);
 
 for (const event of ["scan:progress", "scan:job", "scan:error", "scan:complete"]) {
   events.on(event, (payload = {}) => {

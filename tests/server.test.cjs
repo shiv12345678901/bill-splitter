@@ -9,7 +9,13 @@ process.env.SPLITMATE_DATA_DIR = fs.mkdtempSync(
 const storage = require("../server/services/storage.cjs");
 const registerHistory = require("../server/sockets/history.cjs");
 const registerScan = require("../server/sockets/scan.cjs");
-const { cleanAndParseJson } = require("../server/services/ocr.cjs");
+const {
+  GEMINI_OCR_MODEL,
+  MAX_GEMINI_REQUEST_TIMEOUT_MS,
+  cleanAndParseJson,
+  parseReceiptWithGemini,
+  requestTimeoutMs,
+} = require("../server/services/ocr.cjs");
 const processReceipts = require("../server/services/receipt-workers.cjs");
 const { loadChatHistory } = require("../server/services/message-discovery.cjs");
 const library = require("../server/services/library.cjs");
@@ -596,6 +602,131 @@ test("OCR parsing excludes bank transfers and marks unreadable totals", () => {
     cleanAndParseJson('```json\n{"amount":0}\n```').confidence,
     "LOW",
   );
+});
+test("OCR uses one stable lightning-fast Flash-Lite model and logs duration", async () => {
+  const requests = [];
+  const logs = [];
+  const result = await parseReceiptWithGemini(
+    Buffer.from("fixture").toString("base64"),
+    "image/jpeg",
+    "fixture-key",
+    [],
+    {
+      timeoutMs: 100,
+      logger: { log: (line) => logs.push(line), warn: (line) => logs.push(line) },
+      clientFactory: () => ({
+        models: {
+          generateContent: async (request) => {
+            requests.push(request);
+            return { text: JSON.stringify({ merchant: "Fast Market", amount: 12.5, category: "Groceries", isBankTransfer: false, confidence: "HIGH", isBlurry: false, transactionDate: "2026-11-02", receiptNumber: "FAST-1" }) };
+          },
+        },
+      }),
+    },
+  );
+  assert.equal(GEMINI_OCR_MODEL, "gemini-3.5-flash-lite");
+  const ocrSource = fs.readFileSync("server/services/ocr.cjs", "utf8");
+  assert.doesNotMatch(ocrSource, /candidateModels|gemini-flash-latest|gemini-2\.5|gemini-3\.8/);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].model, GEMINI_OCR_MODEL);
+  assert.equal(requests[0].config.maxOutputTokens, 512);
+  assert.equal(requests[0].config.thinkingConfig.thinkingLevel, "MINIMAL");
+  assert.equal(result.merchant, "Fast Market");
+  assert.match(logs[0], /model=gemini-3\.5-flash-lite duration_ms=\d+ status=success/);
+  assert.doesNotMatch(logs.join("\n"), /fixture-key|fixture/i);
+  assert.equal(requestTimeoutMs(Number.MAX_SAFE_INTEGER), MAX_GEMINI_REQUEST_TIMEOUT_MS);
+});
+
+test("each Gemini request has a hard deadline", async () => {
+  await assert.rejects(
+    () => parseReceiptWithGemini("fixture", "image/jpeg", "fixture-key", [], {
+      timeoutMs: 5,
+      logger: { log() {}, warn() {} },
+      clientFactory: () => ({
+        models: {
+          generateContent: ({ config }) => new Promise((resolve, reject) => {
+            config.abortSignal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+          }),
+        },
+      }),
+    }),
+    (error) => error.code === "GEMINI_REQUEST_TIMEOUT",
+  );
+});
+
+test("permanent Gemini errors are not retried", async () => {
+  let calls = 0;
+  const outcomes = [];
+  await processReceipts({
+    client: { getContactById: async () => ({ name: "Alex" }) },
+    groupId: "permanent-error",
+    candidateMessages: [{ id: `permanent-${Date.now()}`, timestamp: 1700000000, author: "alex" }],
+    activeKeys: ["fixture-a", "fixture-b"],
+    concurrency: 1,
+    effectiveAliases: {},
+    filterMember: "all",
+    socket: socket(),
+    isAborted: () => false,
+    retryBaseMs: 0,
+    downloadMediaBuffer: async () => ({ data: Buffer.from("image").toString("base64"), mimetype: "image/jpeg" }),
+    parseReceiptWithGemini: async () => {
+      calls++;
+      throw Object.assign(new Error("invalid request"), { status: 400 });
+    },
+    onOutcome: async (outcome) => outcomes.push(outcome),
+  });
+  assert.equal(calls, 1);
+  assert.equal(outcomes[0].status, "failed");
+  assert.equal(processReceipts.isRetryable(processReceipts.classifyScanError({ status: 400 })), false);
+  assert.equal(processReceipts.isRetryable(processReceipts.classifyScanError({ status: 503 })), true);
+});
+
+test("successful OCR is reused by content hash for the same image", async () => {
+  const image = Buffer.from(`same-image-${Date.now()}`).toString("base64");
+  let apiCalls = 0;
+  const run = (id) => processReceipts({
+    client: { getContactById: async () => ({ name: "Alex" }) },
+    groupId: "content-cache",
+    candidateMessages: [{ id, timestamp: 1700000000, author: "alex" }],
+    activeKeys: ["fixture"],
+    concurrency: 1,
+    effectiveAliases: {},
+    filterMember: "all",
+    socket: socket(),
+    isAborted: () => false,
+    retryBaseMs: 0,
+    downloadMediaBuffer: async () => ({ data: image, mimetype: "image/jpeg" }),
+    parseReceiptWithGemini: async () => {
+      apiCalls++;
+      return { merchant: "Cached Market", amount: 8, category: "Groceries", confidence: "HIGH" };
+    },
+  });
+  await run(`cache-first-${Date.now()}`);
+  await run(`cache-second-${Date.now()}`);
+  assert.equal(apiCalls, 1);
+});
+test("parallel workers coalesce OCR for identical image bytes", async () => {
+  const image = Buffer.from(`parallel-same-image-${Date.now()}`).toString("base64");
+  let apiCalls = 0;
+  await processReceipts({
+    client: { getContactById: async () => ({ name: "Alex" }) },
+    groupId: "parallel-content-cache",
+    candidateMessages: [1, 2].map((number) => ({ id: `parallel-cache-${Date.now()}-${number}`, timestamp: 1700000000 + number, author: "alex" })),
+    activeKeys: ["fixture-a", "fixture-b"],
+    concurrency: 2,
+    effectiveAliases: {},
+    filterMember: "all",
+    socket: socket(),
+    isAborted: () => false,
+    retryBaseMs: 0,
+    downloadMediaBuffer: async () => ({ data: image, mimetype: "image/jpeg" }),
+    parseReceiptWithGemini: async () => {
+      apiCalls++;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return { merchant: "Parallel Market", amount: 9, category: "Groceries", confidence: "HIGH" };
+    },
+  });
+  assert.equal(apiCalls, 1);
 });
 test("a failed image download remains visible for review instead of disappearing", async () => {
   const s = socket();

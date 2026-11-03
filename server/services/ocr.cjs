@@ -1,3 +1,13 @@
+const GEMINI_OCR_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_GEMINI_REQUEST_TIMEOUT_MS = 30000;
+const MAX_GEMINI_REQUEST_TIMEOUT_MS = 45000;
+
+function requestTimeoutMs(value = process.env.SPLITMATE_GEMINI_REQUEST_TIMEOUT_MS) {
+  const configured = Number(value);
+  if (!Number.isFinite(configured) || configured <= 0) return DEFAULT_GEMINI_REQUEST_TIMEOUT_MS;
+  return Math.min(Math.max(Math.floor(configured), 1), MAX_GEMINI_REQUEST_TIMEOUT_MS);
+}
+
 function cleanAndParseJson(text) {
   let cleaned = (text || "").trim();
   // Strip markdown code fences if present
@@ -63,16 +73,10 @@ async function parseReceiptWithGemini(
   base64Data,
   mimeType,
   apiKey,
-  geminiApiKeys = [],
-  { signal } = {},
+  _geminiApiKeys = [],
+  { signal, timeoutMs, clientFactory, logger = console } = {},
 ) {
-  const keysToTry = [];
-  if (apiKey) keysToTry.push(apiKey);
-  geminiApiKeys.forEach((k) => {
-    if (k && !keysToTry.includes(k)) keysToTry.push(k);
-  });
-
-  if (keysToTry.length === 0) {
+  if (!apiKey) {
     throw new Error(
       "GEMINI_API_KEY is not configured. Please add your key in .env or the Settings drawer.",
     );
@@ -140,84 +144,75 @@ Output properties:
     ],
   };
 
-  const candidateModels = [
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-flash-latest",
-    "gemini-2.5-flash",
-  ];
-  let lastError = null;
-
-  for (const key of keysToTry) {
-    for (const modelName of candidateModels) {
-      if (signal?.aborted) throw new Error("Receipt recognition cancelled.");
-      // 1. Try official @google/genai SDK with Structured Schema
-      try {
-        const { GoogleGenAI } = require("@google/genai");
-        const ai = new GoogleGenAI({ apiKey: key });
-        const response = await ai.models.generateContent({
-          model: modelName,
-          contents: [
-            {
-              role: "user",
-              parts: [
-                { text: prompt },
-                {
-                  inlineData: {
-                    mimeType,
-                    data: base64Data,
-                  },
-                },
-              ],
-            },
-          ],
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: structuredSchema,
-            abortSignal: signal,
-          },
-        });
-        const text = response.text || "";
-        return cleanAndParseJson(text);
-      } catch (sdkError) {
-        if (signal?.aborted) throw sdkError;
-        lastError = sdkError;
-      }
-
-      // 2. Fallback to @google/generative-ai SDK
-      try {
-        const { GoogleGenerativeAI } = require("@google/generative-ai");
-        const genAI = new GoogleGenerativeAI(key);
-        const model = genAI.getGenerativeModel({
-          model: modelName,
-          generationConfig: { responseMimeType: "application/json" },
-        });
-        const result = await model.generateContent(
-          [
-            prompt,
-            {
-              inlineData: {
-                data: base64Data,
-                mimeType,
-              },
-            },
-          ],
-          { signal },
-        );
-        const text = result.response.text();
-        return cleanAndParseJson(text);
-      } catch (fallbackError) {
-        if (signal?.aborted) throw fallbackError;
-        lastError = fallbackError;
-      }
-    }
+  if (signal?.aborted) {
+    const error = new Error("Receipt recognition cancelled.");
+    error.code = "SCAN_CANCELLED";
+    throw error;
   }
 
-  throw new Error(
-    `Gemini Vision extraction failed across ${keysToTry.length} key(s): ${lastError?.message || "Unsupported model or API key error"}`,
-  );
+  const maximumMs = requestTimeoutMs(timeoutMs);
+  const timeoutController = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    timeoutController.abort();
+  }, maximumMs);
+  const requestSignal = signal
+    ? AbortSignal.any([signal, timeoutController.signal])
+    : timeoutController.signal;
+  const startedAt = Date.now();
+  try {
+    const { GoogleGenAI } = require("@google/genai");
+    const ai = clientFactory ? clientFactory(apiKey) : new GoogleGenAI({ apiKey });
+    const response = await ai.models.generateContent({
+      model: GEMINI_OCR_MODEL,
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: prompt },
+            { inlineData: { mimeType, data: base64Data } },
+          ],
+        },
+      ],
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: structuredSchema,
+        maxOutputTokens: 512,
+        thinkingConfig: { thinkingLevel: "MINIMAL" },
+        abortSignal: requestSignal,
+      },
+    });
+    const parsed = cleanAndParseJson(response.text || "");
+    logger.log?.(`[Gemini OCR] model=${GEMINI_OCR_MODEL} duration_ms=${Date.now() - startedAt} status=success`);
+    return parsed;
+  } catch (cause) {
+    const duration = Date.now() - startedAt;
+    const status = Number(cause?.status || cause?.statusCode || cause?.response?.status) || null;
+    logger.warn?.(`[Gemini OCR] model=${GEMINI_OCR_MODEL} duration_ms=${duration} status=error code=${status || cause?.code || cause?.name || "unknown"}`);
+    if (timedOut) {
+      const error = new Error(`Gemini OCR request timed out after ${maximumMs}ms.`);
+      error.code = "GEMINI_REQUEST_TIMEOUT";
+      error.cause = cause;
+      throw error;
+    }
+    if (signal?.aborted) {
+      const error = new Error("Receipt recognition cancelled.");
+      error.code = "SCAN_CANCELLED";
+      error.cause = cause;
+      throw error;
+    }
+    throw cause;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-module.exports = { cleanAndParseJson, parseReceiptWithGemini };
+module.exports = {
+  DEFAULT_GEMINI_REQUEST_TIMEOUT_MS,
+  GEMINI_OCR_MODEL,
+  MAX_GEMINI_REQUEST_TIMEOUT_MS,
+  cleanAndParseJson,
+  parseReceiptWithGemini,
+  requestTimeoutMs,
+};
