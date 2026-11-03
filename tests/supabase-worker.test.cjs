@@ -247,6 +247,30 @@ test("settlement totals use cents, stable members, and exclude transfer proofs",
   assert.equal(settlement.receiptCount, 2);
 });
 
+test("equal shares match historical Muse cent rounding", () => {
+  const members = ["Alex", "Jamie", "Morgan", "Taylor"];
+  const historicalSettlements = [
+    { period: "2026-10-10", totalCents: 166720, perPersonCents: 41680 },
+    { period: "2026-09-19", totalCents: 121214, perPersonCents: 30304 },
+    { period: "2026-08-25", totalCents: 134311, perPersonCents: 33578 },
+  ];
+
+  for (const historical of historicalSettlements) {
+    const settlement = settlementForReceipts([{
+      id: `receipt-${historical.period}`,
+      amount_cents: historical.totalCents,
+      payer: "Alex",
+      merchant: "Historical fixture",
+      date: historical.period,
+      is_excluded: false,
+    }], members);
+
+    assert.equal(settlement.totalCents, historical.totalCents, historical.period);
+    assert.equal(settlement.perPersonCents, historical.perPersonCents, historical.period);
+    assert.equal(Number.isSafeInteger(settlement.perPersonCents), true, historical.period);
+  }
+});
+
 test("a verified clearance rolls forward before November receipts are scanned", async () => {
   const rpcCalls = [];
   let preparedContext = null;

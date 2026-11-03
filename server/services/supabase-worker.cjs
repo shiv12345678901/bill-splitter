@@ -202,7 +202,7 @@ function settlementForReceipts(receipts, members = []) {
   }
   const totalCents = Object.values(memberTotals).reduce((sum, cents) => sum + cents, 0);
   if (!Number.isSafeInteger(totalCents)) throw new Error("Settlement exceeds safe integer cents.");
-  const perPersonCents = names.length ? Math.floor(totalCents / names.length) : 0;
+  const perPersonCents = names.length ? Math.round(totalCents / names.length) : 0;
   return {
     totalCents,
     perPersonCents,
