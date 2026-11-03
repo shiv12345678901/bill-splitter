@@ -1,6 +1,8 @@
 const { isGenuineImageMessage } = require("./whatsapp-media.cjs");
+const { mergeMessages, refreshRecentMessageSnapshot } = require("./whatsapp-snapshot.cjs");
 
 async function loadChatHistory(client, groupId, fetchLimit, startUnix = null) {
+  const recentSnapshot = await refreshRecentMessageSnapshot(groupId, client);
   const result = await client.pupPage.evaluate(
     async (gId, limit, cutoff) => {
       const chatColl = window.require("WAWebCollections")?.Chat;
@@ -78,7 +80,7 @@ async function loadChatHistory(client, groupId, fetchLimit, startUnix = null) {
   );
   if (startUnix !== null && result?.complete !== true)
     throw new Error("WhatsApp history completeness could not be verified. Retry the sync.");
-  return result;
+  return { ...result, recentSnapshot };
 }
 
 async function readReceiptCandidates(
@@ -87,6 +89,7 @@ async function readReceiptCandidates(
   startUnix,
   endUnix,
   useCheckpoint,
+  recentMessages = [],
 ) {
   const result = await client.pupPage.evaluate(
     (gId, sUnix, eUnix, useChk) => {
@@ -212,8 +215,12 @@ async function readReceiptCandidates(
     endUnix,
     useCheckpoint,
   );
-  if (Array.isArray(result?.messages))
-    result.messages = result.messages.filter(isGenuineImageMessage);
+  if (Array.isArray(result?.messages)) {
+    result.messages = mergeMessages(result.messages, recentMessages).filter((message) =>
+      isGenuineImageMessage(message) &&
+      message.timestamp >= result.effectiveStartUnix &&
+      message.timestamp <= endUnix);
+  }
   return result;
 }
 module.exports = { loadChatHistory, readReceiptCandidates };

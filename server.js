@@ -19,6 +19,7 @@ const {
 } = require("./server/services/settlement.cjs");
 const { downloadMediaBuffer } = require("./server/services/media.cjs");
 const { WhatsAppSessionLock } = require("./server/services/whatsapp-session-lock.cjs");
+const { attachMessageSnapshotTracker } = require("./server/services/whatsapp-snapshot.cjs");
 const detectSettlementCycles = (groupId) =>
   require("./server/services/cycles.cjs").detectSettlementCycles(
     groupId,
@@ -168,6 +169,7 @@ async function initializeWhatsAppClient() {
       ],
     },
   });
+  attachMessageSnapshotTracker(client);
 
   client.on("qr", async (qr) => {
     clientStatus = "QR_READY";

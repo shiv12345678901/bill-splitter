@@ -2,6 +2,7 @@ const { loadUserConfig } = require("./config.cjs");
 const library = require("./library.cjs");
 const { buildSettlementCycles } = require("./cycle-state.cjs");
 const { isGenuineImageMessage, messageMimeType, messageType } = require("./whatsapp-media.cjs");
+const { discoveryStats, mergeMessages, refreshRecentMessageSnapshot } = require("./whatsapp-snapshot.cjs");
 
 function messageId(message) {
   if (typeof message?.id === "string") return message.id;
@@ -9,15 +10,9 @@ function messageId(message) {
 }
 
 async function detectSettlementCycles(groupId, client) {
-  if (!client?.pupPage) return [];
+  if (!client?.pupPage) throw new Error("WhatsApp page is unavailable; message freshness is unverified.");
   const config = loadUserConfig();
-  let preloadError = null;
-  try {
-    const chat = await client.getChatById(groupId);
-    await chat.fetchMessages({ limit: Infinity });
-  } catch (error) {
-    preloadError = error;
-  }
+  const recent = await refreshRecentMessageSnapshot(groupId, client);
 
   const searched = [];
   const searchedIds = new Set();
@@ -125,11 +120,11 @@ async function detectSettlementCycles(groupId, client) {
 
   if (!inPage?.complete) {
     throw new Error(
-      `WhatsApp history is incomplete; refusing to finalize this scan. ${inPage?.error || preloadError?.message || "Reconnect and retry."}`,
+      `WhatsApp history is incomplete; refusing to finalize this scan. ${inPage?.error || "Reconnect and retry."}`,
     );
   }
 
-  const messages = [...(inPage.messages || []), ...searched].map((message) => {
+  const messages = mergeMessages(inPage.messages, searched, recent.messages).map((message) => {
     const isMedia = isGenuineImageMessage(message);
     if (!isMedia) return { ...message, isMedia: false };
     const known = library.findById(message.id);
@@ -141,12 +136,23 @@ async function detectSettlementCycles(groupId, client) {
         : "unclassified",
     };
   });
-  return buildSettlementCycles({
+  const stats = discoveryStats(messages);
+  console.log(
+    `[WhatsApp:Discovery] group=${groupId} messages=${stats.messageCount} newest=${stats.newestTimestamp ? new Date(stats.newestTimestamp * 1000).toISOString() : "none"} images=${stats.imageCount} rejected=${stats.rejectedCandidateCount} history=complete freshness=verified`,
+  );
+  const cycles = buildSettlementCycles({
     groupId,
     aliases: config.aliases || {},
     configuredGroupStart: config.groupStartDates?.[groupId] || null,
     messages,
   });
+  cycles.snapshot = {
+    verified: recent.verified === true,
+    refreshedAt: recent.refreshedAt,
+    source: recent.source,
+    ...stats,
+  };
+  return cycles;
 }
 
 module.exports = { detectSettlementCycles };

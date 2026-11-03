@@ -3,9 +3,13 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { EventEmitter } = require("node:events");
 process.env.SPLITMATE_DATA_DIR = fs.mkdtempSync(
   path.join(os.tmpdir(), "splitmate-tests-"),
 );
+process.env.SPLITMATE_WHATSAPP_REFRESH_MIN_WAIT_MS = "1";
+process.env.SPLITMATE_WHATSAPP_REFRESH_POLL_MS = "1";
+process.env.SPLITMATE_WHATSAPP_REFRESH_MAX_WAIT_MS = "50";
 const storage = require("../server/services/storage.cjs");
 const registerHistory = require("../server/sockets/history.cjs");
 const registerScan = require("../server/sockets/scan.cjs");
@@ -27,6 +31,12 @@ const { detectSettlementCycles } = require("../server/services/cycles.cjs");
 const { readReceiptCandidates } = require("../server/services/message-discovery.cjs");
 const { jpegPerceptualHash, perceptualSimilarity, tagReceiptDuplicates } = require("../server/services/receipt-dedup.cjs");
 const { calculateSettlement } = require("../server/services/settlement.cjs");
+const { createScanManager } = require("../server/sockets/scan.cjs");
+const {
+  attachMessageSnapshotTracker,
+  discoveryStats,
+  refreshRecentMessageSnapshot,
+} = require("../server/services/whatsapp-snapshot.cjs");
 
 test("API key parser accepts numbered env-file lines", () => {
   assert.deepEqual(
@@ -74,6 +84,8 @@ function historyClient({ stalled = false } = {}) {
   };
   return {
     loads: () => loads,
+    getState: async () => "CONNECTED",
+    getChatById: async () => ({ fetchMessages: async () => [], syncHistory: async () => false }),
     pupPage: {
       evaluate: (fn, ...args) =>
         require("node:vm").runInNewContext(`(${fn.toString()})(...args)`, {
@@ -130,7 +142,8 @@ test("November discovery rejects group-history and keeps exactly three genuine J
   assert.deepEqual(raw.messages.map((message) => message.id), ["jpeg-1", "jpeg-2", "jpeg-3"]);
 
   const cycles = await detectSettlementCycles("group", {
-    getChatById: async () => ({ fetchMessages: async () => [] }),
+    getState: async () => "CONNECTED",
+    getChatById: async () => ({ fetchMessages: async () => [], syncHistory: async () => false }),
     searchMessages: async () => [],
     pupPage: { evaluate: async () => ({ complete: true, messages: messages.map((message) => ({ ...message, isMedia: true })) }) },
   });
@@ -173,10 +186,111 @@ test("merchant, amount and send time alone never discard a different receipt", (
 
 test("incomplete cycle history is rejected before a scan can finalize", async () => {
   await assert.rejects(() => detectSettlementCycles("group", {
-    getChatById: async () => { throw new Error("preload failed"); },
+    getState: async () => "CONNECTED",
+    getChatById: async () => ({ fetchMessages: async () => [], syncHistory: async () => false }),
     searchMessages: async () => [],
     pupPage: { evaluate: async () => ({ complete: false, messages: [] }) },
   }), /history is incomplete/i);
+});
+
+function recentClient(initialMessages, onSync = null) {
+  const client = new EventEmitter();
+  let visible = [...initialMessages];
+  client.getState = async () => "CONNECTED";
+  client.getChatById = async () => ({
+    fetchMessages: async () => [...visible],
+    syncHistory: async () => {
+      if (onSync) visible = await onSync([...visible]);
+      return true;
+    },
+  });
+  return client;
+}
+
+test("recent refresh discovers new photos absent from a stale earlier collection", async () => {
+  const old = [1, 2, 3].map((number) => ({
+    id: `nov-2-${number}`,
+    timestamp: 1793577600 + number,
+    type: "image",
+    mimetype: "image/jpeg",
+    from: "group@g.us",
+  }));
+  const countryFresh = [
+    { id: "country-fresh-4926", timestamp: 1793734200, type: "image", mimetype: "image/jpeg", from: "group@g.us" },
+    { id: "country-fresh-2143", timestamp: 1793734260, type: "image", mimetype: "image/jpeg", from: "group@g.us" },
+  ];
+  const client = recentClient(old, async (visible) => [...visible, ...countryFresh]);
+  client.searchMessages = async () => [];
+  client.pupPage = { evaluate: async () => ({ complete: true, messages: old }) };
+  const snapshot = await refreshRecentMessageSnapshot("group@g.us", client);
+  assert.equal(snapshot.verified, true);
+  assert.deepEqual(snapshot.messages.slice(-2).map((message) => message.id), ["country-fresh-4926", "country-fresh-2143"]);
+  assert.equal(snapshot.imageCount, 5);
+  const cycles = await detectSettlementCycles("group@g.us", client);
+  assert.equal(
+    cycles.reduce((count, cycle) => count + cycle.groceryCount + cycle.paymentCount + cycle.unclassifiedCount, 0),
+    5,
+  );
+});
+
+test("live message events invalidate an earlier verified snapshot without duplicating IDs", async () => {
+  const oldMessage = { id: "old", timestamp: 1793577600, type: "image", mimetype: "image/jpeg", from: "group@g.us" };
+  const client = recentClient([oldMessage]);
+  attachMessageSnapshotTracker(client);
+  const first = await refreshRecentMessageSnapshot("group@g.us", client);
+  assert.equal(first.messageCount, 1);
+  const newMessage = { id: "country-fresh", timestamp: 1793734200, type: "image", mimetype: "image/jpeg", from: "group@g.us" };
+  client.emit("message", newMessage);
+  client.emit("message_create", newMessage);
+  const second = await refreshRecentMessageSnapshot("group@g.us", client);
+  assert.deepEqual(second.messages.map((message) => message.id), ["old", "country-fresh"]);
+});
+
+test("disconnected and failed refreshes remain explicitly unverified", async () => {
+  const disconnected = recentClient([]);
+  disconnected.getState = async () => "DISCONNECTED";
+  await assert.rejects(
+    refreshRecentMessageSnapshot("group@g.us", disconnected),
+    /freshness is unverified/i,
+  );
+  disconnected.getState = async () => "CONNECTED";
+  assert.equal((await refreshRecentMessageSnapshot("group@g.us", disconnected)).verified, true);
+  const failed = recentClient([]);
+  failed.getChatById = async () => ({
+    fetchMessages: async () => [],
+    syncHistory: async () => { throw new Error("peer sync failed"); },
+  });
+  await assert.rejects(refreshRecentMessageSnapshot("group@g.us", failed), /refresh failed/i);
+});
+
+test("sync preparation fails closed when cycle discovery has no freshness proof", async () => {
+  const events = new EventEmitter();
+  let errorMessage = "";
+  events.on("scan:error", ({ message }) => { errorMessage = message; });
+  const manager = createScanManager(
+    events,
+    () => ({ client: {}, clientStatus: "READY", geminiApiKeys: ["test-key"] }),
+    { detectSettlementCycles: async () => [] },
+  );
+  const prepared = await manager.prepare({
+    runId: `unverified-${Date.now()}`,
+    groupId: "group@g.us",
+    startDate: "2026-11-01",
+    endDate: "2026-11-04",
+    sync: true,
+  });
+  assert.equal(prepared, null);
+  assert.match(errorMessage, /freshness is unverified/i);
+});
+
+test("snapshot diagnostics separate genuine photos from missing or non-image media", () => {
+  const stats = discoveryStats([
+    { id: "photo", timestamp: 1, type: "image", mimetype: "image/jpeg" },
+    { id: "history", timestamp: 2, type: "group-history", mimetype: "image/jpeg" },
+    { id: "document", timestamp: 3, type: "document", mimetype: "application/pdf", hasMedia: true },
+    { id: "text", timestamp: 4, type: "chat" },
+  ]);
+  assert.deepEqual(stats, { messageCount: 4, imageCount: 1, rejectedCandidateCount: 2, newestTimestamp: 4 });
 });
 function socket() {
   return {

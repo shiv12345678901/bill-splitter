@@ -15,6 +15,7 @@ const { createScanManager } = require("./sockets/scan.cjs");
 const { createConfiguredSupabaseWorker, LIVE_MODE } = require("./services/supabase-worker.cjs");
 const { WhatsAppSessionLock, clearStaleChromiumProfileLocks } = require("./services/whatsapp-session-lock.cjs");
 const { resolveWhatsAppUserAgent } = require("./services/whatsapp-user-agent.cjs");
+const { attachMessageSnapshotTracker } = require("./services/whatsapp-snapshot.cjs");
 
 function loadGeminiKeys() {
   const values = [];
@@ -118,6 +119,7 @@ async function initializeWhatsApp() {
         ],
       },
     });
+    attachMessageSnapshotTracker(client);
 
     client.on("qr", async (qr) => {
       clientStatus = "QR_READY";

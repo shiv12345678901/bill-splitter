@@ -95,9 +95,14 @@ function createScanManager(
     let candidateMessages = [];
     let selectedCycleData = null;
     let activeCheckpoint = null;
+    let messageFreshness = null;
 
     if ((cycleId || sync) && detectSettlementCycles) {
       const cycles = await detectSettlementCycles(groupId);
+      messageFreshness = cycles.snapshot || null;
+      if (sync && messageFreshness?.verified !== true) {
+        throw new Error("WhatsApp message freshness is unverified; refusing to finalize this scan.");
+      }
       const target = cycleId
         ? cycles.find((cycle) => cycle.id === cycleId)
         : selectCycleForPeriod(cycles, startDate);
@@ -152,13 +157,16 @@ function createScanManager(
 
     if (!selectedCycleData && client.pupPage) {
       const fetchLimit = Math.min(Math.max(parseInt(maxMessages) || 600, 100), 1500);
-      await loadChatHistory(client, groupId, fetchLimit, sync ? startUnix : null);
+      const history = await loadChatHistory(client, groupId, fetchLimit, sync ? startUnix : null);
+      const { messages: recentMessages = [], ...freshnessSummary } = history.recentSnapshot || {};
+      messageFreshness = freshnessSummary;
       const raw = await readReceiptCandidates(
         client,
         groupId,
         startUnix,
         endUnix,
         useCheckpoint,
+        recentMessages,
       );
       if (raw?.error) throw new Error(raw.error);
       groupDisplayName = raw?.name || groupDisplayName;
@@ -177,6 +185,7 @@ function createScanManager(
       groupDisplayName,
       selectedCycleData,
       checkpoint: activeCheckpoint,
+      messageFreshness,
     };
   }
 
