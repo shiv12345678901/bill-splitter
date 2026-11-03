@@ -94,6 +94,8 @@ docker rm splitmate-pair
 
 For a later re-pair, stop the worker before repeating this section. The session-owner lock prevents two processes from sharing the profile.
 
+The LocalAuth directory remains on the `worker_state` volume. After the exclusive application owner lock is acquired, startup removes only Chromium's stale `SingletonLock`, `SingletonCookie`, and `SingletonSocket` artifacts from the profile root. It does not delete cookies, Local Storage, IndexedDB, WhatsApp credentials, receipt images, or SQLite data, so a normal Docker restart reuses the paired session.
+
 ## 5. Enable live processing
 
 First disable the old Muse poller. Verify no unleased `processing` rows remain; the claim function deliberately refuses to steal them. Then enable the independent safeguards:

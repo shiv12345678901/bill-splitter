@@ -14,6 +14,13 @@ const processReceipts = require("../server/services/receipt-workers.cjs");
 const { loadChatHistory } = require("../server/services/message-discovery.cjs");
 const library = require("../server/services/library.cjs");
 const { parseApiKeys } = require("../server/services/api-keys.cjs");
+const jpeg = require("jpeg-js");
+const crypto = require("node:crypto");
+const { isGenuineImageMessage } = require("../server/services/whatsapp-media.cjs");
+const { detectSettlementCycles } = require("../server/services/cycles.cjs");
+const { readReceiptCandidates } = require("../server/services/message-discovery.cjs");
+const { jpegPerceptualHash, perceptualSimilarity, tagReceiptDuplicates } = require("../server/services/receipt-dedup.cjs");
+const { calculateSettlement } = require("../server/services/settlement.cjs");
 
 test("API key parser accepts numbered env-file lines", () => {
   assert.deepEqual(
@@ -81,6 +88,89 @@ test("sync surfaces stalled loading instead of declaring an incomplete scan succ
     loadChatHistory(historyClient({ stalled: true }), "group", 2, 100),
     /stopped loading/,
   );
+});
+
+function fixtureJpeg({ inverted = false, quality = 90 } = {}) {
+  const width = 72;
+  const height = 96;
+  const data = Buffer.alloc(width * height * 4);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const offset = (y * width + x) * 4;
+      const stripe = ((Math.floor(x / 8) + Math.floor(y / 12)) % 2) * 90;
+      const value = inverted ? 220 - stripe : 35 + stripe;
+      data[offset] = value;
+      data[offset + 1] = value;
+      data[offset + 2] = value;
+      data[offset + 3] = 255;
+    }
+  }
+  return jpeg.encode({ width, height, data }, quality).data;
+}
+
+test("November discovery rejects group-history and keeps exactly three genuine JPEG messages", async () => {
+  const messages = [
+    { id: "history-1", type: "group-history", mimetype: "image/jpeg", mediaData: {}, timestamp: 1793510000 },
+    { id: "jpeg-1", type: "image", mimetype: "image/jpeg", timestamp: 1793596400 },
+    { id: "jpeg-2", type: "image", mimetype: "image/jpeg", timestamp: 1793596460 },
+    { id: "jpeg-3", type: "image", mimetype: "image/jpeg", timestamp: 1793596520 },
+  ];
+  assert.equal(isGenuineImageMessage(messages[0]), false);
+  assert.deepEqual(messages.filter(isGenuineImageMessage).map((message) => message.id), ["jpeg-1", "jpeg-2", "jpeg-3"]);
+
+  const raw = await readReceiptCandidates({
+    pupPage: { evaluate: async () => ({ messages, effectiveStartUnix: 0 }) },
+  }, "group", 0, Number.MAX_SAFE_INTEGER, false);
+  assert.deepEqual(raw.messages.map((message) => message.id), ["jpeg-1", "jpeg-2", "jpeg-3"]);
+
+  const cycles = await detectSettlementCycles("group", {
+    getChatById: async () => ({ fetchMessages: async () => [] }),
+    searchMessages: async () => [],
+    pupPage: { evaluate: async () => ({ complete: true, messages: messages.map((message) => ({ ...message, isMedia: true })) }) },
+  });
+  assert.equal(cycles.reduce((count, cycle) => count + cycle.groceryCount + cycle.paymentCount + cycle.unclassifiedCount, 0), 3);
+});
+
+test("different JPEG encodings of one receipt are review-blocked without dropping a distinct receipt", () => {
+  const distinctImage = fixtureJpeg({ inverted: true, quality: 88 });
+  const duplicateImage2 = fixtureJpeg({ quality: 92 });
+  const duplicateImage3 = fixtureJpeg({ quality: 55 });
+  assert.notEqual(crypto.createHash("sha256").update(duplicateImage2).digest("hex"), crypto.createHash("sha256").update(duplicateImage3).digest("hex"));
+  const hash2 = jpegPerceptualHash(duplicateImage2);
+  const hash3 = jpegPerceptualHash(duplicateImage3);
+  assert.ok(perceptualSimilarity(hash2, hash3) >= 0.9);
+
+  const receipts = [
+    { id: "jpeg-1", date: "2026-11-02T01:00:00Z", merchant: "Fresh Market", paidBy: "Alex", amount: 10, transactionDate: "2026-11-02", perceptualHash: jpegPerceptualHash(distinctImage) },
+    { id: "jpeg-2", date: "2026-11-02T01:01:00Z", merchant: "Woolworths", paidBy: "Alex", amount: 20, transactionDate: "2026-11-02", receiptNumber: "R-778899", perceptualHash: hash2 },
+    { id: "jpeg-3", date: "2026-11-02T01:02:00Z", merchant: "Woolworths", paidBy: "Alex", amount: 20, transactionDate: "2026-11-02", receiptNumber: "R-778899", perceptualHash: hash3 },
+  ];
+  tagReceiptDuplicates(receipts);
+  assert.equal(receipts[0].isDuplicate, undefined);
+  assert.equal(receipts[1].isDuplicate, undefined);
+  assert.equal(receipts[2].isDuplicate, true);
+  assert.equal(receipts[2].needsReview, true);
+  assert.equal(receipts[2].isExcluded, true);
+  assert.equal(receipts[2].duplicateRefId, "jpeg-2");
+  assert.equal(calculateSettlement(receipts, {}, ["Alex", "Jamie"]).totalPool, 30);
+});
+
+test("merchant, amount and send time alone never discard a different receipt", () => {
+  const receipts = [
+    { id: "first", date: "2026-11-02T01:00:00Z", merchant: "Woolworths", paidBy: "Alex", amount: 20, perceptualHash: jpegPerceptualHash(fixtureJpeg()) },
+    { id: "second", date: "2026-11-02T01:00:00Z", merchant: "Woolworths", paidBy: "Alex", amount: 20, perceptualHash: jpegPerceptualHash(fixtureJpeg({ inverted: true })) },
+  ];
+  tagReceiptDuplicates(receipts);
+  assert.equal(receipts[1].isDuplicate, undefined);
+  assert.equal(receipts[1].isExcluded, undefined);
+});
+
+test("incomplete cycle history is rejected before a scan can finalize", async () => {
+  await assert.rejects(() => detectSettlementCycles("group", {
+    getChatById: async () => { throw new Error("preload failed"); },
+    searchMessages: async () => [],
+    pupPage: { evaluate: async () => ({ complete: false, messages: [] }) },
+  }), /history is incomplete/i);
 });
 function socket() {
   return {
@@ -278,6 +368,54 @@ test("empty scan finishes through extracted services without external calls", as
   assert.ok(done);
   assert.deepEqual(done.data.expenses, []);
   assert.equal(done.data.runId, "two");
+});
+test("scan reconciliation keeps three JPEG records but bills only two distinct receipts", async () => {
+  const database = require("../server/services/database.cjs");
+  const jobId = `november-dedup-${Date.now()}`;
+  const candidates = ["jpeg-one", "jpeg-two", "jpeg-three"].map((id, index) => ({
+    id: `${jobId}-${id}`,
+    timestamp: 1793596400 + index * 60,
+    author: "alex",
+  }));
+  database.createScanJob({
+    jobId,
+    groupId: "november-group",
+    status: "queued",
+    expectedImages: candidates.length,
+    request: { startDate: "2026-11-01", endDate: "2026-11-02", aliases: {} },
+    candidates,
+  });
+  for (const candidate of candidates)
+    database.recordScanOutcome(jobId, { messageId: candidate.id, status: "queued" });
+  const images = [fixtureJpeg({ inverted: true }), fixtureJpeg({ quality: 92 }), fixtureJpeg({ quality: 55 })];
+  let ocrIndex = 0;
+  const manager = registerScan.createScanManager(
+    socket(),
+    () => ({ client: { getContactById: async () => ({ name: "Alex" }) }, clientStatus: "READY", geminiApiKeys: ["key"] }),
+    {
+      downloadMediaBuffer: async (_client, id) => ({
+        data: images[candidates.findIndex((candidate) => candidate.id === id)].toString("base64"),
+        mimetype: "image/jpeg",
+      }),
+      parseReceiptWithGemini: async () => {
+        const index = ocrIndex++;
+        return index === 0
+          ? { merchant: "Fresh Market", amount: 10, category: "Groceries", confidence: "HIGH", transactionDate: "2026-11-02", receiptNumber: "FM-10001" }
+          : { merchant: "Woolworths", amount: 20, category: "Groceries", confidence: "HIGH", transactionDate: "2026-11-02", receiptNumber: "WW-778899" };
+      },
+    },
+  );
+  await manager.run(jobId);
+  const saved = database.getScanJob(jobId);
+  const outcomes = database.getScanOutcomes(jobId);
+  assert.equal(saved.status, "complete");
+  assert.equal(saved.result.expenses.length, 3);
+  assert.equal(saved.result.settlement.totalPool, 30);
+  assert.equal(saved.reconciliation.excluded, 1);
+  const duplicate = saved.result.expenses.find((receipt) => receipt.isDuplicate);
+  assert.equal(duplicate.needsReview, true);
+  assert.equal(duplicate.isExcluded, true);
+  assert.equal(outcomes.find((outcome) => outcome.messageId === duplicate.id).status, "excluded");
 });
 test("retry failed images only leaves successful outcomes untouched", async () => {
   const database = require("../server/services/database.cjs");

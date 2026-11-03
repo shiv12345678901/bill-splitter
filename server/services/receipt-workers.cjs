@@ -6,6 +6,7 @@ const {
   upsertReceiptCacheEntry,
 } = require("./storage.cjs");
 const library = require("./library.cjs");
+const { jpegPerceptualHash } = require("./receipt-dedup.cjs");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const classifyScanError = (error) => {
   const message = String(error?.message || error || "").toLowerCase();
@@ -161,6 +162,8 @@ module.exports = async function processReceipts({
         const ocrCache = loadReceiptCache();
         const cacheKey = msg.id;
         let ocrResult = null;
+        let contentHash = null;
+        let perceptualHash = null;
         // The message id whose cached file holds the image bytes (differs
         // from cacheKey when identical content was deduplicated).
         let thumbId = cacheKey;
@@ -168,6 +171,9 @@ module.exports = async function processReceipts({
 
         if (ocrCache[cacheKey]) {
           ocrResult = ocrCache[cacheKey];
+          const known = library.findById(cacheKey);
+          contentHash = known?.contentHash || null;
+          perceptualHash = known?.perceptualHash || null;
           source = "cache";
           console.log(
             `[OCR:Cache Hit ⚡] Instantly loaded cached receipt for message ${cacheKey} (${ocrResult.merchant}, $${(ocrResult.amount || 0).toFixed(2)})`,
@@ -199,7 +205,11 @@ module.exports = async function processReceipts({
               isBankTransfer: known.isBankTransfer,
               confidence: known.confidence,
               isBlurry: known.isBlurry,
+              transactionDate: known.transactionDate,
+              receiptNumber: known.receiptNumber,
             };
+            contentHash = known.contentHash || null;
+            perceptualHash = known.perceptualHash || null;
             thumbId = known.fileId || known.id;
             thumbGroup = known.fileGroupId || groupId;
             console.log(
@@ -240,7 +250,10 @@ module.exports = async function processReceipts({
             continue;
           }
           const buffer = Buffer.from(media.data, "base64");
-          const contentHash = library.hashBuffer(buffer);
+          contentHash = library.hashBuffer(buffer);
+          perceptualHash = /^image\/(?:jpeg|jpg)$/i.test(mime)
+            ? jpegPerceptualHash(buffer)
+            : null;
 
           // 4. Identical image scanned before? Reuse that result and file.
           const duplicate = library.findByContentHash(contentHash);
@@ -253,6 +266,8 @@ module.exports = async function processReceipts({
               isBankTransfer: duplicate.isBankTransfer,
               confidence: duplicate.confidence,
               isBlurry: duplicate.isBlurry,
+              transactionDate: duplicate.transactionDate,
+              receiptNumber: duplicate.receiptNumber,
             };
             thumbId = duplicate.fileId || duplicate.id;
             thumbGroup = duplicate.fileGroupId || duplicate.groupId || groupId;
@@ -264,6 +279,7 @@ module.exports = async function processReceipts({
               groupId,
               mimetype: mime,
               contentHash,
+              perceptualHash,
               ocr: ocrResult,
               senderName,
               timestamp: msg.timestamp,
@@ -300,6 +316,7 @@ module.exports = async function processReceipts({
               buffer,
               mimetype: mime,
               contentHash,
+              perceptualHash,
               ocr: ocrResult,
               senderName,
               timestamp: msg.timestamp,
@@ -333,6 +350,10 @@ module.exports = async function processReceipts({
             confidence: ocrResult.confidence || "HIGH",
             isBlurry: Boolean(ocrResult.isBlurry),
             needsReview: false,
+            contentHash,
+            perceptualHash,
+            transactionDate: ocrResult.transactionDate || null,
+            receiptNumber: ocrResult.receiptNumber || null,
             thumbnail: `/api/media?id=${encodeURIComponent(thumbId)}&groupId=${encodeURIComponent(thumbGroup)}`,
           };
 
@@ -362,6 +383,10 @@ module.exports = async function processReceipts({
             isBankTransfer: true,
             isExcluded: true,
             needsReview: true,
+            contentHash,
+            perceptualHash,
+            transactionDate: ocrResult.transactionDate || null,
+            receiptNumber: ocrResult.receiptNumber || null,
             thumbnail: `/api/media?id=${encodeURIComponent(thumbId)}&groupId=${encodeURIComponent(thumbGroup)}`,
           };
 
@@ -397,6 +422,10 @@ module.exports = async function processReceipts({
             confidence: "LOW",
             isBlurry: true,
             needsReview: true,
+            contentHash,
+            perceptualHash,
+            transactionDate: ocrResult?.transactionDate || null,
+            receiptNumber: ocrResult?.receiptNumber || null,
             thumbnail: `/api/media?id=${encodeURIComponent(thumbId)}&groupId=${encodeURIComponent(thumbGroup)}`,
           };
 

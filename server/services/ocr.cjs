@@ -38,6 +38,12 @@ function cleanAndParseJson(text) {
       ? "HIGH"
       : "LOW";
   const isBlurry = Boolean(parsed.isBlurry);
+  const transactionDate = /^\d{4}-\d{2}-\d{2}$/.test(String(parsed.transactionDate || ""))
+    ? String(parsed.transactionDate)
+    : null;
+  const receiptNumber = String(parsed.receiptNumber || parsed.referenceNumber || "")
+    .trim()
+    .slice(0, 100) || null;
 
   return {
     merchant: String(
@@ -48,6 +54,8 @@ function cleanAndParseJson(text) {
     isBankTransfer,
     confidence,
     isBlurry,
+    transactionDate,
+    receiptNumber,
   };
 }
 
@@ -92,6 +100,8 @@ RETAIL MERCHANTS & HOUSEHOLD BILLS:
 Output properties:
 - merchant: Store name (e.g. "Woolworths", "Coles", "Aldi", "Indian Grocer").
 - amount: The final grand total paid as a clean positive float (e.g. 45.20). If not a retail receipt, use 0.
+- transactionDate: The purchase date printed on the receipt in YYYY-MM-DD form, or null when it is unavailable or uncertain.
+- receiptNumber: The receipt, invoice, order, docket, or transaction reference printed on the receipt, or null when unavailable. Do not invent one.
 - category: One of ["Groceries", "Utilities", "Dining", "Household Supplies", "Other"].
 - isBankTransfer: true if bank transfer confirmation/screenshot, false if retail receipt.
 - confidence: "HIGH" if numbers and store name are crisp and clear; "MEDIUM" if partially wrinkled; "LOW" if blurry/faded.
@@ -102,6 +112,8 @@ Output properties:
     properties: {
       merchant: { type: "STRING" },
       amount: { type: "NUMBER" },
+      transactionDate: { type: "STRING", nullable: true },
+      receiptNumber: { type: "STRING", nullable: true },
       category: {
         type: "STRING",
         enum: [
@@ -119,6 +131,8 @@ Output properties:
     required: [
       "merchant",
       "amount",
+      "transactionDate",
+      "receiptNumber",
       "category",
       "isBankTransfer",
       "confidence",

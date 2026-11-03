@@ -8,6 +8,7 @@ const library = require("../services/library.cjs");
 const { loadReceiptCache } = require("../services/storage.cjs");
 const { loadUserConfig } = require("../services/config.cjs");
 const { selectCycleForPeriod } = require("../services/cycle-state.cjs");
+const { tagReceiptDuplicates } = require("../services/receipt-dedup.cjs");
 const {
   calculateSettlement,
   formatWhatsAppReport,
@@ -266,8 +267,25 @@ function createScanManager(
           });
       }
     }
-    const outcomes = database.getScanOutcomes(job.jobId);
-    const expenses = outcomes
+    let outcomes = database.getScanOutcomes(job.jobId);
+    let expenses = outcomes
+      .map((outcome) => outcome.receipt)
+      .filter(Boolean)
+      .sort((a, b) => new Date(a.date) - new Date(b.date));
+    tagReceiptDuplicates(expenses);
+    for (const expense of expenses) {
+      if (!expense.isDuplicate || !expense.needsReview || !expense.isExcluded) continue;
+      const outcome = outcomes.find((item) => item.messageId === expense.id);
+      if (!outcome || outcome.status === "excluded") continue;
+      database.recordScanOutcome(job.jobId, {
+        ...outcome,
+        status: "excluded",
+        reason: expense.duplicateReason,
+        receipt: expense,
+      });
+    }
+    outcomes = database.getScanOutcomes(job.jobId);
+    expenses = outcomes
       .map((outcome) => outcome.receipt)
       .filter(Boolean)
       .sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -309,7 +327,7 @@ function createScanManager(
           amount: outcome.receipt?.amount || 0,
           paidBy: outcome.receipt?.paidBy || "",
           status: outcome.status,
-          isExcluded: outcome.status === "excluded",
+          isExcluded: Boolean(outcome.receipt?.isExcluded || outcome.status === "excluded"),
         })),
         totals: {
           totalPool: settlement.totalPool,

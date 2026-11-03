@@ -20,6 +20,23 @@ function processIsAlive(pid) {
   }
 }
 
+function clearStaleChromiumProfileLocks(sessionDataPath) {
+  const profile = path.join(path.resolve(sessionDataPath || "./.wwebjs_auth"), "session");
+  const removed = [];
+  for (const name of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
+    const target = path.join(profile, name);
+    try {
+      fs.lstatSync(target);
+      fs.rmSync(target, { force: true, recursive: false });
+      removed.push(name);
+    } catch (error) {
+      if (error.code !== "ENOENT")
+        throw new Error(`Could not clear stale Chromium profile lock ${name}: ${error.message}`);
+    }
+  }
+  return removed;
+}
+
 class WhatsAppSessionLock {
   constructor(sessionDataPath, owner = "unknown") {
     this.directory = path.resolve(sessionDataPath || "./.wwebjs_auth");
@@ -70,4 +87,4 @@ class WhatsAppSessionLock {
   }
 }
 
-module.exports = { WhatsAppSessionLock, processIsAlive };
+module.exports = { WhatsAppSessionLock, clearStaleChromiumProfileLocks, processIsAlive };

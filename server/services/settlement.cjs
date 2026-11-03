@@ -1,42 +1,9 @@
-function tagFuzzyDuplicates(expenses = []) {
-  const n = expenses.length;
-  for (let i = 0; i < n; i++) {
-    const e1 = expenses[i];
-    if (!e1 || parseFloat(e1.amount) <= 0) continue;
-    const t1 = new Date(e1.date).getTime();
+const { tagReceiptDuplicates } = require("./receipt-dedup.cjs");
 
-    for (let j = i + 1; j < n; j++) {
-      const e2 = expenses[j];
-      if (!e2 || parseFloat(e2.amount) <= 0) continue;
-      const t2 = new Date(e2.date).getTime();
-
-      // Same amount down to the cent
-      const sameAmount =
-        Math.abs(parseFloat(e1.amount) - parseFloat(e2.amount)) < 0.009;
-      // Within 24 hours of each other
-      const within24h = Math.abs(t1 - t2) <= 24 * 60 * 60 * 1000;
-      // Same merchant OR same payer
-      const samePayer =
-        e1.paidBy &&
-        e2.paidBy &&
-        e1.paidBy.toLowerCase() === e2.paidBy.toLowerCase();
-      const sameMerchant =
-        e1.merchant &&
-        e2.merchant &&
-        e1.merchant.toLowerCase() === e2.merchant.toLowerCase();
-
-      if (sameAmount && within24h && (samePayer || sameMerchant)) {
-        e2.isDuplicate = true;
-        e2.duplicateRefId = e1.id;
-        e2.duplicateReason = `Matches ${e1.merchant} ($${parseFloat(e1.amount).toFixed(2)}) by ${e1.paidBy}`;
-        if (typeof e2.isExcluded === "undefined") {
-          e2.isExcluded = false;
-        }
-      }
-    }
-  }
-  return expenses;
-}
+// Kept as an exported compatibility name for the local application.
+// The implementation is deliberately conservative and no longer treats
+// matching merchant/amount/time alone as proof of a duplicate.
+const tagFuzzyDuplicates = (expenses = []) => tagReceiptDuplicates(expenses);
 
 function calculateSettlement(
   expenses = [],

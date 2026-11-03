@@ -64,7 +64,7 @@ function imageFilePath(entry) {
 // saving a second copy of identical content.
 function recordImage(args) {
   return serialized(() => {
-    const { id, groupId, buffer, mimetype, contentHash, ocr, senderName, timestamp, dedupOf } = args;
+    const { id, groupId, buffer, mimetype, contentHash, perceptualHash, ocr, senderName, timestamp, dedupOf } = args;
     const existing = database.getReceipt(id);
     const fileName =
       dedupOf?.fileName ||
@@ -94,6 +94,7 @@ function recordImage(args) {
     fileGroupId: dedupOf?.groupId || existing?.fileGroupId || groupId || "",
     mimetype: mimetype || existing?.mimetype || "image/jpeg",
     contentHash: contentHash || existing?.contentHash || null,
+    perceptualHash: perceptualHash || dedupOf?.perceptualHash || existing?.perceptualHash || null,
     date: timestamp
       ? new Date(timestamp * 1000).toISOString()
       : existing?.date || null,
@@ -104,6 +105,8 @@ function recordImage(args) {
     confidence: ocr?.confidence ?? existing?.confidence ?? "LOW",
     isBankTransfer: Boolean(ocr?.isBankTransfer ?? existing?.isBankTransfer),
     isBlurry: Boolean(ocr?.isBlurry ?? existing?.isBlurry),
+    transactionDate: ocr?.transactionDate ?? existing?.transactionDate ?? null,
+    receiptNumber: ocr?.receiptNumber ?? existing?.receiptNumber ?? null,
     scannedAt: existing?.scannedAt || new Date().toISOString(),
     cycles: existing?.cycles || [],
   };

@@ -13,7 +13,7 @@ const { downloadMediaBuffer } = require("./services/media.cjs");
 const { parseReceiptWithGemini } = require("./services/ocr.cjs");
 const { createScanManager } = require("./sockets/scan.cjs");
 const { createConfiguredSupabaseWorker, LIVE_MODE } = require("./services/supabase-worker.cjs");
-const { WhatsAppSessionLock } = require("./services/whatsapp-session-lock.cjs");
+const { WhatsAppSessionLock, clearStaleChromiumProfileLocks } = require("./services/whatsapp-session-lock.cjs");
 const { resolveWhatsAppUserAgent } = require("./services/whatsapp-user-agent.cjs");
 
 function loadGeminiKeys() {
@@ -98,6 +98,9 @@ async function initializeWhatsApp() {
       await previous.destroy();
       client = null;
     }
+    // The application owner lock is already held here, so Chromium's stale
+    // Singleton* artifacts can be removed without risking a second client.
+    clearStaleChromiumProfileLocks(sessionDataPath);
     client = new Client({
       authStrategy: new LocalAuth({ dataPath: sessionDataPath }),
       userAgent: whatsappUserAgent,

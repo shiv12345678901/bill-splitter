@@ -17,7 +17,7 @@ const {
   SCHEMA_APPROVAL,
   WRITE_APPROVAL,
 } = require("../server/services/supabase-worker.cjs");
-const { WhatsAppSessionLock } = require("../server/services/whatsapp-session-lock.cjs");
+const { WhatsAppSessionLock, clearStaleChromiumProfileLocks } = require("../server/services/whatsapp-session-lock.cjs");
 
 test("Supabase receipt validation follows the available SplitMate cent and category rules", () => {
   assert.equal(centsFromAmount(12.345), 1235);
@@ -515,4 +515,16 @@ test("WhatsApp session ownership prevents two local clients sharing a profile", 
     first.release();
     fs.rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("normal Docker restart cleanup removes only stale Chromium locks and preserves LocalAuth", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "splitmate-profile-restart-"));
+  const profile = path.join(directory, "session");
+  fs.mkdirSync(path.join(profile, "Default"), { recursive: true });
+  fs.writeFileSync(path.join(profile, "Default", "Cookies"), "persistent-auth-fixture");
+  for (const name of ["SingletonLock", "SingletonCookie", "SingletonSocket"])
+    fs.writeFileSync(path.join(profile, name), "stale");
+  assert.deepEqual(clearStaleChromiumProfileLocks(directory).sort(), ["SingletonCookie", "SingletonLock", "SingletonSocket"]);
+  assert.equal(fs.readFileSync(path.join(profile, "Default", "Cookies"), "utf8"), "persistent-auth-fixture");
+  assert.deepEqual(clearStaleChromiumProfileLocks(directory), []);
 });

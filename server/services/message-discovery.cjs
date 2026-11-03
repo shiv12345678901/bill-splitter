@@ -1,5 +1,7 @@
+const { isGenuineImageMessage } = require("./whatsapp-media.cjs");
+
 async function loadChatHistory(client, groupId, fetchLimit, startUnix = null) {
-  return await client.pupPage.evaluate(
+  const result = await client.pupPage.evaluate(
     async (gId, limit, cutoff) => {
       const chatColl = window.require("WAWebCollections")?.Chat;
       let c = chatColl?.get(gId);
@@ -43,7 +45,8 @@ async function loadChatHistory(client, groupId, fetchLimit, startUnix = null) {
           const oldest = Math.min(
             ...msgs.map((m) => Number(m.t || m.timestamp)).filter((t) => t > 0),
           );
-          if (cutoff !== null ? oldest <= cutoff : msgs.length >= limit) return;
+          if (cutoff !== null ? oldest <= cutoff : msgs.length >= limit)
+            return { complete: true, reason: cutoff !== null ? "cutoff-reached" : "limit-reached" };
           const earlier = await loader.loadEarlierMsgs({ chat: c });
           const after = c.msgs?.getModelsArray
             ? c.msgs.getModelsArray()
@@ -54,7 +57,8 @@ async function loadChatHistory(client, groupId, fetchLimit, startUnix = null) {
               .filter((t) => t > 0),
           );
           if (afterOldest < oldest || after.length > msgs.length) stalled = 0;
-          else if (Array.isArray(earlier) && earlier.length === 0) return;
+          else if (Array.isArray(earlier) && earlier.length === 0)
+            return { complete: true, reason: "start-of-history" };
           else if (++stalled >= 3)
             throw new Error(
               "WhatsApp stopped loading older messages. Reconnect and retry.",
@@ -62,6 +66,7 @@ async function loadChatHistory(client, groupId, fetchLimit, startUnix = null) {
           await new Promise((r) => setTimeout(r, 70));
         }
       }
+      if (cutoff === null) return { complete: true, reason: "local-window" };
       if (cutoff !== null)
         throw new Error(
           "WhatsApp could not finish loading this date range. Retry the sync.",
@@ -71,6 +76,9 @@ async function loadChatHistory(client, groupId, fetchLimit, startUnix = null) {
     fetchLimit,
     startUnix,
   );
+  if (startUnix !== null && result?.complete !== true)
+    throw new Error("WhatsApp history completeness could not be verified. Retry the sync.");
+  return result;
 }
 
 async function readReceiptCandidates(
@@ -80,7 +88,7 @@ async function readReceiptCandidates(
   endUnix,
   useCheckpoint,
 ) {
-  return await client.pupPage.evaluate(
+  const result = await client.pupPage.evaluate(
     (gId, sUnix, eUnix, useChk) => {
       try {
         const chatColl = window.require("WAWebCollections")?.Chat;
@@ -149,12 +157,14 @@ async function readReceiptCandidates(
             if (!m || m.isNotification) return false;
             const ts = m.t || m.timestamp || 0;
             const inWindow = ts >= effectiveStartUnix && ts <= eUnix;
-            const isMedia = Boolean(
-              m.isMedia ||
-              m.mediaData ||
-              m.type === "image" ||
-              (m.mimetype && m.mimetype.startsWith("image/")),
-            );
+            const type = String(m.type || m._data?.type || "").trim().toLowerCase();
+            const mimetype = String(
+              m.mimetype || m.mediaData?.mimetype ||
+              m.mediaData?.fullMimetype || m._data?.mimetype || "",
+            ).split(";")[0].trim().toLowerCase();
+            const imageMime = /^image\/(?:jpeg|jpg|png|webp|heic|heif)$/i.test(mimetype);
+            const isMedia = (!type || type === "image") && (!mimetype || imageMime) &&
+              (type === "image" || imageMime);
             return inWindow && isMedia;
           })
           .map((m) => {
@@ -173,6 +183,11 @@ async function readReceiptCandidates(
               timestamp: m.t || m.timestamp || 0,
               author: authorStr,
               from: m.from?._serialized || m.from?.$1 || authorStr,
+              type: String(m.type || m._data?.type || "").trim().toLowerCase(),
+              mimetype: String(
+                m.mimetype || m.mediaData?.mimetype ||
+                m.mediaData?.fullMimetype || m._data?.mimetype || "",
+              ).split(";")[0].trim().toLowerCase(),
             };
           });
 
@@ -197,5 +212,8 @@ async function readReceiptCandidates(
     endUnix,
     useCheckpoint,
   );
+  if (Array.isArray(result?.messages))
+    result.messages = result.messages.filter(isGenuineImageMessage);
+  return result;
 }
 module.exports = { loadChatHistory, readReceiptCandidates };

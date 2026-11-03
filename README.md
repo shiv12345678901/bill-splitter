@@ -34,7 +34,7 @@ The **Cycles** page runs a full scan of the group chat and maps each settlement 
 
 Every image collected from WhatsApp is saved locally with its scanned data:
 
-- `data/media_cache/` — one image file per message, deduplicated by content hash so an identical photo is never stored twice.
+- `data/media_cache/` — one image file per message, with SHA-256 reuse for identical files and a JPEG perceptual fingerprint used only as supporting evidence for receipt-level duplicate review.
 - `data/splitmate.sqlite` — transactional receipt, OCR cache, cycle, scan-job and settlement-history records.
 - `data/backups/` — daily verified SQLite backups; the five newest backups are retained.
 - `data/json-backup-pre-sqlite/` — verified copies of legacy JSON stores created during the one-time migration.
@@ -49,7 +49,7 @@ SQLite uses foreign keys, unique message/cycle constraints, full synchronous com
 - WhatsApp session: `.wwebjs_auth/`.
 - Export/import: workspace JSON backups in Settings. They contain receipts and payment records, never API keys or authentication data. Image references require the original local media cache or connected WhatsApp session.
 - Scans are durable server jobs with queued, running, partial, failed, cancelled and complete states. Each image records its own outcome. Progress survives browser disconnects, unfinished work resumes after a server restart once WhatsApp is ready, and cancellation stops new image work while safely recording work already in flight.
-- **InstaBox/Supabase worker:** run `npm run worker:sync` as a separate background process. It owns the persistent WhatsApp session, polls `sync_requests` every five seconds, atomically claims leased jobs from the frontend (`requested_by = netlify-app`), reuses the WhatsApp/Gemini scan pipeline, uploads private evidence to `bill-evidence`, preserves existing receipt edits and exclusions, and updates `receipts`, `periods`, and `settlements` idempotently. The normal web server and this worker cannot share the same WhatsApp profile at the same time; the session-owner lock makes that failure explicit.
+- **InstaBox/Supabase worker:** run `npm run worker:sync` as a separate background process. It owns the persistent WhatsApp session, polls `sync_requests` every five seconds, atomically claims leased jobs from the frontend (`requested_by = netlify-app`), reuses the WhatsApp/Gemini scan pipeline, uploads private evidence to `bill-evidence`, preserves existing receipt edits and exclusions, and updates `receipts`, `periods`, and `settlements` idempotently. Only genuine WhatsApp image messages are scanned; system history records are ignored. Strong receipt identity evidence can mark a differently encoded photo as a possible duplicate, retain it for review, and exclude it from automatic totals. The normal web server and this worker cannot share the same WhatsApp profile at the same time; the session-owner lock makes that failure explicit.
 - Timeouts, quota limits, download failures and recognition errors are classified and retried with exponential backoff. The final reconciliation card shows processed, excluded, failed and skipped counts with reasons; **Retry failed images** leaves successful images untouched.
 - After the first successful load, the cached shell supports offline reload. Editing, calculations and exports work offline; scanning and local history require the server.
 
