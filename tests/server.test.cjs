@@ -780,6 +780,69 @@ test("settled-cycle scan returns a clear message when WhatsApp history is unavai
   assert.equal(result, null);
   assert.match(failure.message, /chat history is unavailable or incomplete/i);
 });
+
+test("Supabase historical queue mode filters saved IDs and returns evidence without recalculating a cycle", async () => {
+  const suffix = Date.now();
+  const oldId = `already-saved-${suffix}`;
+  const newId = `new-history-evidence-${suffix}`;
+  const startBoundary = {
+    id: `queue-start-${suffix}`, timestamp: 1788148799,
+    dateStr: "2026-08-31", source: "configured", confidence: "HIGH",
+  };
+  const endBoundary = {
+    id: `queue-end-${suffix}`, timestamp: 1790738399,
+    dateStr: "2026-09-30", source: "marker", confidence: "HIGH",
+  };
+  const cycle = {
+    id: `queue-cycle-${suffix}`,
+    status: "SETTLED",
+    settlementConfirmed: true,
+    startDate: "2026-09-01",
+    endDate: "2026-09-30",
+    startBoundary,
+    endBoundary,
+    clearanceMessage: endBoundary,
+    groceryMessages: [
+      { id: oldId, timestamp: 1788408000, author: "alex" },
+      { id: newId, timestamp: 1788494400, author: "alex" },
+    ],
+    paymentMessages: [],
+    unclassifiedMessages: [],
+  };
+  const cycles = [cycle];
+  cycles.snapshot = { retrievalVerified: true };
+  const manager = createScanManager(
+    new EventEmitter(),
+    () => ({
+      client: { getContactById: async () => ({ name: "Alex" }) },
+      clientStatus: "READY",
+      geminiApiKeys: ["test-key"],
+    }),
+    {
+      detectSettlementCycles: async () => cycles,
+      downloadMediaBuffer: async () => ({ data: Buffer.from("queue-image").toString("base64"), mimetype: "image/png" }),
+      parseReceiptWithGemini: async () => ({ merchant: "Evidence", amount: 4, category: "Other", confidence: "HIGH" }),
+    },
+  );
+  const prepared = await manager.prepare({
+    runId: `queue-history-${suffix}`,
+    groupId: `queue-history-${suffix}@g.us`,
+    startDate: cycle.startDate,
+    endDate: cycle.endDate,
+    cycleId: cycle.id,
+    historicalQueueEvidence: true,
+    excludeMessageIds: [oldId],
+    sync: true,
+  });
+  assert.equal(prepared.expectedImages, 1);
+  const completed = await manager.runAndGet(prepared.jobId);
+  assert.equal(completed.status, "complete");
+  assert.equal(completed.result.expenses.length, 1);
+  assert.equal(completed.result.expenses[0].id, newId);
+  assert.equal(completed.result.expenses[0].isExcluded, true);
+  assert.equal(completed.result.expenses[0].needsReview, true);
+  assert.equal(completed.result.expenses[0].evidenceOnly, true);
+});
 test("scan reconciliation keeps three JPEG records but bills only two distinct receipts", async () => {
   const database = require("../server/services/database.cjs");
   const jobId = `november-dedup-${Date.now()}`;

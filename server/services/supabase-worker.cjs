@@ -13,6 +13,8 @@ const DEFAULT_LEASE_SECONDS = 15 * 60;
 const DEFAULT_REQUESTED_BY = "netlify-app";
 const LIVE_MODE = "live";
 const DRY_RUN_MODE = "dry-run";
+const NORMAL_JOB_TYPE = "sync";
+const HISTORICAL_RESCAN_JOB_TYPE = "historical_rescan";
 const SCHEMA_APPROVAL = "I_HAVE_CONFIRMED_SUPABASE_SCHEMA";
 const WRITE_APPROVAL = "I_UNDERSTAND_SUPABASE_WORKER_WRITES";
 const VALID_CATEGORIES = new Set([
@@ -40,6 +42,11 @@ const REQUIRED_COLUMNS = {
     "lease_expires_at",
     "attempt_count",
     "claimed_at",
+    "next_attempt_at",
+    "max_attempts",
+    "job_type",
+    "period_id",
+    "requested_by_user",
   ],
   periods: [
     "id",
@@ -66,6 +73,10 @@ const REQUIRED_COLUMNS = {
     "date",
     "is_excluded",
     "image_url",
+    "source_provider",
+    "source_message_id",
+    "evidence_only",
+    "needs_review",
   ],
   settlements: [
     "id",
@@ -221,6 +232,47 @@ function assertReceiptCycleAssignment({
     }
   }
   return true;
+}
+
+function validateHistoricalPeriodCycle(period, cycles = []) {
+  if (!period?.id || period.status === "CURRENT" || period.whatsapp_cycle_status !== "SETTLED") {
+    throw new Error("Historical rescans require an authoritative SETTLED Supabase period.");
+  }
+  if (!period.start_date || !period.end_date) {
+    throw new Error("The settled period has incomplete date boundaries.");
+  }
+  if (cycles.snapshot?.retrievalVerified !== true) {
+    throw new Error("WhatsApp historical retrieval is unverified; refusing the rescan.");
+  }
+  const storedStart = period.whatsapp_start_boundary;
+  const storedEnd = period.whatsapp_clearance_message;
+  const startTimestamp = Number(storedStart?.timestamp);
+  const endTimestamp = Number(storedEnd?.timestamp);
+  if (!storedStart?.id || !storedEnd?.id ||
+      !Number.isSafeInteger(startTimestamp) || !Number.isSafeInteger(endTimestamp) ||
+      startTimestamp <= 0 || endTimestamp <= startTimestamp ||
+      storedStart.confidence !== "HIGH" || !["configured", "marker"].includes(storedStart.source) ||
+      storedEnd.source !== "marker" || storedEnd.confidence !== "HIGH") {
+    throw new Error("The settled period is missing verified immutable WhatsApp boundaries.");
+  }
+  if (sydneyDate(startTimestamp + 1) !== period.start_date || sydneyDate(endTimestamp) !== period.end_date) {
+    throw new Error("The settled period dates conflict with its WhatsApp boundary timestamps.");
+  }
+  const sameBoundary = (left, right) =>
+    left?.id === right?.id && Number(left?.timestamp) === Number(right?.timestamp);
+  const matches = cycles.filter((cycle) =>
+    cycle.status === "SETTLED" && cycle.settlementConfirmed === true &&
+    cycle.startDate === period.start_date && cycle.endDate === period.end_date &&
+    sameBoundary(storedStart, cycle.startBoundary) && sameBoundary(storedEnd, cycle.endBoundary) &&
+    cycle.clearanceMessage?.source === "marker" && cycle.clearanceMessage?.confidence === "HIGH");
+  if (matches.length !== 1) {
+    throw new Error("The settled period does not map to exactly one verified WhatsApp cycle.");
+  }
+  const selected = matches[0];
+  const conflicting = cycles.some((cycle) => cycle !== selected && (
+    cycle.startBoundary?.id === storedStart.id || cycle.endBoundary?.id === storedEnd.id));
+  if (conflicting) throw new Error("WhatsApp cycle boundaries overlap or conflict with another cycle.");
+  return selected;
 }
 
 function safeObjectName(value) {
@@ -393,7 +445,7 @@ class SupabaseRestClient {
     const bucket = await this.request("storage/v1", "bucket/bill-evidence");
     if (!bucket || bucket.public !== false) throw new Error("bill-evidence must be a private Storage bucket.");
     const capabilities = await this.rpc("instabox_worker_capabilities", {});
-    if (capabilities?.version !== 5) throw new Error("Automatic cycle rollover safeguards migration version 5 is required.");
+    if (capabilities?.version !== 6) throw new Error("Historical rescan safeguards migration version 6 is required.");
     this.writeEnabled = capabilities.writes_enabled === true;
     this.columns = verified;
     return verified;
@@ -533,6 +585,22 @@ function createSupabaseWorker({
     return rows[0] || null;
   }
 
+  async function receiptIdentities() {
+    const all = [];
+    for (let offset = 0; ; ) {
+      const rows = await client.select("receipts", {
+        select: "id,period_id,source_provider,source_message_id",
+        order: "id.asc",
+        limit: 500,
+        offset,
+      });
+      if (!Array.isArray(rows)) throw new Error("Invalid receipt identity response.");
+      if (!rows.length) return all;
+      all.push(...rows);
+      offset += rows.length;
+    }
+  }
+
   function requestContext(job, period) {
     const extra = job.request || job.payload || job.params || {};
     const config = loadUserConfig ? loadUserConfig() : {};
@@ -551,14 +619,15 @@ function createSupabaseWorker({
     };
   }
 
-  async function persistReceipt(expense, periodId, lease) {
+  async function persistReceipt(expense, periodId, lease, { historicalEvidence = false } = {}) {
     lease.assert();
     const config = loadUserConfig ? loadUserConfig() : {};
     const aliases = { ...(config.aliases || {}) };
     const row = adapter.validateReceipt(expense, periodId, aliases);
     if (contract.approved) {
       if (!contract.value.members.includes(row.payer)) throw new Error("Payer is not in reviewed household membership.");
-      if (!row.amount_cents && contract.value.zeroAmountPolicy === "reject") throw new Error("Zero amount requires manual review.");
+      if (!historicalEvidence && !row.amount_cents && contract.value.zeroAmountPolicy === "reject")
+        throw new Error("Zero amount requires manual review.");
       if (contract.value.dateMode === "Australia/Sydney") {
         const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Australia/Sydney", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(row.captured_at));
         const part = (type) => parts.find((p) => p.type === type).value;
@@ -576,6 +645,15 @@ function createSupabaseWorker({
     }
     if (existing?.source_message_id && existing.source_message_id !== row.id) {
       throw new Error(`Existing receipt ${row.id} has conflicting WhatsApp source identity.`);
+    }
+    if (historicalEvidence && existing) {
+      return { inserted: false, id: row.id, row: null };
+    }
+
+    if (historicalEvidence) {
+      row.is_excluded = true;
+      row.evidence_only = true;
+      row.needs_review = true;
     }
 
     let evidenceLocator = existing?.image_url || null;
@@ -604,7 +682,7 @@ function createSupabaseWorker({
     return { inserted: Boolean(inserted?.length), id: row.id };
   }
 
-  async function syncReceipts(expenses, periodId, lease) {
+  async function syncReceipts(expenses, periodId, lease, options = {}) {
     const result = { inserted: 0, existing: 0, invalid: [], rows: [] };
     const seen = new Set();
     for (const expense of expenses || []) {
@@ -618,7 +696,7 @@ function createSupabaseWorker({
         result.invalid.push({ id, error: error.message });
         continue;
       }
-        const outcome = await persistReceipt(expense, periodId, lease);
+        const outcome = await persistReceipt(expense, periodId, lease, options);
         if (outcome.row) result.rows.push(outcome.row);
         if (outcome.inserted) result.inserted++;
         else result.existing++;
@@ -685,7 +763,127 @@ function createSupabaseWorker({
     await client.update("periods", { id: encodeFilter("eq", period.id) }, changes);
   }
 
+  async function processHistoricalRescan(job, lease) {
+    if (!job.period_id) throw new Error("Historical rescan request is missing its authoritative period ID.");
+    const period = await currentPeriod(job.period_id);
+    if (!period) throw new Error("The requested historical period does not exist.");
+    const context = requestContext(job, period);
+    if (!context.groupId) throw new Error("No WhatsApp group is configured for the Supabase worker.");
+    if (typeof scanManager.detectCycles !== "function") {
+      throw new Error("The production scanner cannot verify historical WhatsApp cycles.");
+    }
+
+    await updateJob(job, {
+      stage: "validating_history",
+      stage_message: "Verifying the saved settlement against WhatsApp boundaries…",
+      error: null,
+    });
+    const cycles = await scanManager.detectCycles(context.groupId);
+    const targetCycle = validateHistoricalPeriodCycle(period, cycles);
+    const cycleMessageIds = new Set([
+      ...(targetCycle.groceryMessages || []),
+      ...(targetCycle.paymentMessages || []),
+      ...(targetCycle.unclassifiedMessages || []),
+    ].map((message) => String(message?.id || "")).filter(Boolean));
+    const identities = await receiptIdentities();
+    const excludedMessageIds = [];
+    for (const identity of identities) {
+      const sourceId = String(identity.source_message_id || identity.id || "");
+      if (!cycleMessageIds.has(sourceId)) continue;
+      if (String(identity.period_id) !== String(period.id)) {
+        throw new Error(`WhatsApp evidence ${sourceId} is already assigned to another period.`);
+      }
+      excludedMessageIds.push(sourceId);
+    }
+
+    lease.assert();
+    await updateJob(job, {
+      stage: "discovering_history",
+      stage_message: "Loading new evidence from the settled WhatsApp cycle…",
+    });
+    const prepared = await scanManager.prepare({
+      ...context,
+      cycleId: targetCycle.id,
+      cycleBoundaryId: targetCycle.startBoundary.id,
+      historicalQueueEvidence: true,
+      excludeMessageIds: excludedMessageIds,
+      useCheckpoint: false,
+      sync: true,
+    });
+    if (!prepared) throw new Error("Historical WhatsApp evidence discovery could not be prepared.");
+
+    lease.assert();
+    await updateJob(job, {
+      stage: "scanning_history",
+      stage_message: `${prepared.expectedImages || 0} new historical image(s) found. Reading them…`,
+    });
+    let progressQueue = Promise.resolve();
+    const progressHandler = (payload = {}) => {
+      if (payload.runId !== prepared.jobId || !payload.message) return;
+      progressQueue = progressQueue.then(() => updateJob(job, {
+        stage: "scanning_history",
+        stage_message: payload.message,
+      })).catch((error) => logger.warn(`[Supabase] Could not report historical scan progress: ${error.message}`));
+    };
+    scanEvents?.on?.("scan:progress", progressHandler);
+    try {
+      await scanManager.runAndGet(prepared.jobId, {
+        retryFailedOnly: ["partial", "failed"].includes(prepared.status),
+      });
+    } finally {
+      scanEvents?.off?.("scan:progress", progressHandler);
+      await progressQueue;
+    }
+
+    lease.assert();
+    const localJob = localDatabase.getScanJob(prepared.jobId);
+    if (!localJob) throw new Error("The local historical scan job disappeared before completion.");
+    if (localJob.status !== "complete" || localJob.reconciliation?.failed || localJob.reconciliation?.queued) {
+      throw new Error(localJob.message || "Historical WhatsApp retrieval was incomplete; no database evidence was published.");
+    }
+    const expenses = (localJob.result?.expenses || []).map((expense) => ({
+      ...expense,
+      isExcluded: true,
+      needsReview: true,
+      historicalEvidence: true,
+      evidenceOnly: true,
+    }));
+    assertReceiptCycleAssignment({
+      expenses,
+      scanJob: localJob,
+      period,
+      expectedCycleId: targetCycle.id,
+      expectedBoundaryId: targetCycle.startBoundary.id,
+    });
+
+    await updateJob(job, {
+      stage: "saving_history",
+      stage_message: `Saving ${expenses.length} review-only historical evidence item(s)…`,
+    });
+    const saved = await syncReceipts(expenses, period.id, lease, { historicalEvidence: true });
+    if (saved.invalid.length) {
+      throw new Error(`${saved.invalid.length} historical evidence item(s) failed validation; no receipt rows were published.`);
+    }
+    if (!transactionalWrites || !contract.approved) {
+      throw new Error("Historical publishing requires the reviewed transactional production adapter.");
+    }
+    lease.assert();
+    const result = await client.rpc("finalize_historical_rescan", {
+      p_job_id: String(job.id),
+      p_worker_id: workerId,
+      p_period_id: String(period.id),
+      p_start_boundary_id: targetCycle.startBoundary.id,
+      p_end_boundary_id: targetCycle.endBoundary.id,
+      p_receipts: saved.rows,
+      p_members: contract.value.members,
+    });
+    return { finalized: true, historical: true, resultSummary: result.result_summary };
+  }
+
   async function processClaimedJob(job, lease) {
+    const jobType = job.job_type || NORMAL_JOB_TYPE;
+    if (jobType === HISTORICAL_RESCAN_JOB_TYPE) return processHistoricalRescan(job, lease);
+    if (jobType !== NORMAL_JOB_TYPE) throw new Error(`Unsupported sync request type: ${jobType}.`);
     let period = await currentPeriod(job.period_id || job.periodId || null);
     if (!period) throw new Error("No current settlement period is available in Supabase.");
     if (period.status !== "CURRENT") {
@@ -934,7 +1132,7 @@ function createSupabaseWorker({
     }
     if (mode === LIVE_MODE && schemaVerified && liveWritesApproved) {
       const capabilities = await client.rpc("instabox_worker_capabilities", {});
-      client.writeEnabled = capabilities?.version === 5 && capabilities.writes_enabled === true;
+      client.writeEnabled = capabilities?.version === 6 && capabilities.writes_enabled === true;
     }
     if (mode !== LIVE_MODE) {
       if (!guardLogged) {
@@ -1001,7 +1199,9 @@ function createConfiguredSupabaseWorker(options = {}) {
 module.exports = {
   DEFAULT_LEASE_SECONDS,
   DRY_RUN_MODE,
+  HISTORICAL_RESCAN_JOB_TYPE,
   LIVE_MODE,
+  NORMAL_JOB_TYPE,
   REQUIRED_COLUMNS,
   SCHEMA_APPROVAL,
   WRITE_APPROVAL,
@@ -1012,5 +1212,6 @@ module.exports = {
   centsFromAmount,
   validateReceipt,
   assertReceiptCycleAssignment,
+  validateHistoricalPeriodCycle,
   settlementForReceipts,
 };
