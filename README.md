@@ -129,12 +129,6 @@ Receipt inserts ignore existing IDs, evidence uploads never overwrite objects, a
 
 On the InstaBox VM, install Node 22.5+ and Chrome's Linux runtime dependencies, check out this branch, run `npm ci`, store `.env` outside Git, and keep `SESSION_DATA_PATH` (use an absolute path) and `SPLITMATE_DATA_DIR` on persistent disk. Run `npm run worker:sync` first in dry-run, then enable live mode after the above confirmations and link WhatsApp using the terminal QR. Use a process supervisor to restart the worker after VM reboot. Only one process may own a profile; for concurrent local UI access use `SPLITMATE_NO_WHATSAPP=1 npm start` with the worker owning WhatsApp. Dependency installation may require approving Puppeteer's install script or provisioning Chrome separately.
 
-### Settled-cycle evidence rescan
-
-The local app exposes a separate, evidence-only History operation for rescanning an exact settled WhatsApp cycle. A History button sends `history:scan_cycle` with `runId`, `historyId`, `groupId`, `startDate`, `endDate`, and optionally the saved `cycleId`. Dates use `YYYY-MM-DD`. The server accepts exactly one settled cycle with matching immutable start/end boundary IDs; ambiguous ranges and unavailable or incomplete chat history fail closed.
-
-The UI can listen for `history:scan_cycle_started`, the existing `scan:progress` and `scan:job` updates, then `history:scan_cycle_complete` or `history:scan_cycle_error`. Newly found receipts and bank-transfer proof are saved to the selected History record as `isExcluded`, `needsReview`, and `evidenceOnly`. Existing edited expenses win on ID collisions. The operation never recalculates or replaces the settled record's totals, balances, transfers, payment state, or `owes` values.
-
 ## Design rationale
 
 The household and period remain visible across Overview, Receipts and Payment plan. History and configuration stay separate. Receipt review uses a list/detail pattern; errors appear beside the workflow they affect. Short transitions respect reduced-motion preferences.

@@ -5,11 +5,7 @@ const {
 const processReceipts = require("../services/receipt-workers.cjs");
 const database = require("../services/database.cjs");
 const library = require("../services/library.cjs");
-const {
-  loadReceiptCache,
-  loadSettlementHistory,
-  saveSettlementHistory,
-} = require("../services/storage.cjs");
+const { loadReceiptCache } = require("../services/storage.cjs");
 const { loadUserConfig } = require("../services/config.cjs");
 const { selectCycleForPeriod } = require("../services/cycle-state.cjs");
 const { tagReceiptDuplicates } = require("../services/receipt-dedup.cjs");
@@ -20,17 +16,6 @@ const {
 } = require("../services/settlement.cjs");
 
 const TERMINAL = new Set(["failed", "cancelled", "complete"]);
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
-
-function historicalScanError(error) {
-  const message = error instanceof Error && error.message
-    ? error.message
-    : safeErrorMessage(error);
-  if (/WhatsApp history|chat history|history loading|chat-collection|group is unavailable|resource unavailable/i.test(message)) {
-    return "WhatsApp chat history is unavailable or incomplete for that cycle. Open WhatsApp on the linked phone, allow history to finish syncing, and try again.";
-  }
-  return message;
-}
 const memberBreakdownFor = (expenses) => {
   const result = {
     "Arjun Bhurtel": { total: 0, count: 0, receipts: [] },
@@ -100,13 +85,7 @@ function createScanManager(
       maxMessages = 600,
       useCheckpoint = false,
       sync = false,
-      historicalEvidence = false,
     } = request;
-    if (historicalEvidence && !groupId)
-      throw new Error("Choose the WhatsApp group for this cycle scan.");
-    if (!ISO_DATE.test(startDate || "") || !ISO_DATE.test(endDate || "") || startDate > endDate) {
-      throw new Error("Choose a valid start and end date for the cycle scan.");
-    }
     const startUnix = Math.floor(new Date(`${startDate}T00:00:00`).getTime() / 1000);
     const endUnix = Math.floor(new Date(`${endDate}T23:59:59`).getTime() / 1000);
     if (!Number.isFinite(startUnix) || !Number.isFinite(endUnix))
@@ -125,25 +104,9 @@ function createScanManager(
       if (sync && messageFreshness?.retrievalVerified !== true) {
         throw new Error("WhatsApp recent-message retrieval is unverified; refusing to finalize this scan.");
       }
-      const historicalMatches = historicalEvidence
-        ? cycles.filter((cycle) =>
-          cycle.status === "SETTLED" &&
-          cycle.startDate === startDate &&
-          cycle.endDate === endDate &&
-          (!cycleId || cycle.id === cycleId))
-        : [];
-      if (historicalEvidence && historicalMatches.length !== 1) {
-        throw new Error(
-          historicalMatches.length
-            ? "That date range matches more than one settled WhatsApp cycle. Select the cycle by its saved ID."
-            : "No settled WhatsApp cycle exactly matches that start and end date.",
-        );
-      }
-      const target = historicalEvidence
-        ? historicalMatches[0]
-        : cycleId
-          ? cycles.find((cycle) => cycle.id === cycleId)
-          : selectCycleForPeriod(cycles, startDate);
+      const target = cycleId
+        ? cycles.find((cycle) => cycle.id === cycleId)
+        : selectCycleForPeriod(cycles, startDate);
       if (!target) {
         throw new Error(
           cycleId
@@ -153,9 +116,6 @@ function createScanManager(
       }
       if (cycleBoundaryId && target.startBoundary?.id !== cycleBoundaryId) {
         throw new Error("The WhatsApp cycle boundary changed during discovery; refusing an ambiguous scan.");
-      }
-      if (historicalEvidence && (!target.startBoundary?.id || !target.endBoundary?.id)) {
-        throw new Error("The settled cycle has no immutable WhatsApp boundaries and cannot be rescanned safely.");
       }
       if (target) {
         selectedCycleData = {
@@ -230,7 +190,7 @@ function createScanManager(
     };
   }
 
-  async function prepare(request = {}, { autoStart = false, errorEvent = "scan:error" } = {}) {
+  async function prepare(request = {}, { autoStart = false } = {}) {
     const jobId = request.runId || request.jobId || crypto.randomUUID();
     if (database.getScanJob(jobId)) return database.getScanJob(jobId);
     try {
@@ -272,11 +232,9 @@ function createScanManager(
       if (autoStart) void run(jobId);
       return job;
     } catch (error) {
-      emit(errorEvent, {
+      emit("scan:error", {
         runId: jobId,
-        message: request.historicalEvidence
-          ? historicalScanError(error)
-          : error instanceof Error && error.message ? error.message : safeErrorMessage(error),
+        message: error instanceof Error && error.message ? error.message : safeErrorMessage(error),
       });
       return null;
     }
@@ -311,144 +269,6 @@ function createScanManager(
     };
   };
 
-  async function finishHistoricalEvidence(job, status, outcomes, expenses) {
-    const history = loadSettlementHistory();
-    const matches = job.request.historyId
-      ? history.filter((record) => record.id === job.request.historyId)
-      : history.filter((record) =>
-        record.startDate === job.request.startDate &&
-        record.endDate === job.request.endDate &&
-        (!record.groupId || record.groupId === job.groupId));
-    if (matches.length !== 1) {
-      throw new Error(
-        matches.length
-          ? "More than one saved settlement matches that cycle. Send its historyId with the scan request."
-          : "No saved settlement history matches that cycle. Refresh History and try again.",
-      );
-    }
-    const existingRecord = matches[0];
-    if (
-      (existingRecord.startDate && existingRecord.startDate !== job.request.startDate) ||
-      (existingRecord.endDate && existingRecord.endDate !== job.request.endDate) ||
-      (existingRecord.groupId && existingRecord.groupId !== job.groupId)
-    ) {
-      throw new Error("The saved settlement does not match the requested WhatsApp cycle.");
-    }
-
-    const existingExpenses = Array.isArray(existingRecord.expenses)
-      ? existingRecord.expenses
-      : [];
-    const existingById = new Map(existingExpenses.map((expense) => [expense.id, expense]));
-    const addedEvidence = [];
-    const refreshedById = new Map();
-    for (const scanned of expenses) {
-      const existing = existingById.get(scanned.id);
-      if (existing) {
-        refreshedById.set(scanned.id, { ...scanned, ...existing, id: existing.id });
-        continue;
-      }
-      const evidence = {
-        ...scanned,
-        isExcluded: true,
-        needsReview: true,
-        historicalEvidence: true,
-        evidenceOnly: true,
-      };
-      refreshedById.set(evidence.id, evidence);
-      addedEvidence.push(evidence);
-    }
-    const mergedExpenses = existingExpenses.map((expense) =>
-      refreshedById.get(expense.id) || expense);
-    for (const evidence of addedEvidence) mergedExpenses.push(evidence);
-
-    const now = new Date().toISOString();
-    const updatedHistoryRecord = {
-      ...existingRecord,
-      expenses: mergedExpenses,
-      evidenceRescan: {
-        scannedAt: now,
-        startDate: job.request.startDate,
-        endDate: job.request.endDate,
-        cycleId: job.selectedCycleData.id,
-        found: expenses.length,
-        added: addedEvidence.length,
-        failed: outcomes.filter((outcome) => outcome.status === "failed").length,
-        settlementPreserved: true,
-      },
-    };
-    const historyIndex = history.indexOf(existingRecord);
-    history[historyIndex] = updatedHistoryRecord;
-    saveSettlementHistory(history);
-
-    const savedCycle = library.loadSettlementCycles().find((cycle) =>
-      cycle.groupId === job.groupId &&
-      cycle.startBoundaryId === job.selectedCycleData.startBoundary?.id);
-    const imagesById = new Map((savedCycle?.images || []).map((image) => [image.id, image]));
-    for (const outcome of outcomes) {
-      if (!outcome.receipt || imagesById.has(outcome.messageId)) continue;
-      imagesById.set(outcome.messageId, {
-        id: outcome.messageId,
-        merchant: outcome.receipt.merchant || "",
-        amount: outcome.receipt.amount || 0,
-        paidBy: outcome.receipt.paidBy || "",
-        status: "excluded",
-        isExcluded: true,
-      });
-    }
-    const cycleRecord = await library.recordSettlementCycle({
-      groupId: job.groupId,
-      groupName: job.groupDisplayName,
-      startDate: job.selectedCycleData.startDate,
-      endDate: job.selectedCycleData.endDate,
-      status: "SETTLED",
-      calculationMessage: job.selectedCycleData.calculationMessage,
-      clearanceMessage: job.selectedCycleData.clearanceMessage,
-      settlementConfirmed: job.selectedCycleData.settlementConfirmed,
-      unclassifiedCount: job.selectedCycleData.unclassifiedCount,
-      startBoundary: job.selectedCycleData.startBoundary,
-      endBoundary: job.selectedCycleData.endBoundary,
-      expectedMedia: Math.max(
-        Number(savedCycle?.completeness?.expected) || 0,
-        job.expectedImages,
-        imagesById.size,
-      ),
-      images: [...imagesById.values()],
-      totals: savedCycle?.totals || null,
-    });
-
-    const reconciliation = reconciliationFor(job.jobId, job.startedAt);
-    const updated = database.updateScanJob(job.jobId, {
-      status,
-      stage: "historical_evidence_saved",
-      message: status === "complete"
-        ? `${addedEvidence.length} new evidence item(s) saved. Settlement values were preserved.`
-        : `${addedEvidence.length} evidence item(s) saved; some images need attention. Settlement values were preserved.`,
-      reconciliation,
-      finishedAt: now,
-      result: {
-        expenses,
-        historyId: updatedHistoryRecord.id,
-        addedEvidence: addedEvidence.length,
-        settlementPreserved: true,
-        cycleRecord,
-      },
-    });
-    publishJob(job.jobId);
-    emit("history:saved", { record: updatedHistoryRecord });
-    emit("history:list", { history });
-    emit("history:scan_cycle_complete", {
-      runId: job.jobId,
-      job: publicJob(updated),
-      historyId: updatedHistoryRecord.id,
-      cycleId: job.selectedCycleData.id,
-      found: expenses.length,
-      added: addedEvidence.length,
-      reconciliation,
-      settlementPreserved: true,
-    });
-    return updated;
-  }
-
   async function finish(job, status) {
     if (status === "cancelled") {
       for (const outcome of database.getScanOutcomes(job.jobId)) {
@@ -482,9 +302,6 @@ function createScanManager(
       .map((outcome) => outcome.receipt)
       .filter(Boolean)
       .sort((a, b) => new Date(a.date) - new Date(b.date));
-    if (job.request.historicalEvidence) {
-      return finishHistoricalEvidence(job, status, outcomes, expenses);
-    }
     const aliases = { ...loadUserConfig().aliases, ...(job.request.aliases || {}) };
     const settlement = calculateSettlement(expenses, aliases);
     const memberBreakdown = memberBreakdownFor(expenses);
@@ -653,25 +470,17 @@ function createScanManager(
       await finish(job, status);
     } catch (error) {
       const status = database.getScanJob(jobId)?.cancelRequested ? "cancelled" : "failed";
-      const message = job.request.historicalEvidence
-        ? historicalScanError(error)
-        : error instanceof Error && error.message
-          ? error.message
-          : safeErrorMessage(error);
       database.updateScanJob(jobId, {
         status,
-        message,
+        message: error.message || "The scan failed.",
         errorCode: processReceipts.classifyScanError(error),
         finishedAt: new Date().toISOString(),
         reconciliation: reconciliationFor(jobId, job.startedAt),
       });
       publishJob(jobId);
-      const errorEvent = job.request.historicalEvidence
-        ? "history:scan_cycle_error"
-        : status === "cancelled" ? "scan:aborted" : "scan:error";
-      emit(errorEvent, {
+      emit(status === "cancelled" ? "scan:aborted" : "scan:error", {
         runId: jobId,
-        message,
+        message: error.message || "The scan failed.",
       });
     } finally {
       activeJobId = null;
@@ -708,24 +517,6 @@ function createScanManager(
     if (job) await run(job.jobId);
   }
 
-  async function scanHistoricalCycle(request = {}) {
-    const runId = request.runId || crypto.randomUUID();
-    emit("history:scan_cycle_started", { runId });
-    const prepared = await prepare(
-      {
-        ...request,
-        runId,
-        historicalEvidence: true,
-        sync: true,
-        useCheckpoint: false,
-      },
-      { errorEvent: "history:scan_cycle_error" },
-    );
-    if (!prepared) return null;
-    await run(prepared.jobId);
-    return database.getScanJob(prepared.jobId);
-  }
-
   function registerSocket(socket) {
     socket.on("scan:prepare", (request) => prepare(request));
     socket.on("scan:start", async (request) => {
@@ -735,7 +526,6 @@ function createScanManager(
     socket.on("scan:run", ({ jobId }) => run(jobId));
     socket.on("scan:retry_failed", ({ jobId }) => run(jobId, { retryFailedOnly: true }));
     socket.on("scan:cancel", ({ jobId } = {}) => cancel(jobId));
-    socket.on("history:scan_cycle", (request) => scanHistoricalCycle(request));
     socket.on("scan:jobs", () => {
       const stored = database.listScanJobs({ limit: 10 });
       const active = stored.find(
@@ -767,7 +557,6 @@ function createScanManager(
     runAndGet,
     cancel,
     resumePending,
-    scanHistoricalCycle,
     registerSocket,
     detectCycles: async (groupId) => detectSettlementCycles ? detectSettlementCycles(groupId) : [],
   };
