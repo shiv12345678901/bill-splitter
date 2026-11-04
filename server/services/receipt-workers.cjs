@@ -411,6 +411,9 @@ module.exports = async function processReceipts({
             perceptualHash,
             transactionDate: ocrResult.transactionDate || null,
             receiptNumber: ocrResult.receiptNumber || null,
+            transferAmount: ocrResult.transferAmount ?? null,
+            transferRecipient: ocrResult.transferRecipient || null,
+            transferReference: ocrResult.transferReference || null,
             thumbnail: `/api/media?id=${encodeURIComponent(thumbId)}&groupId=${encodeURIComponent(thumbGroup)}`,
           };
 

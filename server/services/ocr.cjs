@@ -54,6 +54,16 @@ function cleanAndParseJson(text) {
   const receiptNumber = String(parsed.receiptNumber || parsed.referenceNumber || "")
     .trim()
     .slice(0, 100) || null;
+  const parsedTransferAmount = Number(parsed.transferAmount);
+  const transferAmount = isBankTransfer && Number.isFinite(parsedTransferAmount) && parsedTransferAmount >= 0
+    ? Math.round(parsedTransferAmount * 100) / 100
+    : null;
+  const transferRecipient = isBankTransfer
+    ? String(parsed.transferRecipient || "").trim().slice(0, 150) || null
+    : null;
+  const transferReference = isBankTransfer
+    ? String(parsed.transferReference || receiptNumber || "").trim().slice(0, 150) || null
+    : null;
 
   return {
     merchant: String(
@@ -66,6 +76,9 @@ function cleanAndParseJson(text) {
     isBlurry,
     transactionDate,
     receiptNumber,
+    transferAmount,
+    transferRecipient,
+    transferReference,
   };
 }
 
@@ -108,6 +121,9 @@ Output properties:
 - receiptNumber: The receipt, invoice, order, docket, or transaction reference printed on the receipt, or null when unavailable. Do not invent one.
 - category: One of ["Groceries", "Utilities", "Dining", "Household Supplies", "Other"].
 - isBankTransfer: true if bank transfer confirmation/screenshot, false if retail receipt.
+- transferAmount: For a bank transfer only, the positive amount shown in the transfer confirmation, or null if unreadable. This is evidence metadata and never a grocery expense.
+- transferRecipient: For a bank transfer only, the displayed recipient/payee name, or null if unavailable. Do not invent a person.
+- transferReference: For a bank transfer only, the displayed bank transaction/reference ID, or null if unavailable.
 - confidence: "HIGH" if numbers and store name are crisp and clear; "MEDIUM" if partially wrinkled; "LOW" if blurry/faded.
 - isBlurry: true if image is low-resolution, out of focus, or numbers are hard to read; false otherwise.`;
 
@@ -129,6 +145,9 @@ Output properties:
         ],
       },
       isBankTransfer: { type: "BOOLEAN" },
+      transferAmount: { type: "NUMBER", nullable: true },
+      transferRecipient: { type: "STRING", nullable: true },
+      transferReference: { type: "STRING", nullable: true },
       confidence: { type: "STRING", enum: ["HIGH", "MEDIUM", "LOW"] },
       isBlurry: { type: "BOOLEAN" },
     },
@@ -139,6 +158,9 @@ Output properties:
       "receiptNumber",
       "category",
       "isBankTransfer",
+      "transferAmount",
+      "transferRecipient",
+      "transferReference",
       "confidence",
       "isBlurry",
     ],

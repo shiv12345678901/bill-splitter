@@ -77,6 +77,20 @@ const REQUIRED_COLUMNS = {
     "calculated_at",
     "payment_obligations_status",
   ],
+  whatsapp_bank_transfer_evidence: [
+    "id",
+    "period_id",
+    "source_message_id",
+    "captured_at",
+    "sender_name",
+    "recipient_name",
+    "amount_cents",
+    "transfer_date",
+    "reference_number",
+    "evidence_url",
+    "classification",
+    "review_status",
+  ],
 };
 
 const OPTIONAL_COLUMNS = { periods: ["last_scanned_at"] };
@@ -150,6 +164,42 @@ function validateReceipt(expense, periodId, aliases = {}) {
     // Transfer proofs remain records but never enter the grocery split.
     is_excluded: Boolean(expense.isExcluded || expense.isBankTransfer),
     image_url: null,
+  };
+}
+
+function validateBankTransferEvidence(expense, periodId, aliases = {}) {
+  if (!expense?.isBankTransfer) throw new Error("Evidence is not classified as a bank transfer.");
+  const id = String(expense.id || "").trim();
+  const senderName = normalisePayer(expense.paidBy, aliases);
+  const capturedAt = isoDate(expense.date);
+  const transferDateIso = expense.transactionDate == null || expense.transactionDate === ""
+    ? null
+    : isoDate(expense.transactionDate);
+  const transferDate = transferDateIso ? dateOnly(transferDateIso) : null;
+  const amountCents = expense.transferAmount == null || expense.transferAmount === ""
+    ? null
+    : centsFromAmount(expense.transferAmount);
+  if (!id) throw new Error("Bank evidence is missing its stable WhatsApp message id.");
+  if (!senderName || (Object.keys(aliases).length && !Object.values(aliases).includes(senderName)))
+    throw new Error(`Bank evidence ${id} has an unmapped sender.`);
+  if (!capturedAt) throw new Error(`Bank evidence ${id} has an invalid capture date.`);
+  if (expense.transactionDate && !transferDate)
+    throw new Error(`Bank evidence ${id} has an invalid transfer date.`);
+  if (expense.transferAmount != null && amountCents === null)
+    throw new Error(`Bank evidence ${id} has an invalid transfer amount.`);
+  return {
+    id,
+    period_id: String(periodId),
+    source_message_id: id,
+    captured_at: capturedAt,
+    sender_name: senderName,
+    recipient_name: String(expense.transferRecipient || "").trim().slice(0, 150) || null,
+    amount_cents: amountCents,
+    transfer_date: transferDate,
+    reference_number: String(expense.transferReference || expense.receiptNumber || "").trim().slice(0, 150) || null,
+    evidence_url: null,
+    classification: "bank_transfer",
+    review_status: "pending",
   };
 }
 
@@ -236,6 +286,10 @@ function extensionFor(mimetype, fileName = "") {
 
 function buildEvidencePath(periodId, receiptId, mimetype, fileName) {
   return `${safeObjectName(periodId)}/${safeObjectName(receiptId)}.${extensionFor(mimetype, fileName)}`;
+}
+
+function buildBankEvidencePath(periodId, messageId, mimetype, fileName) {
+  return `${safeObjectName(periodId)}/bank-transfers/${safeObjectName(messageId)}.${extensionFor(mimetype, fileName)}`;
 }
 
 function supabaseAuthHeaders(key) {
@@ -393,7 +447,7 @@ class SupabaseRestClient {
     const bucket = await this.request("storage/v1", "bucket/bill-evidence");
     if (!bucket || bucket.public !== false) throw new Error("bill-evidence must be a private Storage bucket.");
     const capabilities = await this.rpc("instabox_worker_capabilities", {});
-    if (capabilities?.version !== 5) throw new Error("Automatic cycle rollover safeguards migration version 5 is required.");
+    if (capabilities?.version !== 6) throw new Error("WhatsApp bank-evidence safeguards migration version 6 is required.");
     this.writeEnabled = capabilities.writes_enabled === true;
     this.columns = verified;
     return verified;
@@ -444,7 +498,7 @@ function createSupabaseWorker({
   settlementIdMode = process.env.SUPABASE_SETTLEMENT_ID_MODE || "existing-only",
   // Explicit seam for a reviewed Muse schema/rule mapping. No extra columns
   // may be written without supplying and reviewing a replacement adapter.
-  adapter = { validateReceipt, settlementForReceipts },
+  adapter = { validateReceipt, validateBankTransferEvidence, settlementForReceipts },
   localDatabase = database,
   imageLoader = localImageForLibrary,
   contract = { approved: false, reason: "Missing reviewed production contract." },
@@ -604,6 +658,38 @@ function createSupabaseWorker({
     return { inserted: Boolean(inserted?.length), id: row.id };
   }
 
+  async function persistBankEvidence(expense, periodId, lease) {
+    lease.assert();
+    const config = loadUserConfig ? loadUserConfig() : {};
+    const row = adapter.validateBankTransferEvidence(expense, periodId, config.aliases || {});
+    if (contract.approved && !contract.value.members.includes(row.sender_name)) {
+      throw new Error("Bank evidence sender is not in reviewed household membership.");
+    }
+    const existingRows = await client.select("whatsapp_bank_transfer_evidence", {
+      select: "id,period_id,source_message_id,evidence_url,review_status",
+      id: encodeFilter("eq", row.id),
+      limit: 1,
+    });
+    const existing = Array.isArray(existingRows) ? existingRows[0] : null;
+    if (existing && String(existing.period_id) !== String(periodId)) {
+      throw new Error(`Bank evidence ${row.id} belongs to another period.`);
+    }
+    if (existing?.source_message_id && existing.source_message_id !== row.id) {
+      throw new Error(`Bank evidence ${row.id} has conflicting WhatsApp source identity.`);
+    }
+    if (existing) return { inserted: false, id: row.id, row: null };
+
+    const image = await imageLoader(expense);
+    if (!image) throw new Error(`Bank evidence ${row.id} has no cached image; retry the scan before publishing.`);
+    const objectPath = buildBankEvidencePath(periodId, row.id, image.mimetype, image.fileName);
+    await client.upload(objectPath, image.buffer, image.mimetype);
+    row.evidence_url = `storage://bill-evidence/${objectPath}`;
+    lease.assert();
+    if (transactionalWrites) return { inserted: true, id: row.id, row };
+    const inserted = await client.insert("whatsapp_bank_transfer_evidence", row, { ignoreDuplicates: true });
+    return { inserted: Boolean(inserted?.length), id: row.id };
+  }
+
   async function syncReceipts(expenses, periodId, lease) {
     const result = { inserted: 0, existing: 0, invalid: [], rows: [] };
     const seen = new Set();
@@ -622,6 +708,28 @@ function createSupabaseWorker({
         if (outcome.row) result.rows.push(outcome.row);
         if (outcome.inserted) result.inserted++;
         else result.existing++;
+    }
+    return result;
+  }
+
+  async function syncBankEvidence(expenses, periodId, lease) {
+    const result = { inserted: 0, existing: 0, invalid: [], rows: [] };
+    const seen = new Set();
+    for (const expense of expenses || []) {
+      const id = String(expense?.id || "");
+      if (seen.has(id)) continue;
+      seen.add(id);
+      try {
+        const outcome = await persistBankEvidence(expense, periodId, lease);
+        if (outcome.row) result.rows.push(outcome.row);
+        if (outcome.inserted) result.inserted++;
+        else result.existing++;
+      } catch (error) {
+        if (/belongs to another period|conflicting WhatsApp source identity|no cached image|Supabase|Lost the lease/i.test(error.message)) {
+          throw error;
+        }
+        result.invalid.push({ id, error: error.message });
+      }
     }
     return result;
   }
@@ -792,11 +900,15 @@ function createSupabaseWorker({
     }
     await updateJob(job, {
       stage: "saving_receipts",
-      stage_message: `Validating and saving ${expenses.length} receipt result(s)…`,
+      stage_message: `Validating and saving ${expenses.length} receipt and bank-evidence result(s)…`,
     });
-    const saved = await syncReceipts(expenses, period.id, lease);
+    const receiptExpenses = expenses.filter((expense) => !expense.isBankTransfer);
+    const bankExpenses = expenses.filter((expense) => expense.isBankTransfer);
+    const saved = await syncReceipts(receiptExpenses, period.id, lease);
+    const savedBankEvidence = await syncBankEvidence(bankExpenses, period.id, lease);
     if (transactionalWrites) {
-      if (saved.invalid.length || localJob.status !== "complete") throw new Error("Scan is incomplete or failed validation; saved local results were retained for retry.");
+      if (saved.invalid.length || savedBankEvidence.invalid.length || localJob.status !== "complete")
+        throw new Error("Scan is incomplete or failed validation; saved local results were retained for retry.");
       if (!contract.approved) throw new Error("Production writes require a reviewed contract.");
       lease.assert();
       const cycle = localJob.selectedCycleData;
@@ -810,12 +922,25 @@ function createSupabaseWorker({
         p_clearance_message: cycle.clearanceMessage,
       });
       lease.assert();
+      if (savedBankEvidence.rows.length) {
+        await client.rpc("record_whatsapp_bank_evidence", {
+          p_job_id: String(job.id),
+          p_worker_id: workerId,
+          p_period_id: String(period.id),
+          p_evidence: savedBankEvidence.rows,
+        });
+        lease.assert();
+      }
       const result = await client.rpc("finalize_sync_request", {
         p_job_id: String(job.id), p_worker_id: workerId, p_period_id: String(period.id),
         p_receipts: saved.rows, p_members: contract.value.members,
         p_rounding: contract.value.shareRounding, p_settlement_id_mode: contract.value.settlementIdMode,
       });
-      return { finalized: true, resultSummary: result.result_summary };
+      return {
+        finalized: true,
+        bankEvidence: savedBankEvidence,
+        resultSummary: result.result_summary,
+      };
     }
     const allReceipts = await allPeriodReceipts(period.id);
     const config = loadUserConfig ? loadUserConfig() : {};
@@ -833,12 +958,13 @@ function createSupabaseWorker({
     const invalidText = saved.invalid.length
       ? ` ${saved.invalid.length} result(s) were rejected by validation.`
       : "";
-    if (saved.invalid.length || (localJob.reconciliation?.failed || 0) || (localJob.reconciliation?.queued || 0))
-      throw new Error(`Some receipts require attention. ${saved.invalid.length} validation rejection(s), ${localJob.reconciliation?.failed || 0} failed image(s). Completed receipts were preserved.`);
+    if (saved.invalid.length || savedBankEvidence.invalid.length || (localJob.reconciliation?.failed || 0) || (localJob.reconciliation?.queued || 0))
+      throw new Error(`Some receipts require attention. ${saved.invalid.length + savedBankEvidence.invalid.length} validation rejection(s), ${localJob.reconciliation?.failed || 0} failed image(s). Completed records were preserved.`);
     return {
       saved,
+      savedBankEvidence,
       computed,
-      resultSummary: `Sync complete: ${saved.inserted} new receipt(s), ${computed.receiptCount} receipt(s) in the period.${reviewText}${invalidText}`,
+      resultSummary: `Sync complete: ${saved.inserted} new receipt(s), ${savedBankEvidence.inserted} new bank-evidence item(s), ${computed.receiptCount} receipt(s) in the period.${reviewText}${invalidText}`,
     };
   }
 
@@ -934,7 +1060,7 @@ function createSupabaseWorker({
     }
     if (mode === LIVE_MODE && schemaVerified && liveWritesApproved) {
       const capabilities = await client.rpc("instabox_worker_capabilities", {});
-      client.writeEnabled = capabilities?.version === 5 && capabilities.writes_enabled === true;
+      client.writeEnabled = capabilities?.version === 6 && capabilities.writes_enabled === true;
     }
     if (mode !== LIVE_MODE) {
       if (!guardLogged) {
@@ -1011,6 +1137,7 @@ module.exports = {
   createConfiguredSupabaseWorker,
   centsFromAmount,
   validateReceipt,
+  validateBankTransferEvidence,
   assertReceiptCycleAssignment,
   settlementForReceipts,
 };

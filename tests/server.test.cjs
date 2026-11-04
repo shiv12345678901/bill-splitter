@@ -843,10 +843,11 @@ test("a reconciled partial job does not restart automatically", async () => {
   assert.equal(database.getScanJob(jobId).status, "partial");
 });
 test("OCR parsing excludes bank transfers and marks unreadable totals", () => {
-  assert.equal(
-    cleanAndParseJson('{"amount":100,"isBankTransfer":true}').amount,
-    0,
-  );
+  const transfer = cleanAndParseJson('{"amount":100,"isBankTransfer":true,"transferAmount":42.55,"transferRecipient":"Jamie","transferReference":"OSKO-123"}');
+  assert.equal(transfer.amount, 0);
+  assert.equal(transfer.transferAmount, 42.55);
+  assert.equal(transfer.transferRecipient, "Jamie");
+  assert.equal(transfer.transferReference, "OSKO-123");
   assert.equal(
     cleanAndParseJson('```json\n{"amount":0}\n```').confidence,
     "LOW",

@@ -9,6 +9,7 @@ process.env.SPLITMATE_DATA_DIR = workerTestData;
 const {
   centsFromAmount,
   validateReceipt,
+  validateBankTransferEvidence,
   assertReceiptCycleAssignment,
   settlementForReceipts,
   SupabaseRestClient,
@@ -60,6 +61,37 @@ test("validation rejects impossible calendar dates, absent amounts and unknown p
   assert.throws(() => validateReceipt({ ...receipt, date: "2026-02-30" }, "p"), /invalid date/);
   assert.throws(() => validateReceipt(receipt, "p", { sender: "Jamie" }), /unmapped payer/);
   assert.equal(validateReceipt({ ...receipt, paidBy: "sender" }, "p", { sender: "Jamie" }).payer, "Jamie");
+});
+
+test("bank-transfer evidence is classified separately without becoming a bill or verified payment", () => {
+  const row = validateBankTransferEvidence({
+    id: "true_transfer-message",
+    date: "2026-10-20T01:02:03.000Z",
+    paidBy: "sender",
+    isBankTransfer: true,
+    transferAmount: 42.55,
+    transferRecipient: "Jamie",
+    transferReference: "OSKO-123",
+    transactionDate: "2026-10-20",
+  }, "period_2026-10-01", { sender: "Alex" });
+  assert.deepEqual(row, {
+    id: "true_transfer-message",
+    period_id: "period_2026-10-01",
+    source_message_id: "true_transfer-message",
+    captured_at: "2026-10-20T01:02:03.000Z",
+    sender_name: "Alex",
+    recipient_name: "Jamie",
+    amount_cents: 4255,
+    transfer_date: "2026-10-20",
+    reference_number: "OSKO-123",
+    evidence_url: null,
+    classification: "bank_transfer",
+    review_status: "pending",
+  });
+  assert.throws(() => validateBankTransferEvidence({ ...row, isBankTransfer: false }, "p"), /not classified/i);
+  assert.throws(() => validateBankTransferEvidence({
+    ...row, isBankTransfer: true, paidBy: "Alex", date: row.captured_at, transactionDate: "2026-02-30",
+  }, "p"), /invalid transfer date/i);
 });
 
 test("immutable boundaries separate receipts on the same Sydney clearance date", () => {
@@ -370,7 +402,7 @@ test("transactional publishing records pending-cycle metadata before finalizing 
         endDate: null,
         startBoundary,
       }],
-      prepare: async () => ({ jobId: "local", expectedImages: 1, status: "queued" }),
+      prepare: async () => ({ jobId: "local", expectedImages: 2, status: "queued" }),
       runAndGet: async () => {},
     },
     localDatabase: {
@@ -386,8 +418,19 @@ test("transactional publishing records pending-cycle metadata before finalizing 
           calculationMessage,
           clearanceMessage: null,
         },
-        candidates: [{ id: "receipt-1", timestamp: receiptTimestamp }],
-        result: { expenses: [{ id: "receipt-1", date: new Date(receiptTimestamp * 1000).toISOString(), paidBy: "Alex", merchant: "Market", amount: 10, category: "Groceries" }] },
+        candidates: [
+          { id: "receipt-1", timestamp: receiptTimestamp },
+          { id: "bank-1", timestamp: receiptTimestamp + 1 },
+        ],
+        result: { expenses: [
+          { id: "receipt-1", date: new Date(receiptTimestamp * 1000).toISOString(), paidBy: "Alex", merchant: "Market", amount: 10, category: "Groceries" },
+          {
+            id: "bank-1", date: new Date((receiptTimestamp + 1) * 1000).toISOString(), paidBy: "Jamie",
+            merchant: "Bank Transfer", amount: 0, category: "Other", isBankTransfer: true,
+            isExcluded: true, needsReview: true, transferAmount: 42.55,
+            transferRecipient: "Alex", transferReference: "OSKO-123", transactionDate: "2026-10-02",
+          },
+        ] },
         reconciliation: { failed: 0, queued: 0 },
       }),
     },
@@ -406,10 +449,16 @@ test("transactional publishing records pending-cycle metadata before finalizing 
   });
   const result = await worker.processClaimedJob({ id: "11111111-1111-4111-8111-111111111111" }, { assert() {} });
   assert.equal(result.finalized, true);
-  assert.deepEqual(rpcCalls.map((call) => call.name), ["record_period_cycle_state", "finalize_sync_request"]);
+  assert.deepEqual(rpcCalls.map((call) => call.name), [
+    "record_period_cycle_state", "record_whatsapp_bank_evidence", "finalize_sync_request",
+  ]);
   assert.equal(rpcCalls[0].body.p_cycle_status, "PENDING_SETTLEMENT");
   assert.deepEqual(rpcCalls[0].body.p_calculation_message, calculationMessage);
   assert.equal(rpcCalls[0].body.p_clearance_message, null);
+  assert.equal(rpcCalls[1].body.p_evidence[0].id, "bank-1");
+  assert.equal(rpcCalls[1].body.p_evidence[0].amount_cents, 4255);
+  assert.equal(rpcCalls[1].body.p_evidence[0].review_status, "pending");
+  assert.deepEqual(rpcCalls[2].body.p_receipts.map((row) => row.id), ["receipt-1"]);
 });
 
 test("settlement totals use cents, stable members, and exclude transfer proofs", () => {
@@ -701,7 +750,7 @@ test("a lost job lease stops processing before receipt writes", async () => {
     transactionalWrites: false,
     client: {
       verifySchema: async () => {},
-      rpc: async (name) => name === "instabox_worker_capabilities" ? { version: 5, writes_enabled: true } : [{ id: "recovered", lease_expires_at: new Date(Date.now() + 60000).toISOString() }],
+      rpc: async (name) => name === "instabox_worker_capabilities" ? { version: 6, writes_enabled: true } : [{ id: "recovered", lease_expires_at: new Date(Date.now() + 60000).toISOString() }],
       select: async () => [{ id: "p", status: "CURRENT", start_date: "2026-10-01", end_date: "2026-10-31" }],
       update: async () => [],
       insert: async () => { throw new Error("no insert should occur after lease loss"); },
