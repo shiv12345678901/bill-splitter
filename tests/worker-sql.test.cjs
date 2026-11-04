@@ -12,13 +12,6 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
   try {
     await db.exec(`
       create role anon; create role authenticated; create role service_role;
-      create schema auth;
-      create function auth.uid() returns uuid language sql stable as $$
-        select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid
-      $$;
-      create function auth.jwt() returns jsonb language sql stable as $$
-        select jsonb_build_object('email',coalesce(current_setting('request.jwt.claim.email',true),''))
-      $$;
       create schema storage;
       create table storage.buckets(id text primary key,name text,public boolean);
       create table storage.objects(id text primary key,bucket_id text);
@@ -54,7 +47,7 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     assert.equal((await q("select * from claim_sync_request('a')")).length, 0);
     assert.equal((await q("select total_cents from periods where id='p'"))[0].total_cents, 999);
     await db.exec("update instabox_worker_control set writes_enabled=true");
-    assert.equal((await q("select instabox_worker_capabilities() as value"))[0].value.version, 6);
+    assert.equal((await q("select instabox_worker_capabilities() as value"))[0].value.version, 5);
     assert.equal((await q("select verification_status from bank_transfer_receipts"))[0].verification_status, null);
     assert.equal((await q("select * from claim_sync_request('a')")).length, 1);
     assert.equal((await q("select * from claim_sync_request('b')")).length, 0);
@@ -150,56 +143,10 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     assert.equal((await q("select owes from settlements where id='settlement_2026-10-31_current'"))[0].owes, null);
     assert.equal((await q("select has_function_privilege('authenticated','public.rollover_settlement_period(uuid,text,text,date,jsonb,text,text,date,jsonb,text,jsonb,text[])','execute') as allowed"))[0].allowed, false);
     assert.equal((await q("select has_function_privilege('service_role','public.rollover_settlement_period(uuid,text,text,date,jsonb,text,text,date,jsonb,text,jsonb,text[])','execute') as allowed"))[0].allowed, true);
-    const historicalStart = Math.floor(new Date("2026-08-31T13:59:59Z").getTime() / 1000);
-    const historicalEnd = Math.floor(new Date("2026-09-30T13:59:59Z").getTime() / 1000);
-    const historicalStartBoundary = { id: "historical-start", timestamp: historicalStart, source: "configured", confidence: "HIGH" };
-    const historicalEndBoundary = { id: "historical-clearance", timestamp: historicalEnd, source: "marker", confidence: "HIGH" };
-    await q("update periods set whatsapp_cycle_status='SETTLED',whatsapp_start_boundary=$1::jsonb,whatsapp_clearance_message=$2::jsonb where id='historical'", [JSON.stringify(historicalStartBoundary), JSON.stringify(historicalEndBoundary)]);
-    await q("insert into settlements(id,period_id,total_cents,per_person_cents,member_totals,receipt_count,calculated_at,owes,payment_obligations_status) values('settlement_2026-09-01_closed','historical',500,125,'{\"Alex\":500}',1,now(),'{\"Jamie\":125}','REVIEWED')");
-    const historicalFinanceBefore = (await q("select to_jsonb(p) period,(select jsonb_agg(to_jsonb(s)) from settlements s where s.period_id=p.id) settlements from periods p where id='historical'"))[0];
-
-    await db.exec("set role authenticated");
-    await q("select set_config('request.jwt.claim.sub','99999999-9999-4999-8999-999999999999',false)");
-    await q("select set_config('request.jwt.claim.email','outsider@example.com',false)");
-    await assert.rejects(() => q("select * from request_historical_rescan('historical')"), /authorization/i);
-    await q("select set_config('request.jwt.claim.email','shiva@billforus.netlify.app',false)");
-    const historicalRequest = await q("select * from request_historical_rescan('historical')");
-    const duplicateRequest = await q("select * from request_historical_rescan('historical')");
-    assert.equal(historicalRequest[0].id, duplicateRequest[0].id);
-    assert.equal(historicalRequest[0].job_type, "historical_rescan");
-    await assert.rejects(
-      () => db.exec("insert into sync_requests(id,requested_by,status,job_type,period_id,requested_by_user) values('66666666-6666-4666-8666-666666666666','netlify-app','pending','historical_rescan','historical','99999999-9999-4999-8999-999999999999')"),
-      /row-level security/i,
-    );
-    await db.exec("reset role");
-
-    const claimedHistorical = await q("select * from claim_sync_request('historical-worker')");
-    assert.equal(claimedHistorical[0].id, historicalRequest[0].id);
-    const historicalEvidence = [{
-      id: "historical-bank-proof", period_id: "historical", captured_at: "2026-09-15T01:00:00Z",
-      merchant: "Bank Transfer", amount_cents: 0, payer: "Alex", category: "Other", date: "2026-09-15",
-      is_excluded: true, evidence_only: true, needs_review: true,
-      image_url: "storage://bill-evidence/historical/historical-bank-proof.jpg",
-    }];
-    const finalizeHistorical = () => q(
-      "select finalize_historical_rescan($1::uuid,'historical-worker','historical','historical-start','historical-clearance',$2::jsonb,array['Alex','Jamie','Morgan','Taylor'])",
-      [historicalRequest[0].id, JSON.stringify(historicalEvidence)],
-    );
-    await finalizeHistorical();
-    await finalizeHistorical();
-    assert.deepEqual(await q("select is_excluded,evidence_only,needs_review from receipts where id='historical-bank-proof'"), [{
-      is_excluded: true, evidence_only: true, needs_review: true,
-    }]);
-    const historicalFinanceAfter = (await q("select to_jsonb(p) period,(select jsonb_agg(to_jsonb(s)) from settlements s where s.period_id=p.id) settlements from periods p where id='historical'"))[0];
-    assert.deepEqual(historicalFinanceAfter, historicalFinanceBefore);
-    assert.equal((await q("select count(*)::integer n from instabox_historical_rescan_audit"))[0].n, 1);
-    assert.equal((await q("select has_function_privilege('authenticated','public.request_historical_rescan(text)','execute') allowed"))[0].allowed, true);
-    assert.equal((await q("select has_function_privilege('authenticated','public.finalize_historical_rescan(uuid,text,text,text,text,jsonb,text[])','execute') allowed"))[0].allowed, false);
-    assert.equal((await q("select has_function_privilege('service_role','public.finalize_historical_rescan(uuid,text,text,text,text,jsonb,text[])','execute') allowed"))[0].allowed, true);
     await db.exec("set role authenticated");
     await assert.rejects(() => db.exec("insert into sync_requests(id,requested_by,status,worker_id) values('55555555-5555-4555-8555-555555555555','netlify-app','processing','evil')"), /row-level security/);
     await db.exec("insert into sync_requests(id,requested_by,status) values('44444444-4444-4444-8444-444444444444','netlify-app','pending')");
-    assert.equal((await q("select count(*)::integer n from receipts"))[0].n, 4);
+    assert.equal((await q("select count(*)::integer n from receipts"))[0].n, 3);
     await db.exec("reset role");
   } finally { await db.close(); }
 });

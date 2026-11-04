@@ -135,8 +135,6 @@ The local app exposes a separate, evidence-only History operation for rescanning
 
 The UI can listen for `history:scan_cycle_started`, the existing `scan:progress` and `scan:job` updates, then `history:scan_cycle_complete` or `history:scan_cycle_error`. Newly found receipts and bank-transfer proof are saved to the selected History record as `isExcluded`, `needsReview`, and `evidenceOnly`. Existing edited expenses win on ID collisions. The operation never recalculates or replaces the settled record's totals, balances, transfers, payment state, or `owes` values.
 
-The production Supabase/InstaBox equivalent uses a separate `historical_rescan` queue type and the guarded RPCs documented in `docs/HISTORICAL_RESCAN_CONTRACT.md`. It accepts only an authoritative period ID, scans only media not already represented by a stable WhatsApp source ID, and atomically inserts review-only excluded evidence without refreshing period or settlement aggregates.
-
 ## Design rationale
 
 The household and period remain visible across Overview, Receipts and Payment plan. History and configuration stay separate. Receipt review uses a list/detail pattern; errors appear beside the workflow they affect. Short transitions respect reduced-motion preferences.

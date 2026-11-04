@@ -10,7 +10,6 @@ const {
   centsFromAmount,
   validateReceipt,
   assertReceiptCycleAssignment,
-  validateHistoricalPeriodCycle,
   settlementForReceipts,
   SupabaseRestClient,
   resolveSupabaseServerKey,
@@ -173,210 +172,6 @@ test("cycle assignment is retry-safe and rejects missing or ambiguous evidence",
     ...input,
     scanJob: { ...scanJob, candidates: [...candidates, { id: ids[0], timestamp: receiptTimestamp + 99 }] },
   }), /conflicting immutable/i);
-});
-
-test("historical periods require one exact verified settled WhatsApp cycle", () => {
-  const startBoundary = {
-    id: "historical-start",
-    timestamp: timestamp("2026-08-31T13:59:59Z"),
-    source: "configured",
-    confidence: "HIGH",
-  };
-  const endBoundary = {
-    id: "historical-clearance",
-    timestamp: timestamp("2026-09-30T13:59:59Z"),
-    source: "marker",
-    confidence: "HIGH",
-  };
-  const period = {
-    id: "period_2026-09-01",
-    status: "CLOSED",
-    start_date: "2026-09-01",
-    end_date: "2026-09-30",
-    whatsapp_cycle_status: "SETTLED",
-    whatsapp_start_boundary: startBoundary,
-    whatsapp_clearance_message: endBoundary,
-  };
-  const cycle = {
-    id: "cycle_hist_1",
-    status: "SETTLED",
-    settlementConfirmed: true,
-    startDate: period.start_date,
-    endDate: period.end_date,
-    startBoundary,
-    endBoundary,
-    clearanceMessage: endBoundary,
-  };
-  const cycles = [cycle];
-  cycles.snapshot = { retrievalVerified: true };
-  assert.equal(validateHistoricalPeriodCycle(period, cycles), cycle);
-
-  const unverified = [cycle];
-  unverified.snapshot = { retrievalVerified: false };
-  assert.throws(() => validateHistoricalPeriodCycle(period, unverified), /unverified/i);
-  assert.throws(
-    () => validateHistoricalPeriodCycle({ ...period, whatsapp_start_boundary: null }, cycles),
-    /missing verified immutable/i,
-  );
-  const conflicting = [cycle, { ...cycle, id: "duplicate-cycle" }];
-  conflicting.snapshot = { retrievalVerified: true };
-  assert.throws(() => validateHistoricalPeriodCycle(period, conflicting), /exactly one/i);
-});
-
-function historicalWorkerFixture({ crossPeriod = false, empty = false, failFirstDetection = false } = {}) {
-  const startBoundary = {
-    id: "historical-start",
-    timestamp: timestamp("2026-08-31T13:59:59Z"),
-    source: "configured",
-    confidence: "HIGH",
-  };
-  const endBoundary = {
-    id: "historical-clearance",
-    timestamp: timestamp("2026-09-30T13:59:59Z"),
-    source: "marker",
-    confidence: "HIGH",
-  };
-  const existingId = "historical-existing";
-  const newId = "historical-bank-proof";
-  const newTimestamp = timestamp("2026-09-15T01:00:00Z");
-  const cycle = {
-    id: "cycle_hist_1",
-    status: "SETTLED",
-    settlementConfirmed: true,
-    startDate: "2026-09-01",
-    endDate: "2026-09-30",
-    startBoundary,
-    endBoundary,
-    clearanceMessage: endBoundary,
-    groceryMessages: empty ? [] : [{ id: existingId, timestamp: newTimestamp - 60, author: "sender" }],
-    paymentMessages: empty ? [] : [{ id: newId, timestamp: newTimestamp, author: "sender" }],
-    unclassifiedMessages: [],
-  };
-  const cycles = [cycle];
-  cycles.snapshot = { retrievalVerified: true };
-  const period = {
-    id: "historical-period",
-    status: "CLOSED",
-    start_date: cycle.startDate,
-    end_date: cycle.endDate,
-    whatsapp_cycle_status: "SETTLED",
-    whatsapp_start_boundary: startBoundary,
-    whatsapp_clearance_message: endBoundary,
-  };
-  let preparedContext;
-  let detections = 0;
-  const rpcCalls = [];
-  const tableWrites = [];
-  const localJob = {
-    status: "complete",
-    selectedCycleData: cycle,
-    candidates: empty ? [] : [{ id: newId, timestamp: newTimestamp }],
-    result: {
-      expenses: empty ? [] : [{
-        id: newId,
-        date: new Date(newTimestamp * 1000).toISOString(),
-        paidBy: "Alex",
-        merchant: "Bank Transfer",
-        amount: 0,
-        category: "Other",
-        isBankTransfer: true,
-        isExcluded: true,
-      }],
-    },
-    reconciliation: { failed: 0, queued: 0 },
-  };
-  const worker = createSupabaseWorker({
-    mode: "dry-run",
-    transactionalWrites: true,
-    workerId: "historical-worker",
-    groupId: "household@g.us",
-    contract: {
-      approved: true,
-      value: {
-        members: ["Alex", "Jamie", "Morgan", "Taylor"], aliases: { sender: "Alex" },
-        shareRounding: "round", settlementIdMode: "existing-only",
-        zeroAmountPolicy: "reject", dateMode: "Australia/Sydney",
-      },
-    },
-    loadUserConfig: () => ({ aliases: { sender: "Alex" } }),
-    scanManager: {
-      detectCycles: async () => {
-        detections++;
-        if (failFirstDetection && detections === 1) throw new Error("WhatsApp disconnected during history retrieval.");
-        return cycles;
-      },
-      prepare: async (context) => {
-        preparedContext = context;
-        return { jobId: "local-historical", expectedImages: empty ? 0 : 1, status: "queued" };
-      },
-      runAndGet: async () => localJob,
-    },
-    localDatabase: { getScanJob: () => localJob },
-    imageLoader: async () => ({ buffer: Buffer.from("bank-proof"), mimetype: "image/jpeg" }),
-    client: {
-      columns: Object.fromEntries(Object.entries(REQUIRED_COLUMNS).map(([table, columns]) => [table, new Set(columns)])),
-      select: async (table, query = {}) => {
-        if (table === "periods") return [period];
-        if (table === "receipts" && query.id) return [];
-        if (table === "receipts" && Number(query.offset || 0) === 0 && !empty) return [{
-          id: existingId,
-          source_provider: "whatsapp",
-          source_message_id: existingId,
-          period_id: crossPeriod ? "another-period" : period.id,
-        }];
-        return [];
-      },
-      update: async (table, filters, body) => {
-        tableWrites.push({ table, body });
-        return table === "sync_requests" ? [{ id: "historical-job", ...body }] : [];
-      },
-      upload: async () => {},
-      rpc: async (name, body) => {
-        rpcCalls.push({ name, body });
-        return { result_summary: "Historical rescan complete" };
-      },
-    },
-  });
-  return { worker, prepared: () => preparedContext, rpcCalls, tableWrites };
-}
-
-test("historical queue scans only new media and publishes review-only evidence", async () => {
-  const fixture = historicalWorkerFixture();
-  const result = await fixture.worker.processClaimedJob({
-    id: "11111111-1111-4111-8111-111111111111",
-    job_type: "historical_rescan",
-    period_id: "historical-period",
-  }, { assert() {} });
-  assert.equal(result.historical, true);
-  assert.deepEqual(fixture.prepared().excludeMessageIds, ["historical-existing"]);
-  assert.equal(fixture.prepared().historicalQueueEvidence, true);
-  assert.deepEqual(fixture.rpcCalls.map((call) => call.name), ["finalize_historical_rescan"]);
-  const row = fixture.rpcCalls[0].body.p_receipts[0];
-  assert.equal(row.is_excluded, true);
-  assert.equal(row.evidence_only, true);
-  assert.equal(row.needs_review, true);
-  assert.equal(row.amount_cents, 0);
-  assert.equal(fixture.tableWrites.some((write) => ["periods", "settlements"].includes(write.table)), false);
-});
-
-test("historical queue rejects cross-period evidence and can retry after reconnect", async () => {
-  const crossPeriod = historicalWorkerFixture({ crossPeriod: true });
-  await assert.rejects(() => crossPeriod.worker.processClaimedJob({
-    id: "22222222-2222-4222-8222-222222222222",
-    job_type: "historical_rescan",
-    period_id: "historical-period",
-  }, { assert() {} }), /already assigned to another period/i);
-
-  const reconnect = historicalWorkerFixture({ empty: true, failFirstDetection: true });
-  const job = {
-    id: "33333333-3333-4333-8333-333333333333",
-    job_type: "historical_rescan",
-    period_id: "historical-period",
-  };
-  await assert.rejects(() => reconnect.worker.processClaimedJob(job, { assert() {} }), /disconnected/i);
-  const recovered = await reconnect.worker.processClaimedJob(job, { assert() {} });
-  assert.equal(recovered.historical, true);
-  assert.deepEqual(reconnect.rpcCalls[0].body.p_receipts, []);
 });
 
 function fakeIntegration({ failInsert = false, periodStatus = "CURRENT" } = {}) {
@@ -850,10 +645,12 @@ test("modern Supabase secret keys take precedence and are redacted from failures
 });
 
 test("Supabase worker requires the additive lease columns", () => {
-  for (const column of [
-    "worker_id", "lease_expires_at", "attempt_count", "claimed_at",
-    "job_type", "period_id", "requested_by_user",
-  ]) assert.ok(REQUIRED_COLUMNS.sync_requests.includes(column), column);
+  assert.deepEqual(REQUIRED_COLUMNS.sync_requests.slice(-4), [
+    "worker_id",
+    "lease_expires_at",
+    "attempt_count",
+    "claimed_at",
+  ]);
 });
 
 test("dry-run verifies configuration without claiming or writing jobs", async () => {
@@ -904,7 +701,7 @@ test("a lost job lease stops processing before receipt writes", async () => {
     transactionalWrites: false,
     client: {
       verifySchema: async () => {},
-      rpc: async (name) => name === "instabox_worker_capabilities" ? { version: 6, writes_enabled: true } : [{ id: "recovered", lease_expires_at: new Date(Date.now() + 60000).toISOString() }],
+      rpc: async (name) => name === "instabox_worker_capabilities" ? { version: 5, writes_enabled: true } : [{ id: "recovered", lease_expires_at: new Date(Date.now() + 60000).toISOString() }],
       select: async () => [{ id: "p", status: "CURRENT", start_date: "2026-10-01", end_date: "2026-10-31" }],
       update: async () => [],
       insert: async () => { throw new Error("no insert should occur after lease loss"); },

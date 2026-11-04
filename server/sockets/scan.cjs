@@ -101,10 +101,8 @@ function createScanManager(
       useCheckpoint = false,
       sync = false,
       historicalEvidence = false,
-      historicalQueueEvidence = false,
     } = request;
-    const historicalCycle = historicalEvidence || historicalQueueEvidence;
-    if (historicalCycle && !groupId)
+    if (historicalEvidence && !groupId)
       throw new Error("Choose the WhatsApp group for this cycle scan.");
     if (!ISO_DATE.test(startDate || "") || !ISO_DATE.test(endDate || "") || startDate > endDate) {
       throw new Error("Choose a valid start and end date for the cycle scan.");
@@ -127,21 +125,21 @@ function createScanManager(
       if (sync && messageFreshness?.retrievalVerified !== true) {
         throw new Error("WhatsApp recent-message retrieval is unverified; refusing to finalize this scan.");
       }
-      const historicalMatches = historicalCycle
+      const historicalMatches = historicalEvidence
         ? cycles.filter((cycle) =>
           cycle.status === "SETTLED" &&
           cycle.startDate === startDate &&
           cycle.endDate === endDate &&
           (!cycleId || cycle.id === cycleId))
         : [];
-      if (historicalCycle && historicalMatches.length !== 1) {
+      if (historicalEvidence && historicalMatches.length !== 1) {
         throw new Error(
           historicalMatches.length
             ? "That date range matches more than one settled WhatsApp cycle. Select the cycle by its saved ID."
             : "No settled WhatsApp cycle exactly matches that start and end date.",
         );
       }
-      const target = historicalCycle
+      const target = historicalEvidence
         ? historicalMatches[0]
         : cycleId
           ? cycles.find((cycle) => cycle.id === cycleId)
@@ -156,7 +154,7 @@ function createScanManager(
       if (cycleBoundaryId && target.startBoundary?.id !== cycleBoundaryId) {
         throw new Error("The WhatsApp cycle boundary changed during discovery; refusing an ambiguous scan.");
       }
-      if (historicalCycle && (!target.startBoundary?.id || !target.endBoundary?.id)) {
+      if (historicalEvidence && (!target.startBoundary?.id || !target.endBoundary?.id)) {
         throw new Error("The settled cycle has no immutable WhatsApp boundaries and cannot be rescanned safely.");
       }
       if (target) {
@@ -220,14 +218,6 @@ function createScanManager(
         author: message.author,
         from: message.from || message.author,
       }));
-    }
-
-    const excludedMessageIds = new Set(
-      Array.isArray(request.excludeMessageIds) ? request.excludeMessageIds.map(String) : [],
-    );
-    if (excludedMessageIds.size) {
-      candidateMessages = candidateMessages.filter((candidate) =>
-        !excludedMessageIds.has(String(candidate.id)));
     }
 
     return {
@@ -459,29 +449,6 @@ function createScanManager(
     return updated;
   }
 
-  async function finishHistoricalQueueEvidence(job, status, outcomes, expenses) {
-    const evidence = expenses.map((expense) => ({
-      ...expense,
-      isExcluded: true,
-      needsReview: true,
-      historicalEvidence: true,
-      evidenceOnly: true,
-    }));
-    const reconciliation = reconciliationFor(job.jobId, job.startedAt);
-    const updated = database.updateScanJob(job.jobId, {
-      status,
-      stage: "historical_evidence_ready",
-      message: status === "complete"
-        ? `${evidence.length} new historical evidence item(s) ready to save.`
-        : `${evidence.length} historical evidence item(s) read; some images need attention.`,
-      reconciliation,
-      finishedAt: new Date().toISOString(),
-      result: { expenses: evidence, evidenceOnly: true },
-    });
-    publishJob(job.jobId);
-    return updated;
-  }
-
   async function finish(job, status) {
     if (status === "cancelled") {
       for (const outcome of database.getScanOutcomes(job.jobId)) {
@@ -515,9 +482,6 @@ function createScanManager(
       .map((outcome) => outcome.receipt)
       .filter(Boolean)
       .sort((a, b) => new Date(a.date) - new Date(b.date));
-    if (job.request.historicalQueueEvidence) {
-      return finishHistoricalQueueEvidence(job, status, outcomes, expenses);
-    }
     if (job.request.historicalEvidence) {
       return finishHistoricalEvidence(job, status, outcomes, expenses);
     }
