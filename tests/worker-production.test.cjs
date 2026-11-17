@@ -32,12 +32,15 @@ test("missing or incomplete production contracts cannot enable writes", () => {
   const filename = path.join(folder, "contract.json");
   const value = { verified: true, schemaReviewed: true, museRulesReviewed: true, legacySourceIdsReviewed: true,
     legacyWorkerStopped: true, dependencyAuditReviewed: true, reviewReference: "fixture review", sourceIdMode: "receipt-id", dateMode: "UTC",
-    shareRounding: "floor", zeroAmountPolicy: "preserve",
+    shareRounding: "round", zeroAmountPolicy: "preserve",
     members: ["Shiva Kafle", "Arjun Bhurtel", "Arpan Bhurtel", "Swasti Adhikari"],
     aliases: { sender: "Shiva Kafle" }, settlementIdMode: "existing-only" };
   fs.writeFileSync(filename, JSON.stringify(value));
   assert.equal(loadContract(filename).approved, true);
   fs.writeFileSync(filename, JSON.stringify({ ...value, members: ["Alex", "Jamie", "Morgan", "Taylor"], aliases: { sender: "Alex" } }));
+  assert.equal(loadContract(filename).approved, false);
+  fs.writeFileSync(filename, JSON.stringify(value));
+  fs.writeFileSync(filename, JSON.stringify({ ...value, shareRounding: "floor" }));
   assert.equal(loadContract(filename).approved, false);
   fs.writeFileSync(filename, JSON.stringify(value));
   fs.writeFileSync(filename, JSON.stringify({ ...value, aliases: { sender: "Unknown" } }));

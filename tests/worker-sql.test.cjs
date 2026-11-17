@@ -58,9 +58,9 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     assert.equal((await q("select * from claim_sync_request('b')")).length, 0);
     const rows = [
       { id: "edited", period_id: "p", captured_at: "2026-10-02T00:00:00Z", merchant: "OCR overwrite", amount_cents: 10000, payer: "Shiva Kafle", category: "Groceries", date: "2026-10-02", is_excluded: false, image_url: "storage://bill-evidence/new.jpg" },
-      { id: "new", period_id: "p", captured_at: "2026-10-02T00:00:00Z", merchant: "Market", amount_cents: 101, payer: "Shiva Kafle", category: "Groceries", date: "2026-10-02", is_excluded: false, image_url: "storage://bill-evidence/new.jpg" },
+      { id: "new", period_id: "p", captured_at: "2026-10-02T00:00:00Z", merchant: "Market", amount_cents: 102, payer: "Shiva Kafle", category: "Groceries", date: "2026-10-02", is_excluded: false, image_url: "storage://bill-evidence/new.jpg" },
     ];
-    const finalize = (owner, receipts = rows, rounding = "floor") => q("select finalize_sync_request($1::uuid,$2,'p',$3::jsonb,array['Shiva Kafle','Arjun Bhurtel','Arpan Bhurtel','Swasti Adhikari'],$4,'existing-only')", [jobId, owner, JSON.stringify(receipts), rounding]);
+    const finalize = (owner, receipts = rows, rounding = "round") => q("select finalize_sync_request($1::uuid,$2,'p',$3::jsonb,array['Shiva Kafle','Arjun Bhurtel','Arpan Bhurtel','Swasti Adhikari'],$4,'existing-only')", [jobId, owner, JSON.stringify(receipts), rounding]);
     await q("select record_period_cycle_state($1::uuid,'a','p','PENDING_SETTLEMENT',$2::jsonb,null)", [jobId, JSON.stringify({ id: "calc-1", timestamp: 1793500000 })]);
     assert.equal((await q("select whatsapp_cycle_status from periods where id='p'"))[0].whatsapp_cycle_status, "PENDING_SETTLEMENT");
     await assert.rejects(
@@ -121,8 +121,8 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     const edited = (await q("select * from receipts where id='edited'"))[0];
     assert.equal(edited.merchant, "Manual merchant");
     assert.equal(edited.is_excluded, true);
-    assert.equal((await q("select total_cents from periods where id='p'"))[0].total_cents, 101);
-    assert.equal((await q("select per_person_cents from settlements"))[0].per_person_cents, 25);
+    assert.equal((await q("select total_cents from periods where id='p'"))[0].total_cents, 102);
+    assert.equal((await q("select per_person_cents from settlements"))[0].per_person_cents, 26);
     assert.deepEqual((await q("select owes from settlements"))[0].owes, { "Shiva Kafle": { "Arjun Bhurtel": 250 } });
     assert.equal((await q("select id from settlements"))[0].id, "settlement_2026-10-01_current");
     assert.equal((await q("select previous_period->>'total_cents' as n from instabox_sync_audit"))[0].n, "999");
@@ -135,6 +135,52 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     await q(`insert into sync_requests(id,requested_by,status,worker_id,lease_expires_at,attempt_count)
       values($1,'netlify-app','processing','reconciler',now()+interval '10 minutes',1)`, [reconciliationJobId]);
     await q("update periods set whatsapp_cycle_status='ACTIVE' where id='p'");
+    await assert.rejects(() => q("select reconcile_deleted_whatsapp_images($1::uuid,'reconciler','p','[]'::jsonb,array['Shiva Kafle','Arjun Bhurtel','Arpan Bhurtel','Swasti Adhikari'],'floor')", [reconciliationJobId]), /shareRounding=round/i);
+    const delayedEvidence = [{
+      source_message_id: "delayed-source", evidence_source: "message_revoke_everyone",
+      detected_at: "2026-11-17T07:00:03Z", group_identity_hash: groupIdentityHash,
+      cycle_start_boundary_id: cycleBoundaryId, idempotency_key: "whatsapp-delete:delayed-source",
+    }];
+    const reconcileDelayed = () => q("select reconcile_deleted_whatsapp_images($1::uuid,'reconciler','p',$2::jsonb,array['Shiva Kafle','Arjun Bhurtel','Arpan Bhurtel','Swasti Adhikari'],'round') as value", [reconciliationJobId, JSON.stringify(delayedEvidence)]);
+    assert.equal((await reconcileDelayed())[0].value.protected, 1);
+    await assert.rejects(() => q("select prepare_instabox_whatsapp_sources($1::uuid,'reconciler','p',$2::jsonb)", [reconciliationJobId, JSON.stringify([{
+      source_message_id: "edited", source_kind: "receipt", group_identity_hash: groupIdentityHash, cycle_start_boundary_id: cycleBoundaryId,
+    }])]), /cannot be registered retroactively/i);
+    await q("select prepare_instabox_whatsapp_sources($1::uuid,'reconciler','p',$2::jsonb)", [reconciliationJobId, JSON.stringify([{
+      source_message_id: "delayed-source", source_kind: "receipt", group_identity_hash: groupIdentityHash, cycle_start_boundary_id: cycleBoundaryId,
+    }])]);
+    assert.equal((await q("select registration_status from instabox_managed_whatsapp_sources where source_message_id='delayed-source'"))[0].registration_status, "pending");
+    await q(`insert into receipts(id,period_id,captured_at,merchant,amount_cents,payer,category,date,is_excluded,image_url,source_provider,source_message_id)
+      values('delayed-source','p','2026-10-05T01:00:00Z','Delayed Market',4,'Arjun Bhurtel','Groceries','2026-10-05',false,'storage://bill-evidence/delayed.jpg','whatsapp','delayed-source')`);
+    assert.equal((await q("select registration_status from instabox_managed_whatsapp_sources where source_message_id='delayed-source'"))[0].registration_status, "active");
+    assert.equal((await reconcileDelayed())[0].value.receipts_deleted, 1);
+    assert.deepEqual(await q("select outcome,source_state from whatsapp_image_reconciliation_audit where source_message_id='delayed-source' order by audit_id"), [
+      { outcome: "protected_legacy", source_state: "unregistered" },
+      { outcome: "receipt_deleted", source_state: "managed_receipt_present" },
+    ]);
+    assert.equal((await q("select total_cents from periods where id='p'"))[0].total_cents, 102);
+    assert.equal((await q("select per_person_cents from settlements where period_id='p'"))[0].per_person_cents, 26);
+    const missingEvidence = [{
+      source_message_id: "missing-source", evidence_source: "revoked_placeholder",
+      detected_at: "2026-11-17T07:00:04Z", group_identity_hash: groupIdentityHash,
+      cycle_start_boundary_id: cycleBoundaryId, idempotency_key: "whatsapp-delete:missing-source",
+    }];
+    const reconcileMissing = () => q("select reconcile_deleted_whatsapp_images($1::uuid,'reconciler','p',$2::jsonb,array['Shiva Kafle','Arjun Bhurtel','Arpan Bhurtel','Swasti Adhikari'],'round') as value", [reconciliationJobId, JSON.stringify(missingEvidence)]);
+    await q("select prepare_instabox_whatsapp_sources($1::uuid,'reconciler','p',$2::jsonb)", [reconciliationJobId, JSON.stringify([{
+      source_message_id: "missing-source", source_kind: "receipt", group_identity_hash: groupIdentityHash, cycle_start_boundary_id: cycleBoundaryId,
+    }])]);
+    const insertMissingSource = () => q(`insert into receipts(id,period_id,captured_at,merchant,amount_cents,payer,category,date,is_excluded,image_url,source_provider,source_message_id)
+      values('missing-source','p','2026-10-06T01:00:00Z','Missing Market',8,'Arpan Bhurtel','Groceries','2026-10-06',false,'storage://bill-evidence/missing.jpg','whatsapp','missing-source')`);
+    await insertMissingSource();
+    await q("delete from receipts where id='missing-source'");
+    assert.equal((await reconcileMissing())[0].value.receipts_deleted, 0);
+    assert.equal((await q("select outcome from whatsapp_image_reconciliation_audit where source_message_id='missing-source' order by audit_id"))[0].outcome, "not_found");
+    await insertMissingSource();
+    assert.equal((await reconcileMissing())[0].value.receipts_deleted, 1);
+    assert.deepEqual(await q("select outcome,source_state from whatsapp_image_reconciliation_audit where source_message_id='missing-source' order by audit_id"), [
+      { outcome: "not_found", source_state: "managed_receipt_missing" },
+      { outcome: "receipt_deleted", source_state: "managed_receipt_present" },
+    ]);
     await q("update settlements set payment_obligations_status='REVIEWED' where period_id='p'");
     await assert.rejects(() => q("select reconcile_deleted_whatsapp_images($1::uuid,'reconciler','p','[]'::jsonb,array['Shiva Kafle','Arjun Bhurtel','Arpan Bhurtel','Swasti Adhikari'],'round')", [reconciliationJobId]), /UNINITIALIZED payment obligations/i);
     await q("update settlements set payment_obligations_status='UNINITIALIZED' where period_id='p'");
@@ -159,7 +205,7 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     assert.equal((await q("select count(*)::integer n from receipts where id='new'"))[0].n, 0);
     assert.equal((await q("select count(*)::integer n from receipts where id='edited'"))[0].n, 1);
     assert.deepEqual(await q("select id,review_status from whatsapp_bank_transfer_evidence"), [{ id: "whatsapp-bank-reviewed", review_status: "reviewed" }]);
-    assert.equal((await q("select count(*)::integer n from whatsapp_image_reconciliation_audit"))[0].n, 4);
+    assert.equal((await q("select count(*)::integer n from whatsapp_image_reconciliation_audit"))[0].n, 8);
     assert.equal((await q("select total_cents from periods where id='p'"))[0].total_cents, 0);
     assert.deepEqual((await q("select total_cents,per_person_cents,receipt_count,member_totals from settlements where period_id='p'"))[0], {
       total_cents: 0,
@@ -245,7 +291,7 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     const reconciliationMigration = fs.readFileSync("supabase/migrations/20261117000000_whatsapp_image_reconciliation.sql", "utf8");
     await db.exec(reconciliationMigration);
     assert.equal((await q("select instabox_worker_capabilities() as value"))[0].value.version, 7);
-    assert.equal((await q("select count(*)::integer n from whatsapp_image_reconciliation_audit"))[0].n, 4);
+    assert.equal((await q("select count(*)::integer n from whatsapp_image_reconciliation_audit"))[0].n, 8);
     assert.equal((await q("select count(*)::integer n from whatsapp_image_reconciliation_audit where previous_record ? 'reference_number' or previous_record ? 'recipient_name'"))[0].n, 0);
     await db.exec("set role authenticated");
     await assert.rejects(() => db.exec("delete from receipts where id='edited'"), /permission denied|row-level security/i);

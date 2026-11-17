@@ -431,7 +431,7 @@ test("transactional publishing records pending-cycle metadata before finalizing 
       value: {
         members: ["Alex", "Jamie", "Morgan", "Taylor"],
         aliases: {},
-        shareRounding: "floor",
+        shareRounding: "round",
         settlementIdMode: "existing-only",
         zeroAmountPolicy: "preserve",
       },
@@ -565,6 +565,7 @@ test("production four-member aggregate matches the current 74284-cent settlement
 
 test("a verified clearance rolls forward before November receipts are scanned", async () => {
   const rpcCalls = [];
+  const reconciliationUpdates = [];
   let preparedContext = null;
   const clearance = {
     id: "clearance-31-oct", text: "Clear up to date", timestamp: 1793449800,
@@ -579,7 +580,7 @@ test("a verified clearance rolls forward before November receipts are scanned", 
       approved: true,
       value: {
         members: ["Alex", "Jamie", "Morgan", "Taylor"], aliases: {},
-        shareRounding: "floor", settlementIdMode: "existing-only", zeroAmountPolicy: "preserve",
+        shareRounding: "round", settlementIdMode: "existing-only", zeroAmountPolicy: "preserve",
       },
     },
     groupId: "fixture-group@g.us",
@@ -597,7 +598,7 @@ test("a verified clearance rolls forward before November receipts are scanned", 
     },
     localDatabase: {
       purgeDeletedLocalArtifacts: () => true,
-      updateDeletionReconciliation: () => {},
+      updateDeletionReconciliation: (id, status) => reconciliationUpdates.push({ id, status }),
       getScanJob: () => ({
         status: "complete",
         groupId: "fixture-group@g.us",
@@ -634,6 +635,7 @@ test("a verified clearance rolls forward before November receipts are scanned", 
       update: async (table, filters, body) => table === "sync_requests" ? [{ id: "job", ...body }] : [],
       rpc: async (name, body) => {
         rpcCalls.push({ name, body });
+        if (name === "reconcile_deleted_whatsapp_images") return { outcomes: { "deleted-source": "protected_legacy" } };
         return name === "finalize_sync_request" ? { result_summary: "done" } : {};
       },
     },
@@ -647,6 +649,7 @@ test("a verified clearance rolls forward before November receipts are scanned", 
   assert.equal(rpcCalls[0].body.p_new_settlement_id, "settlement_2026-10-31_current");
   assert.equal(rpcCalls[1].body.p_deletions[0].cycle_start_boundary_id, "clearance-31-oct");
   assert.equal(rpcCalls[1].body.p_deletions[0].group_identity_hash, whatsappGroupIdentityHash("fixture-group@g.us"));
+  assert.deepEqual(reconciliationUpdates, [{ id: "deleted-source", status: "review_required" }]);
   assert.equal(preparedContext.startDate, "2026-10-31");
   assert.equal(preparedContext.cycleBoundaryId, "clearance-31-oct");
   assert.equal(rpcCalls[4].body.p_period_id, "period_2026-10-31");

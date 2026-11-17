@@ -12,11 +12,13 @@ create table if not exists public.instabox_managed_whatsapp_sources (
   cycle_start_boundary_id text not null,
   registration_status text not null default 'pending' check(registration_status in ('pending','active')),
   job_id uuid not null references public.sync_requests(id),
-  registered_at timestamptz not null default now()
+  registered_at timestamptz not null default now(),
+  activated_at timestamptz
 );
 
 create table if not exists public.whatsapp_image_reconciliation_audit (
-  idempotency_key text primary key,
+  audit_id bigint generated always as identity primary key,
+  idempotency_key text not null,
   job_id uuid not null references public.sync_requests(id),
   period_id text not null references public.periods(id),
   source_message_id text not null,
@@ -25,9 +27,13 @@ create table if not exists public.whatsapp_image_reconciliation_audit (
   cycle_start_boundary_id text not null,
   evidence_detected_at timestamptz not null,
   outcome text not null check(outcome in ('receipt_deleted','bank_evidence_deleted','not_found','protected_legacy','protected_reviewed')),
+  source_state text not null,
   previous_record jsonb,
-  reconciled_at timestamptz not null default now()
+  reconciled_at timestamptz not null default now(),
+  unique(idempotency_key,source_state)
 );
+create index if not exists whatsapp_image_reconciliation_idempotency_idx
+  on public.whatsapp_image_reconciliation_audit(idempotency_key,reconciled_at desc,audit_id desc);
 
 alter table public.instabox_managed_whatsapp_sources enable row level security;
 alter table public.whatsapp_image_reconciliation_audit enable row level security;
@@ -88,9 +94,10 @@ returns trigger language plpgsql security definer set search_path=public,pg_temp
 begin
   if new.source_provider='whatsapp' and nullif(btrim(new.source_message_id),'') is not null
      and new.source_message_id=new.id::text then
-    update public.instabox_managed_whatsapp_sources set registration_status='active'
+    update public.instabox_managed_whatsapp_sources
+      set registration_status='active',activated_at=now()
       where source_message_id=new.source_message_id and period_id=new.period_id::text
-        and source_kind='receipt' and registration_status='pending';
+        and source_kind='receipt';
   end if;
   return new;
 end $$;
@@ -103,9 +110,10 @@ create or replace function public.register_instabox_whatsapp_bank_evidence()
 returns trigger language plpgsql security definer set search_path=public,pg_temp as $$
 begin
   if new.source_message_id=new.id then
-    update public.instabox_managed_whatsapp_sources set registration_status='active'
+    update public.instabox_managed_whatsapp_sources
+      set registration_status='active',activated_at=now()
       where source_message_id=new.source_message_id and period_id=new.period_id::text
-        and source_kind='bank_evidence' and registration_status='pending';
+        and source_kind='bank_evidence';
   end if;
   return new;
 end $$;
@@ -135,6 +143,10 @@ begin
        v_group_identity_hash !~ '^[0-9a-f]{64}$' or v_cycle_start_boundary_id is null or
        p.whatsapp_start_boundary->>'id' is distinct from v_cycle_start_boundary_id then
       raise exception 'Invalid managed source provenance';
+    end if;
+    if exists(select 1 from public.receipts r where r.id::text=v_source_id or r.source_message_id=v_source_id) or
+       exists(select 1 from public.whatsapp_bank_transfer_evidence e where e.id=v_source_id or e.source_message_id=v_source_id) then
+      raise exception 'Existing source cannot be registered retroactively';
     end if;
     insert into public.instabox_managed_whatsapp_sources(
       source_message_id,period_id,source_kind,group_identity_hash,cycle_start_boundary_id,
@@ -181,6 +193,8 @@ declare
   detected_at timestamptz;
   previous jsonb;
   outcome text;
+  current_source_state text;
+  latest_audit public.whatsapp_image_reconciliation_audit;
   total bigint;
   count_receipts integer;
   shares bigint;
@@ -205,7 +219,7 @@ begin
      (select count(distinct member_name) from unnest(p_members) member_name)<>4 or
      not (p_members @> array['Shiva Kafle','Arjun Bhurtel','Arpan Bhurtel','Swasti Adhikari']::text[] and
           p_members <@ array['Shiva Kafle','Arjun Bhurtel','Arpan Bhurtel','Swasti Adhikari']::text[]) or
-     p_rounding not in ('floor','round') then raise exception 'Reviewed settlement rules required'; end if;
+     p_rounding is distinct from 'round' then raise exception 'Reviewed settlement rules require shareRounding=round'; end if;
   if jsonb_typeof(p_deletions)<>'array' then raise exception 'Deletion evidence array required'; end if;
   -- Match finalize_sync_request's lock order to avoid deadlocks with manual edits.
   lock table public.receipts in share row exclusive mode;
@@ -233,53 +247,77 @@ begin
        v_idempotency_key is distinct from 'whatsapp-delete:'||v_source_id or detected_at is null then
       raise exception 'Invalid verified WhatsApp deletion evidence';
     end if;
-    if exists(select 1 from public.whatsapp_image_reconciliation_audit where idempotency_key=v_idempotency_key) then
-      select audit.outcome into outcome from public.whatsapp_image_reconciliation_audit audit
-        where audit.idempotency_key=v_idempotency_key and audit.period_id=p_period_id
-          and audit.source_message_id=v_source_id and audit.group_identity_hash=v_group_identity_hash
-          and audit.cycle_start_boundary_id=v_cycle_start_boundary_id;
-      if outcome is null then raise exception 'WhatsApp deletion idempotency conflict'; end if;
-      v_outcomes:=v_outcomes||jsonb_build_object(v_source_id,outcome);
-      continue;
+    managed:=null; outcome:=null; previous:=null; current_source_state:=null; latest_audit:=null;
+    select * into managed from public.instabox_managed_whatsapp_sources
+      where source_message_id=v_source_id for update;
+    if managed.source_message_id is not null and
+       (managed.period_id<>p_period_id or managed.group_identity_hash<>v_group_identity_hash or
+          managed.cycle_start_boundary_id<>v_cycle_start_boundary_id) then
+      raise exception 'WhatsApp deletion source provenance conflicts with the selected period';
     end if;
 
-    managed:=null; outcome:=null; previous:=null;
-    select * into managed from public.instabox_managed_whatsapp_sources
-      where source_message_id=v_source_id and registration_status='active' for update;
     if managed.source_message_id is null then
-      outcome:='protected_legacy'; protected:=protected+1;
-    elsif managed.period_id<>p_period_id or managed.group_identity_hash<>v_group_identity_hash or
-          managed.cycle_start_boundary_id<>v_cycle_start_boundary_id then
-      raise exception 'WhatsApp deletion source provenance conflicts with the selected period';
+      current_source_state:='unregistered';
+    elsif managed.registration_status<>'active' then
+      current_source_state:='registration_pending';
     elsif managed.source_kind='receipt' then
       select jsonb_build_object('id',r.id,'period_id',r.period_id,'amount_cents',r.amount_cents,
         'payer',r.payer,'is_excluded',r.is_excluded) into previous from public.receipts r
         where r.period_id::text=p_period_id and r.id::text=v_source_id
           and r.source_provider='whatsapp' and r.source_message_id=v_source_id for update;
-      if previous is null then outcome:='not_found';
-      else
-        delete from public.receipts where period_id::text=p_period_id and id::text=v_source_id
-          and source_provider='whatsapp' and source_message_id=v_source_id;
-        outcome:='receipt_deleted'; changed_receipts:=changed_receipts+1;
-      end if;
+      current_source_state:=case when previous is null then 'managed_receipt_missing' else 'managed_receipt_present' end;
     else
       select jsonb_build_object('id',e.id,'period_id',e.period_id,'review_status',e.review_status)
         into previous from public.whatsapp_bank_transfer_evidence e
         where e.period_id::text=p_period_id and e.id=v_source_id and e.source_message_id=v_source_id for update;
-      if previous is null then outcome:='not_found';
-      elsif previous->>'review_status'<>'pending' then
-        outcome:='protected_reviewed'; protected:=protected+1;
-      else
-        delete from public.whatsapp_bank_transfer_evidence
-          where period_id::text=p_period_id and id=v_source_id and source_message_id=v_source_id and review_status='pending';
-        outcome:='bank_evidence_deleted'; changed_evidence:=changed_evidence+1;
+      current_source_state:=case
+        when previous is null then 'managed_bank_missing'
+        when previous->>'review_status'='pending' then 'managed_bank_pending'
+        else 'managed_bank_reviewed' end;
+    end if;
+
+    select * into latest_audit from public.whatsapp_image_reconciliation_audit audit
+      where audit.idempotency_key=v_idempotency_key
+      order by audit.reconciled_at desc,audit.audit_id desc limit 1;
+    if latest_audit.audit_id is not null then
+      if latest_audit.period_id<>p_period_id or latest_audit.source_message_id<>v_source_id or
+         latest_audit.group_identity_hash<>v_group_identity_hash or
+         latest_audit.cycle_start_boundary_id<>v_cycle_start_boundary_id then
+        raise exception 'WhatsApp deletion idempotency conflict';
       end if;
+      if latest_audit.outcome in ('receipt_deleted','bank_evidence_deleted','protected_reviewed') or
+         latest_audit.source_state=current_source_state or
+         (latest_audit.outcome='protected_legacy' and current_source_state='registration_pending') then
+        v_outcomes:=v_outcomes||jsonb_build_object(v_source_id,latest_audit.outcome);
+        continue;
+      end if;
+      if latest_audit.outcome not in ('protected_legacy','not_found') or
+         current_source_state not in ('managed_receipt_missing','managed_receipt_present','managed_bank_missing','managed_bank_pending','managed_bank_reviewed') or
+         managed.activated_at is null or managed.activated_at<=latest_audit.reconciled_at then
+        raise exception 'WhatsApp deletion source state changed without authoritative registration evidence';
+      end if;
+    end if;
+
+    if current_source_state in ('unregistered','registration_pending') then
+      outcome:='protected_legacy'; protected:=protected+1;
+    elsif current_source_state in ('managed_receipt_missing','managed_bank_missing') then
+      outcome:='not_found';
+    elsif current_source_state='managed_receipt_present' then
+      delete from public.receipts where period_id::text=p_period_id and id::text=v_source_id
+        and source_provider='whatsapp' and source_message_id=v_source_id;
+      outcome:='receipt_deleted'; changed_receipts:=changed_receipts+1;
+    elsif current_source_state='managed_bank_reviewed' then
+      outcome:='protected_reviewed'; protected:=protected+1;
+    else
+      delete from public.whatsapp_bank_transfer_evidence
+        where period_id::text=p_period_id and id=v_source_id and source_message_id=v_source_id and review_status='pending';
+      outcome:='bank_evidence_deleted'; changed_evidence:=changed_evidence+1;
     end if;
     insert into public.whatsapp_image_reconciliation_audit(
       idempotency_key,job_id,period_id,source_message_id,evidence_source,group_identity_hash,
-      cycle_start_boundary_id,evidence_detected_at,outcome,previous_record
+      cycle_start_boundary_id,evidence_detected_at,outcome,source_state,previous_record
     ) values(v_idempotency_key,p_job_id,p_period_id,v_source_id,v_evidence_source,v_group_identity_hash,
-      v_cycle_start_boundary_id,detected_at,outcome,previous);
+      v_cycle_start_boundary_id,detected_at,outcome,current_source_state,previous);
     v_outcomes:=v_outcomes||jsonb_build_object(v_source_id,outcome);
   end loop;
 
@@ -290,8 +328,7 @@ begin
     end if;
     select coalesce(sum(amount_cents),0),count(*) into total,count_receipts
       from public.receipts where period_id::text=p_period_id and not is_excluded;
-    shares:=case when p_rounding='round' then round(total::numeric/array_length(p_members,1))
-      else floor(total::numeric/array_length(p_members,1)) end;
+    shares:=round(total::numeric/array_length(p_members,1));
     select jsonb_object_agg(member_name,coalesce((select sum(amount_cents) from public.receipts
       where period_id::text=p_period_id and not is_excluded and payer=member_name),0))
       into v_member_totals from unnest(p_members) member_name;

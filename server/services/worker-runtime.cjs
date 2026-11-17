@@ -16,7 +16,7 @@ function loadContract(filename) {
     if (!value.reviewReference || value.reviewReference.startsWith("REPLACE")) throw new Error("Missing review reference.");
     if (value.sourceIdMode !== "receipt-id") throw new Error("Legacy source-ID mapping requires a custom adapter.");
     if (!["UTC", "Australia/Sydney"].includes(value.dateMode)) throw new Error("Unconfirmed date convention.");
-    if (!["floor", "round"].includes(value.shareRounding)) throw new Error("Unconfirmed share rounding.");
+    if (value.shareRounding !== "round") throw new Error("The reviewed production contract requires shareRounding=round.");
     if (!["preserve", "reject"].includes(value.zeroAmountPolicy)) throw new Error("Unconfirmed zero-amount policy.");
     if (value.settlementIdMode !== "existing-only") throw new Error("Production settlement creation is disabled; use existing-only.");
     if (!Array.isArray(value.members) || value.members.length !== 4 || value.members.some((m) => typeof m !== "string" || !m.trim() || m !== m.trim()) || new Set(value.members).size !== value.members.length)

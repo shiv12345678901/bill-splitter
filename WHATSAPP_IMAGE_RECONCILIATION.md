@@ -16,6 +16,8 @@ The 17 November incident combined two defects: the worker had no persistent revo
 - The Supabase migration registers only sources explicitly prepared by a currently leased InstaBox job and inserted after the migration. Registration binds each source to a hashed WhatsApp group identity and immutable cycle-start boundary. Existing Muse rows are not eligible for automatic deletion.
 - The reconciliation RPC accepts only `CURRENT`/`ACTIVE` periods with `UNINITIALIZED` payment obligations, an active lease, enabled production writes, exact period/source/group/boundary identities, supported deletion evidence, and deterministic idempotency keys.
 - Reconciliation accepts exactly the reviewed four members: Shiva Kafle, Arjun Bhurtel, Arpan Bhurtel and Swasti Adhikari. Three-member cycles require a separate future membership migration.
+- Reconciliation requires the reviewed `shareRounding=round` rule; callers cannot select `floor`. Normal `finalize_sync_request` behavior is unchanged.
+- `receipt_deleted`, `bank_evidence_deleted`, and `protected_reviewed` audit outcomes are terminal. `protected_legacy` and `not_found` retain their audit history but can be reconsidered only after the managed-source trigger records a later authoritative activation. Existing legacy rows cannot be registered retroactively.
 - Grocery deletion, audit insertion and aggregate recalculation are one PostgreSQL transaction. `settlements.owes`, payment obligations and verification fields are never updated.
 - Pending bank evidence may be removed. Reviewed evidence, historical rows and unregistered legacy rows are protected.
 - Local image/cache cleanup happens only after the database RPC succeeds. Shared image files are retained.

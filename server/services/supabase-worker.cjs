@@ -792,6 +792,10 @@ function createSupabaseWorker({
     const groupIdentityHash = whatsappGroupIdentityHash(scanGroupId);
     const evidence = deletions.map((item) => {
       if (item.group_id !== scanGroupId) throw new Error("WHATSAPP_IMAGE_INVALID_PROVENANCE");
+      if (!["message_revoke_everyone", "revoked_placeholder"].includes(item.evidence_source) ||
+          item.idempotency_key !== `whatsapp-delete:${item.message_id}` ||
+          !Number.isFinite(Date.parse(item.detected_at)))
+        throw new Error("WHATSAPP_IMAGE_AVAILABILITY_UNVERIFIED");
       return {
         source_message_id: item.message_id,
         evidence_source: item.evidence_source,
@@ -814,11 +818,16 @@ function createSupabaseWorker({
       localDatabase.purgeDeletedLocalArtifacts(item.message_id);
       library.removeDeletedImageIfUnshared(item.message_id);
       const outcome = result?.outcomes?.[item.message_id];
-      const protectedRecord = ["protected_legacy", "protected_reviewed"].includes(outcome);
+      const protectedRecord = outcome === "protected_reviewed";
+      const retryableState = ["protected_legacy", "not_found"].includes(outcome);
       localDatabase.updateDeletionReconciliation(
         item.message_id,
-        protectedRecord ? "protected" : "reconciled",
-        protectedRecord ? "Supabase record is legacy or reviewed and requires authorized correction." : null,
+        protectedRecord ? "protected" : retryableState ? "review_required" : "reconciled",
+        protectedRecord
+          ? "Reviewed Supabase evidence requires authorized correction."
+          : retryableState
+            ? "Awaiting an authoritative managed-source state change."
+            : null,
       );
     }
     return result || {};
