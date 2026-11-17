@@ -35,12 +35,16 @@ psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261101000001
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261102000000_pending_settlement_cycle_state.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261102000001_automatic_cycle_rollover.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261104000000_whatsapp_bank_transfer_evidence.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261117000000_whatsapp_image_reconciliation.sql
 ```
 
-Migration 00000 adds lease fields, claim indexes/function, and creates the private bucket if absent. Migration 00001 adds the verified production safeguards. Migration 00002 adds pending-cycle metadata. Migration 00003 adds guarded rollover. Migration 00004 adds the separate `whatsapp_bank_transfer_evidence` store and raises the capability contract to version 6. It permits an open-ended CURRENT period, derives the historical period status from existing rows, and creates a zero-total settlement placeholder with `owes = null` and `payment_obligations_status = 'UNINITIALIZED'`. Normal scans can save bank-transfer screenshots for review without creating a `bank_transfer_receipts.step_id`, verifying a payment, or changing bill totals. Clearances older than the migration's rollout watermark require an exact row in `instabox_rollover_approvals`; follow the separate reconciliation plan for the known 31 October boundary. None of these migrations enable writes, backfill verification, move receipts, rename settlement IDs, or touch historical `settlements.owes`.
+Migration 00000 adds lease fields, claim indexes/function, and creates the private bucket if absent. Migration 00001 adds the verified production safeguards. Migration 00002 adds pending-cycle metadata. Migration 00003 adds guarded rollover. Migration 00004 adds the separate `whatsapp_bank_transfer_evidence` store. Migration 00005 adds explicit WhatsApp-revocation reconciliation and raises the capability contract to version 7. It registers only new sources pre-authorized by a leased InstaBox job; the 134 existing rows are not registered and cannot be automatically deleted. It permits an open-ended CURRENT period, derives the historical period status from existing rows, and creates a zero-total settlement placeholder with `owes = null` and `payment_obligations_status = 'UNINITIALIZED'`. Normal scans can save bank-transfer screenshots for review without creating a `bank_transfer_receipts.step_id`, verifying a payment, or changing bill totals. Clearances older than the migration's rollout watermark require an exact row in `instabox_rollover_approvals`; follow the separate reconciliation plan for the known 31 October boundary. None of these migrations enable writes, backfill verification, move receipts, rename settlement IDs, or touch historical `settlements.owes`.
 
 ```sql
 select public.instabox_worker_capabilities();
+select source_kind,registration_status,count(*)
+from public.instabox_managed_whatsapp_sources group by 1,2 order by 1,2;
+select outcome,count(*) from public.whatsapp_image_reconciliation_audit group by 1 order by 1;
 select singleton, writes_enabled, review_reference from public.instabox_worker_control;
 ```
 

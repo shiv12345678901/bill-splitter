@@ -123,6 +123,18 @@ function findByContentHash(contentHash) {
 
 const findById = (id) => database.getReceipt(id);
 
+function removeDeletedImageIfUnshared(id) {
+  const entry = database.getReceipt(id);
+  if (!entry?.fileName || entry.fileId && entry.fileId !== id) return false;
+  const shared = Object.values(database.getReceipts()).some((other) =>
+    other?.id !== id && other?.fileName === entry.fileName && other?.status !== "archived");
+  if (shared) return false;
+  const target = imageFilePath(entry);
+  if (!target.startsWith(`${IMAGES_DIR}${path.sep}`) || !fs.existsSync(target)) return false;
+  fs.rmSync(target, { force: true });
+  return true;
+}
+
 // Saves the cycles found by a full group scan (detected from the chat's
 // "clear up to date" markers). Scan results — images, totals, dates — are
 // preserved when a cycle has already been scanned.
@@ -492,6 +504,7 @@ module.exports = {
   saveSettlementCycles,
   recordImage,
   findByContentHash,
+  removeDeletedImageIfUnshared,
   findById,
   recordSettlementCycle,
   upsertDetectedCycles,

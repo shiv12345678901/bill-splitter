@@ -3,6 +3,12 @@ const { isGenuineImageMessage, messageMimeType, messageType } = require("./whats
 const { fetchRecentCollectionMessages } = require("./whatsapp-collection.cjs");
 
 const clientStates = new WeakMap();
+const IMAGE_AVAILABILITY = Object.freeze({
+  PRESENT: "PRESENT",
+  CONFIRMED_DELETED: "CONFIRMED_DELETED",
+  UNCONFIRMED_MISSING: "UNCONFIRMED_MISSING",
+  UNVERIFIED_HISTORY: "UNVERIFIED_HISTORY",
+});
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const OPERATION_LABELS = {
   get_state: "connection-state check",
@@ -89,6 +95,7 @@ function normaliseMessage(message = {}) {
     author,
     from,
     to,
+    revokedMessageId: serializedId(message.protocolMessageKey || message.revokedMessageId),
   };
 }
 
@@ -138,6 +145,15 @@ function snapshotFingerprint(messages) {
     `${message.id}:${message.timestamp}:${message.type}:${message.mimetype}`).join("|");
 }
 
+function classifyImageAvailability({ messageId, presentIds = [], confirmedDeletedIds = [], snapshot = null } = {}) {
+  if (confirmedDeletedIds.includes(messageId)) return IMAGE_AVAILABILITY.CONFIRMED_DELETED;
+  if (presentIds.includes(messageId)) return IMAGE_AVAILABILITY.PRESENT;
+  if (snapshot?.retrievalVerified !== true) return IMAGE_AVAILABILITY.UNVERIFIED_HISTORY;
+  // A connected, stable recent window still does not prove complete delivery
+  // or complete older history, so absence is never deletion evidence.
+  return IMAGE_AVAILABILITY.UNCONFIRMED_MISSING;
+}
+
 function stateFor(client) {
   let state = clientStates.get(client);
   if (!state) {
@@ -147,9 +163,10 @@ function stateFor(client) {
   return state;
 }
 
-function attachMessageSnapshotTracker(client, { logger = console } = {}) {
+function attachMessageSnapshotTracker(client, { logger = console, onConfirmedDeletion = null } = {}) {
   if (!client?.on) return;
   const state = stateFor(client);
+  if (onConfirmedDeletion) state.onConfirmedDeletion = onConfirmedDeletion;
   if (state.attached) return;
   state.attached = true;
   const clearCache = () => state.cache.clear();
@@ -166,6 +183,27 @@ function attachMessageSnapshotTracker(client, { logger = console } = {}) {
   };
   client.on("message", remember);
   client.on("message_create", remember);
+  client.on("message_revoke_everyone", (message, revokedMessage) => {
+    try {
+      const messageId = serializedId(revokedMessage?.id) ||
+        serializedId(message?.protocolMessageKey) || serializedId(message?.id);
+      const groupId = groupIdFor(revokedMessage) || groupIdFor(message) ||
+        serializedId(revokedMessage?.id?.remote) || serializedId(message?.id?.remote);
+      if (!messageId || !groupId.endsWith("@g.us")) return;
+      state.onConfirmedDeletion?.({
+        messageId,
+        groupId,
+        evidenceSource: "message_revoke_everyone",
+        detectedAt: new Date().toISOString(),
+        sourceTimestamp: Number(revokedMessage?.timestamp || message?.timestamp || 0) || null,
+      });
+      state.groups.set(groupId, (state.groups.get(groupId) || []).filter((item) => normaliseMessage(item).id !== messageId));
+      state.cache.delete(groupId);
+      logger.log?.(`[WhatsApp:Deletion] Recorded an explicit revocation for group=${privateGroupLabel(groupId)}.`);
+    } catch (error) {
+      logger.warn?.(`[WhatsApp:Deletion] ${safeErrorMessage(error)}`);
+    }
+  });
   client.on("disconnected", clearCache);
   client.on("change_state", (connectionState) => {
     if (connectionState !== "CONNECTED") clearCache();
@@ -209,7 +247,7 @@ async function refreshRecentMessageSnapshot(groupId, client, options = {}) {
   if (!groupId || !client?.getState || !client?.pupPage?.evaluate) {
     throw operationError("get_chat", new Error("operation unsupported"));
   }
-  attachMessageSnapshotTracker(client, { logger });
+  attachMessageSnapshotTracker(client, { logger, onConfirmedDeletion: options.onConfirmedDeletion });
   const state = stateFor(client);
   const cached = state.cache.get(groupId);
   if (cached && now() - cached.refreshedAtMs <= cacheMs) return cached;
@@ -283,6 +321,16 @@ async function refreshRecentMessageSnapshot(groupId, client, options = {}) {
   if (finalConnectionState !== "CONNECTED") throw operationError("get_state", new Error("client disconnected"));
 
   const stats = discoveryStats(messages);
+  for (const message of messages) {
+    if (message.type !== "revoked" || !message.revokedMessageId) continue;
+    state.onConfirmedDeletion?.({
+      messageId: message.revokedMessageId,
+      groupId,
+      evidenceSource: "revoked_placeholder",
+      detectedAt: new Date().toISOString(),
+      sourceTimestamp: Number(message.timestamp) || null,
+    });
+  }
   const result = {
     retrievalVerified: true,
     freshness: "observed-connected-window",
@@ -303,6 +351,7 @@ async function refreshRecentMessageSnapshot(groupId, client, options = {}) {
 }
 
 module.exports = {
+  IMAGE_AVAILABILITY,
   attachMessageSnapshotTracker,
   discoveryStats,
   errorCategory,
@@ -312,4 +361,5 @@ module.exports = {
   refreshRecentMessageSnapshot,
   runWhatsAppOperation,
   safeErrorMessage,
+  classifyImageAvailability,
 };

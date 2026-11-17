@@ -97,6 +97,7 @@ function createScanManager(
     let selectedCycleData = null;
     let activeCheckpoint = null;
     let messageFreshness = null;
+    let confirmedDeletions = [];
 
     if ((cycleId || sync) && detectSettlementCycles) {
       const cycles = await detectSettlementCycles(groupId);
@@ -153,6 +154,18 @@ function createScanManager(
           });
         }
         candidateMessages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+        const startBoundaryTimestamp = Number(target.startBoundary?.timestamp || 0);
+        const endBoundaryTimestamp = Number(target.endBoundary?.timestamp || 0) || Number.POSITIVE_INFINITY;
+        confirmedDeletions = database.listDeletionTombstones({
+          groupId,
+          state: "CONFIRMED_DELETED",
+          statuses: ["pending", "failed", "review_required"],
+        }).filter((item) => {
+          if (item.affected_cycle_key && item.affected_cycle_key === target.id) return true;
+          return item.source_timestamp && item.source_timestamp > startBoundaryTimestamp && item.source_timestamp <= endBoundaryTimestamp;
+        });
+        const deletedIds = new Set(confirmedDeletions.map((item) => item.message_id));
+        candidateMessages = candidateMessages.filter((message) => !deletedIds.has(message.id));
       }
     }
 
@@ -187,6 +200,7 @@ function createScanManager(
       selectedCycleData,
       checkpoint: activeCheckpoint,
       messageFreshness,
+      confirmedDeletions,
     };
   }
 

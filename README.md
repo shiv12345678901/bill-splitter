@@ -92,7 +92,7 @@ Live WhatsApp authentication and group discovery were verified. Live receipt sca
 
 ## InstaBox Supabase worker
 
-Production Docker, private WhatsApp pairing, migration, operations, update and rollback commands are in [DEPLOY_INSTABOX.md](DEPLOY_INSTABOX.md). The pending-settlement metadata migration is required before this version can enter live mode; it leaves the write switch off and never rotates periods or changes settlement obligations.
+Production Docker, private WhatsApp pairing, migration, operations, update and rollback commands are in [DEPLOY_INSTABOX.md](DEPLOY_INSTABOX.md). WhatsApp image-reconciliation behavior, safeguards, verification and rollback are documented in [WHATSAPP_IMAGE_RECONCILIATION.md](WHATSAPP_IMAGE_RECONCILIATION.md). Migrations leave the write switch off and never alter historical settlement obligations.
 
 The worker is deliberately locked to `dry-run` by default:
 

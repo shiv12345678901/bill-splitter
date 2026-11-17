@@ -16,6 +16,7 @@ const { createConfiguredSupabaseWorker, LIVE_MODE } = require("./services/supaba
 const { WhatsAppSessionLock, clearStaleChromiumProfileLocks } = require("./services/whatsapp-session-lock.cjs");
 const { resolveWhatsAppUserAgent } = require("./services/whatsapp-user-agent.cjs");
 const { attachMessageSnapshotTracker, safeErrorMessage } = require("./services/whatsapp-snapshot.cjs");
+const database = require("./services/database.cjs");
 
 function loadGeminiKeys() {
   const values = [];
@@ -119,7 +120,9 @@ async function initializeWhatsApp() {
         ],
       },
     });
-    attachMessageSnapshotTracker(client);
+    attachMessageSnapshotTracker(client, {
+      onConfirmedDeletion: (evidence) => database.recordDeletionTombstone(evidence),
+    });
 
     client.on("qr", async (qr) => {
       clientStatus = "QR_READY";

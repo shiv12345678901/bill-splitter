@@ -94,6 +94,29 @@ test("bank-transfer evidence is classified separately without becoming a bill or
   }, "p"), /invalid transfer date/i);
 });
 
+test("bank evidence uses Sydney period dates and distinguishes unknown from explicit zero", () => {
+  const period = { id: "period_2026-10-31", start_date: "2026-10-31", end_date: "2026-11-30" };
+  const base = {
+    id: "bank-sydney-boundary", isBankTransfer: true, paidBy: "sender",
+    date: "2026-10-30T13:00:00.000Z", transactionDate: null, transferAmount: null,
+  };
+  const unknown = validateBankTransferEvidence(base, period, { sender: "Alex" });
+  assert.equal(unknown.amount_cents, null);
+  assert.equal(unknown.captured_at, "2026-10-30T13:00:00.000Z");
+  assert.throws(
+    () => validateBankTransferEvidence({ ...base, transferAmount: 0 }, period, { sender: "Alex" }),
+    (error) => error.code === "BANK_EVIDENCE_REVIEW_REQUIRED",
+  );
+  assert.throws(
+    () => validateBankTransferEvidence({ ...base, transactionDate: "2026-04-25", transferAmount: 500 }, period, { sender: "Alex" }),
+    (error) => error.code === "BANK_EVIDENCE_DATE_OUTSIDE_PERIOD",
+  );
+  assert.throws(
+    () => validateBankTransferEvidence({ ...base, paidBy: "" }, period, { sender: "Alex" }),
+    (error) => error.code === "BANK_EVIDENCE_MISSING_SENDER",
+  );
+});
+
 test("immutable boundaries separate receipts on the same Sydney clearance date", () => {
   const clearanceTimestamp = timestamp("2026-10-31T12:30:00Z");
   const beforeTimestamp = clearanceTimestamp - 1;
@@ -450,15 +473,19 @@ test("transactional publishing records pending-cycle metadata before finalizing 
   const result = await worker.processClaimedJob({ id: "11111111-1111-4111-8111-111111111111" }, { assert() {} });
   assert.equal(result.finalized, true);
   assert.deepEqual(rpcCalls.map((call) => call.name), [
-    "record_period_cycle_state", "record_whatsapp_bank_evidence", "finalize_sync_request",
+    "prepare_instabox_whatsapp_sources", "record_period_cycle_state", "record_whatsapp_bank_evidence", "finalize_sync_request",
   ]);
-  assert.equal(rpcCalls[0].body.p_cycle_status, "PENDING_SETTLEMENT");
-  assert.deepEqual(rpcCalls[0].body.p_calculation_message, calculationMessage);
-  assert.equal(rpcCalls[0].body.p_clearance_message, null);
-  assert.equal(rpcCalls[1].body.p_evidence[0].id, "bank-1");
-  assert.equal(rpcCalls[1].body.p_evidence[0].amount_cents, 4255);
-  assert.equal(rpcCalls[1].body.p_evidence[0].review_status, "pending");
-  assert.deepEqual(rpcCalls[2].body.p_receipts.map((row) => row.id), ["receipt-1"]);
+  assert.deepEqual(rpcCalls[0].body.p_sources, [
+    { source_message_id: "receipt-1", source_kind: "receipt" },
+    { source_message_id: "bank-1", source_kind: "bank_evidence" },
+  ]);
+  assert.equal(rpcCalls[1].body.p_cycle_status, "PENDING_SETTLEMENT");
+  assert.deepEqual(rpcCalls[1].body.p_calculation_message, calculationMessage);
+  assert.equal(rpcCalls[1].body.p_clearance_message, null);
+  assert.equal(rpcCalls[2].body.p_evidence[0].id, "bank-1");
+  assert.equal(rpcCalls[2].body.p_evidence[0].amount_cents, 4255);
+  assert.equal(rpcCalls[2].body.p_evidence[0].review_status, "pending");
+  assert.deepEqual(rpcCalls[3].body.p_receipts.map((row) => row.id), ["receipt-1"]);
 });
 
 test("settlement totals use cents, stable members, and exclude transfer proofs", () => {
@@ -567,14 +594,14 @@ test("a verified clearance rolls forward before November receipts are scanned", 
   });
   await worker.processClaimedJob({ id: "11111111-1111-4111-8111-111111111111" }, { assert() {} });
   assert.deepEqual(rpcCalls.map((call) => call.name), [
-    "rollover_settlement_period", "record_period_cycle_state", "finalize_sync_request",
+    "rollover_settlement_period", "prepare_instabox_whatsapp_sources", "record_period_cycle_state", "finalize_sync_request",
   ]);
   assert.equal(rpcCalls[0].body.p_old_period_id, "period_2026-10-10");
   assert.equal(rpcCalls[0].body.p_new_period_id, "period_2026-10-31");
   assert.equal(rpcCalls[0].body.p_new_settlement_id, "settlement_2026-10-31_current");
   assert.equal(preparedContext.startDate, "2026-10-31");
   assert.equal(preparedContext.cycleBoundaryId, "clearance-31-oct");
-  assert.equal(rpcCalls[2].body.p_period_id, "period_2026-10-31");
+  assert.equal(rpcCalls[3].body.p_period_id, "period_2026-10-31");
 });
 
 test("REST client sends conditional updates used for lease renewals", async () => {

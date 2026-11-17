@@ -53,6 +53,7 @@ async function ensureCollectionBridge(client) {
           author: serializeId(message?.author) || serializeId(message?.from),
           from: serializeId(message?.from),
           to: serializeId(message?.to),
+          revokedMessageId: serializeId(message?.protocolMessageKey),
         };
       },
     };

@@ -33,10 +33,13 @@ const { jpegPerceptualHash, perceptualSimilarity, tagReceiptDuplicates } = requi
 const { calculateSettlement } = require("../server/services/settlement.cjs");
 const { createScanManager } = require("../server/sockets/scan.cjs");
 const {
+  IMAGE_AVAILABILITY,
   attachMessageSnapshotTracker,
+  classifyImageAvailability,
   discoveryStats,
   refreshRecentMessageSnapshot,
 } = require("../server/services/whatsapp-snapshot.cjs");
+const database = require("../server/services/database.cjs");
 
 test("API key parser accepts numbered env-file lines", () => {
   assert.deepEqual(
@@ -279,6 +282,54 @@ test("live message events invalidate an earlier observed snapshot without duplic
   assert.deepEqual(second.messages.map((message) => message.id), ["old", "country-fresh"]);
 });
 
+test("explicit WhatsApp revocations persist idempotent deletion tombstones", () => {
+  const client = new EventEmitter();
+  attachMessageSnapshotTracker(client, {
+    logger: { log() {}, warn() {} },
+    onConfirmedDeletion: (evidence) => database.recordDeletionTombstone(evidence),
+  });
+  const incidentId = "false_120363424816420097@g.us_3A48677346BB6FE9253F_60821199667305@lid";
+  const revoked = {
+    id: { _serialized: incidentId, remote: { _serialized: "incident-group@g.us" } },
+    from: "incident-group@g.us",
+    timestamp: Math.floor(Date.parse("2026-11-17T17:39:00+11:00") / 1000),
+  };
+  client.emit("message_revoke_everyone", { type: "revoked", from: "incident-group@g.us" }, revoked);
+  client.emit("message_revoke_everyone", { type: "revoked", from: "incident-group@g.us" }, revoked);
+  const tombstone = database.getDeletionTombstone(incidentId);
+  assert.equal(tombstone.availability_state, "CONFIRMED_DELETED");
+  assert.equal(tombstone.evidence_source, "message_revoke_everyone");
+  assert.equal(database.listDeletionTombstones({ groupId: "incident-group@g.us" }).filter((row) => row.message_id === incidentId).length, 1);
+});
+
+test("missing images remain unconfirmed when WhatsApp history is not authoritative", () => {
+  assert.equal(classifyImageAvailability({ messageId: "a", presentIds: ["a"] }), IMAGE_AVAILABILITY.PRESENT);
+  assert.equal(classifyImageAvailability({ messageId: "a", confirmedDeletedIds: ["a"] }), IMAGE_AVAILABILITY.CONFIRMED_DELETED);
+  assert.equal(classifyImageAvailability({ messageId: "a", snapshot: { retrievalVerified: false } }), IMAGE_AVAILABILITY.UNVERIFIED_HISTORY);
+  assert.equal(classifyImageAvailability({ messageId: "a", snapshot: { retrievalVerified: true, deliveryCompleteness: "unverified" } }), IMAGE_AVAILABILITY.UNCONFIRMED_MISSING);
+  const review = database.recordUnconfirmedMissing({
+    messageId: "older-missing-image",
+    groupId: "incident-group@g.us",
+    reviewReason: "Not present in an incomplete WhatsApp history window.",
+  });
+  assert.equal(review.availability_state, "UNCONFIRMED_MISSING");
+  assert.equal(database.isConfirmedDeleted("older-missing-image"), false);
+});
+
+test("confirmed deletion invalidates only its OCR cache and archives its local record", () => {
+  const id = `deleted-cache-${Date.now()}`;
+  const untouched = `untouched-cache-${Date.now()}`;
+  database.putReceipt({ id, groupId: "cache-group@g.us", date: "2026-11-17T06:39:00Z", merchant: "Untrusted", amount: 0, isBankTransfer: true });
+  database.putOcrCache(id, { isBankTransfer: true, transactionDate: "2026-04-25", transferAmount: 500 });
+  database.putOcrCache(untouched, { merchant: "Valid market", amount: 12 });
+  database.recordDeletionTombstone({ messageId: id, groupId: "cache-group@g.us", evidenceSource: "message_revoke_everyone" });
+  assert.equal(database.purgeDeletedLocalArtifacts(id), true);
+  assert.equal(database.getOcrCache()[id], undefined);
+  assert.equal(database.getOcrCache()[untouched].merchant, "Valid market");
+  assert.equal(database.getReceipt(id).status, "archived");
+  assert.equal(database.getReceipt(id).deletedFromWhatsApp, true);
+});
+
 test("disconnected and failed refreshes remain explicitly unverified", async () => {
   const disconnected = recentClient([]);
   disconnected.getState = async () => "DISCONNECTED";
@@ -416,6 +467,34 @@ test("sync preparation fails closed when cycle discovery has no freshness proof"
   });
   assert.equal(prepared, null);
   assert.match(errorMessage, /recent-message retrieval is unverified/i);
+});
+
+test("confirmed deleted images are removed from the exact active-cycle candidate set", async () => {
+  const events = new EventEmitter();
+  const groupId = "reconcile-group@g.us";
+  const startTimestamp = Math.floor(Date.parse("2026-10-31T12:00:00Z") / 1000);
+  const deletedTimestamp = Math.floor(Date.parse("2026-11-17T06:39:00Z") / 1000);
+  const deletedId = "false_120363424816420097@g.us_3A48677346BB6FE9253F_60821199667305@lid";
+  database.recordDeletionTombstone({
+    messageId: deletedId, groupId, evidenceSource: "message_revoke_everyone", sourceTimestamp: deletedTimestamp,
+  });
+  const manager = createScanManager(
+    events,
+    () => ({ client: {}, clientStatus: "READY", geminiApiKeys: ["test-key"] }),
+    { detectSettlementCycles: async () => Object.assign([{
+      id: "active-cycle", status: "ACTIVE", startDate: "2026-10-31", endDate: null,
+      startBoundary: { id: "clearance", timestamp: startTimestamp },
+      groceryMessages: [
+        { id: deletedId, timestamp: deletedTimestamp, author: "member@lid" },
+        { id: "present-receipt", timestamp: deletedTimestamp + 1, author: "member@lid" },
+      ],
+    }], { snapshot: { retrievalVerified: true, deliveryCompleteness: "unverified" } }) },
+  );
+  const prepared = await manager.prepare({
+    runId: `deleted-filter-${Date.now()}`, groupId, startDate: "2026-10-31", endDate: "2026-11-18", sync: true,
+  });
+  assert.deepEqual(prepared.candidates.map((item) => item.id), ["present-receipt"]);
+  assert.deepEqual(prepared.confirmedDeletions.map((item) => item.message_id), [deletedId]);
 });
 
 test("snapshot diagnostics separate genuine photos from missing or non-image media", () => {

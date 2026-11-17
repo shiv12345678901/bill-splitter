@@ -182,6 +182,32 @@ function migrateSchema() {
     const violation = db.prepare("PRAGMA foreign_key_check").get();
     if (violation) throw new Error(`SQLite cycle-state migration broke a foreign key in ${violation.table}.`);
   }
+  if (current < 3) {
+    transaction(() => {
+      db.exec(`
+        CREATE TABLE whatsapp_deletion_tombstones (
+          message_id TEXT PRIMARY KEY,
+          group_id TEXT NOT NULL,
+          evidence_source TEXT NOT NULL CHECK(evidence_source IN ('message_revoke_everyone','revoked_placeholder','inventory_absence')),
+          detected_at TEXT NOT NULL,
+          source_timestamp INTEGER,
+          last_verified_available_at TEXT,
+          affected_cycle_key TEXT,
+          availability_state TEXT NOT NULL DEFAULT 'CONFIRMED_DELETED'
+            CHECK(availability_state IN ('PRESENT','CONFIRMED_DELETED','UNCONFIRMED_MISSING','UNVERIFIED_HISTORY')),
+          reconciliation_status TEXT NOT NULL DEFAULT 'pending'
+            CHECK(reconciliation_status IN ('pending','reconciled','protected','review_required','failed')),
+          review_reason TEXT,
+          reconciled_at TEXT,
+          idempotency_key TEXT NOT NULL UNIQUE
+        );
+        CREATE INDEX whatsapp_deletion_group_state_idx
+          ON whatsapp_deletion_tombstones(group_id,availability_state,reconciliation_status);
+      `);
+      db.prepare("INSERT INTO schema_migrations(version, name, applied_at) VALUES(3, ?, ?)")
+        .run("persistent WhatsApp deletion tombstones", new Date().toISOString());
+    });
+  }
 }
 
 const parseJson = (value, fallback) => {
@@ -370,6 +396,116 @@ function replaceOcrCache(cache) {
     db.exec("DELETE FROM ocr_cache");
     for (const [id, payload] of Object.entries(cache || {})) putOcrCache(id, payload);
   });
+}
+
+function cycleKeyForReceipt(messageId) {
+  return db.prepare("SELECT cycle_key FROM cycle_receipts WHERE message_id=? ORDER BY cycle_key LIMIT 1")
+    .get(messageId)?.cycle_key || null;
+}
+
+function recordDeletionTombstone({
+  messageId, groupId, evidenceSource, detectedAt = new Date().toISOString(),
+  sourceTimestamp = null, lastVerifiedAvailableAt = null, affectedCycleKey = null, reviewReason = null,
+} = {}) {
+  if (!messageId || !groupId) throw new Error("A WhatsApp deletion tombstone requires message and group identities.");
+  if (!["message_revoke_everyone", "revoked_placeholder"].includes(evidenceSource))
+    throw new Error("Unsupported WhatsApp deletion evidence source.");
+  const cycleKey = affectedCycleKey || cycleKeyForReceipt(messageId);
+  const idempotencyKey = `whatsapp-delete:${messageId}`;
+  db.prepare(`
+    INSERT INTO whatsapp_deletion_tombstones(
+      message_id,group_id,evidence_source,detected_at,last_verified_available_at,
+      source_timestamp,affected_cycle_key,availability_state,reconciliation_status,review_reason,idempotency_key
+    ) VALUES(?,?,?,?,?,?,?,'CONFIRMED_DELETED','pending',?,?)
+    ON CONFLICT(message_id) DO UPDATE SET
+      group_id=excluded.group_id,
+      evidence_source=CASE
+        WHEN whatsapp_deletion_tombstones.evidence_source='message_revoke_everyone' THEN whatsapp_deletion_tombstones.evidence_source
+        ELSE excluded.evidence_source END,
+      detected_at=MIN(whatsapp_deletion_tombstones.detected_at,excluded.detected_at),
+      source_timestamp=COALESCE(whatsapp_deletion_tombstones.source_timestamp,excluded.source_timestamp),
+      last_verified_available_at=COALESCE(whatsapp_deletion_tombstones.last_verified_available_at,excluded.last_verified_available_at),
+      affected_cycle_key=COALESCE(whatsapp_deletion_tombstones.affected_cycle_key,excluded.affected_cycle_key),
+      availability_state='CONFIRMED_DELETED',
+      reconciliation_status=CASE WHEN whatsapp_deletion_tombstones.reconciliation_status='reconciled' THEN 'reconciled' ELSE 'pending' END,
+      review_reason=COALESCE(excluded.review_reason,whatsapp_deletion_tombstones.review_reason)
+  `).run(messageId, groupId, evidenceSource, detectedAt, lastVerifiedAvailableAt, sourceTimestamp, cycleKey, reviewReason, idempotencyKey);
+  return getDeletionTombstone(messageId);
+}
+
+function getDeletionTombstone(messageId) {
+  return db.prepare("SELECT * FROM whatsapp_deletion_tombstones WHERE message_id=?").get(messageId) || null;
+}
+
+function recordUnconfirmedMissing({ messageId, groupId, detectedAt = new Date().toISOString(), reviewReason = null } = {}) {
+  if (!messageId || !groupId) throw new Error("A missing-image review record requires message and group identities.");
+  db.prepare(`
+    INSERT INTO whatsapp_deletion_tombstones(
+      message_id,group_id,evidence_source,detected_at,availability_state,reconciliation_status,review_reason,idempotency_key
+    ) VALUES(?,?, 'inventory_absence',?,'UNCONFIRMED_MISSING','review_required',?,?)
+    ON CONFLICT(message_id) DO UPDATE SET
+      review_reason=COALESCE(excluded.review_reason,whatsapp_deletion_tombstones.review_reason)
+    WHERE whatsapp_deletion_tombstones.availability_state<>'CONFIRMED_DELETED'
+  `).run(messageId, groupId, detectedAt, reviewReason, `whatsapp-missing:${messageId}`);
+  return getDeletionTombstone(messageId);
+}
+
+function listDeletionTombstones({ groupId = null, state = null, statuses = null } = {}) {
+  let sql = "SELECT * FROM whatsapp_deletion_tombstones WHERE 1=1";
+  const args = [];
+  if (groupId) { sql += " AND group_id=?"; args.push(groupId); }
+  if (state) { sql += " AND availability_state=?"; args.push(state); }
+  if (statuses?.length) {
+    sql += ` AND reconciliation_status IN (${statuses.map(() => "?").join(",")})`;
+    args.push(...statuses);
+  }
+  return db.prepare(`${sql} ORDER BY detected_at,message_id`).all(...args);
+}
+
+function isConfirmedDeleted(messageId) {
+  return getDeletionTombstone(messageId)?.availability_state === "CONFIRMED_DELETED";
+}
+
+function updateDeletionReconciliation(messageId, status, reason = null) {
+  if (!["pending", "reconciled", "protected", "review_required", "failed"].includes(status))
+    throw new Error("Invalid deletion reconciliation status.");
+  db.prepare(`UPDATE whatsapp_deletion_tombstones
+    SET reconciliation_status=?,review_reason=?,reconciled_at=CASE WHEN ?='reconciled' THEN ? ELSE reconciled_at END
+    WHERE message_id=?`).run(status, reason, status, new Date().toISOString(), messageId);
+  return getDeletionTombstone(messageId);
+}
+
+function purgeDeletedLocalArtifacts(messageId) {
+  return transaction(() => {
+    const tombstone = getDeletionTombstone(messageId);
+    if (!tombstone || tombstone.availability_state !== "CONFIRMED_DELETED") return false;
+    db.prepare("DELETE FROM ocr_cache WHERE message_id=?").run(messageId);
+    const row = db.prepare("SELECT payload_json FROM receipt_records WHERE message_id=?").get(messageId);
+    if (row) {
+      const payload = parseJson(row.payload_json, {});
+      payload.status = "archived";
+      payload.isExcluded = true;
+      payload.deletedFromWhatsApp = true;
+      delete payload.transferAmount;
+      delete payload.transferRecipient;
+      delete payload.transferReference;
+      db.prepare("UPDATE receipt_records SET status='archived',is_bank_transfer=0,amount_cents=0,payload_json=? WHERE message_id=?")
+        .run(JSON.stringify(payload), messageId);
+    }
+    return true;
+  });
+}
+
+function markReceiptReviewRequired(messageId, code) {
+  const row = db.prepare("SELECT payload_json FROM receipt_records WHERE message_id=?").get(messageId);
+  if (!row) return false;
+  const payload = parseJson(row.payload_json, {});
+  payload.needsReview = true;
+  payload.validationCode = String(code || "BANK_EVIDENCE_REVIEW_REQUIRED");
+  payload.isExcluded = true;
+  db.prepare("UPDATE receipt_records SET status='excluded',payload_json=? WHERE message_id=?")
+    .run(JSON.stringify(payload), messageId);
+  return true;
 }
 
 function getHistory() {
@@ -694,6 +830,14 @@ module.exports = {
   getOcrCache,
   putOcrCache,
   replaceOcrCache,
+  recordDeletionTombstone,
+  getDeletionTombstone,
+  recordUnconfirmedMissing,
+  listDeletionTombstones,
+  isConfirmedDeleted,
+  updateDeletionReconciliation,
+  purgeDeletedLocalArtifacts,
+  markReceiptReviewRequired,
   getHistory,
   replaceHistory,
   createScanJob,

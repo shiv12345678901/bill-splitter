@@ -6,6 +6,7 @@ const {
   upsertReceiptCacheEntry,
 } = require("./storage.cjs");
 const library = require("./library.cjs");
+const database = require("./database.cjs");
 const { jpegPerceptualHash } = require("./receipt-dedup.cjs");
 const pendingOcrByContentHash = new Map();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -162,6 +163,12 @@ module.exports = async function processReceipts({
       };
 
       try {
+        if (database.isConfirmedDeleted(msg.id)) {
+          await recordOutcome("excluded", {
+            reason: "WHATSAPP_IMAGE_CONFIRMED_DELETED",
+          });
+          continue;
+        }
         const senderName = await resolveSender(msg);
 
         if (
