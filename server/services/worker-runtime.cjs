@@ -1,5 +1,11 @@
 const fs = require("node:fs");
 const path = require("node:path");
+const PRODUCTION_MEMBERS = Object.freeze([
+  "Shiva Kafle",
+  "Arjun Bhurtel",
+  "Arpan Bhurtel",
+  "Swasti Adhikari",
+]);
 
 function loadContract(filename) {
   if (!filename) return { approved: false, reason: "Missing reviewed worker contract." };
@@ -15,6 +21,9 @@ function loadContract(filename) {
     if (value.settlementIdMode !== "existing-only") throw new Error("Production settlement creation is disabled; use existing-only.");
     if (!Array.isArray(value.members) || value.members.length !== 4 || value.members.some((m) => typeof m !== "string" || !m.trim() || m !== m.trim()) || new Set(value.members).size !== value.members.length)
       throw new Error("Supply the four distinct canonical household member names.");
+    if (value.members.some((member) => !PRODUCTION_MEMBERS.includes(member)) ||
+        PRODUCTION_MEMBERS.some((member) => !value.members.includes(member)))
+      throw new Error("The reviewed production contract requires the four registered household members.");
     if (!value.aliases || typeof value.aliases !== "object" || Object.values(value.aliases).some((m) => !value.members.includes(m))) throw new Error("Aliases must map to reviewed members.");
     return { approved: true, value };
   } catch (error) { return { approved: false, reason: error.message }; }
@@ -38,4 +47,4 @@ function healthy(state, { ready = false, now = Date.now() } = {}) {
   return now - Date.parse(state.updatedAt) < 45000 && now >= Date.parse(state.updatedAt) && !state.stopping && (!ready || state.ready === true);
 }
 
-module.exports = { loadContract, createDiagnostics, healthy };
+module.exports = { PRODUCTION_MEMBERS, loadContract, createDiagnostics, healthy };

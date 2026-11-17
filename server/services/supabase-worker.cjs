@@ -129,6 +129,12 @@ function evidenceError(code, message) {
   return error;
 }
 
+function whatsappGroupIdentityHash(groupId) {
+  const value = String(groupId || "").trim();
+  if (!value.endsWith("@g.us")) throw new Error("Invalid WhatsApp group identity.");
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
 function centsFromAmount(value) {
   if (value === null || value === undefined || typeof value === "boolean" || String(value).trim() === "") return null;
   const amount = Number(value);
@@ -780,12 +786,21 @@ function createSupabaseWorker({
       stage: "reconciling_images",
       stage_message: `Reconciling ${deletions.length} explicitly deleted WhatsApp image(s)…`,
     });
-    const evidence = deletions.map((item) => ({
-      source_message_id: item.message_id,
-      evidence_source: item.evidence_source,
-      detected_at: item.detected_at,
-      idempotency_key: item.idempotency_key,
-    }));
+    const cycleBoundaryId = String(scanJob.selectedCycleData?.startBoundary?.id || "").trim();
+    const scanGroupId = String(scanJob.groupId || "").trim();
+    if (!cycleBoundaryId || !scanGroupId) throw new Error("WHATSAPP_IMAGE_AVAILABILITY_UNVERIFIED");
+    const groupIdentityHash = whatsappGroupIdentityHash(scanGroupId);
+    const evidence = deletions.map((item) => {
+      if (item.group_id !== scanGroupId) throw new Error("WHATSAPP_IMAGE_INVALID_PROVENANCE");
+      return {
+        source_message_id: item.message_id,
+        evidence_source: item.evidence_source,
+        detected_at: item.detected_at,
+        group_identity_hash: groupIdentityHash,
+        cycle_start_boundary_id: cycleBoundaryId,
+        idempotency_key: item.idempotency_key,
+      };
+    });
     const result = await client.rpc("reconcile_deleted_whatsapp_images", {
       p_job_id: String(job.id),
       p_worker_id: workerId,
@@ -994,6 +1009,13 @@ function createSupabaseWorker({
         ...savedBankEvidence.rows.map((row) => ({ source_message_id: row.id, source_kind: "bank_evidence" })),
       ];
       if (managedSources.length) {
+        const cycleBoundaryId = String(cycle.startBoundary?.id || "").trim();
+        if (!cycleBoundaryId) throw new Error("The verified WhatsApp cycle has no immutable start boundary.");
+        const groupIdentityHash = whatsappGroupIdentityHash(context.groupId);
+        for (const source of managedSources) {
+          source.group_identity_hash = groupIdentityHash;
+          source.cycle_start_boundary_id = cycleBoundaryId;
+        }
         await client.rpc("prepare_instabox_whatsapp_sources", {
           p_job_id: String(job.id), p_worker_id: workerId, p_period_id: String(period.id), p_sources: managedSources,
         });
@@ -1227,4 +1249,5 @@ module.exports = {
   validateBankTransferEvidence,
   assertReceiptCycleAssignment,
   settlementForReceipts,
+  whatsappGroupIdentityHash,
 };

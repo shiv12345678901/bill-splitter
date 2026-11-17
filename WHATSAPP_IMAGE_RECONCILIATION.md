@@ -13,8 +13,9 @@ The 17 November incident combined two defects: the worker had no persistent revo
 - SQLite tombstones are keyed by immutable WhatsApp message ID and survive restart.
 - Confirmed IDs are excluded before discovery and again before OCR/cache reuse.
 - Missing IDs from incomplete history are preserved for manual review.
-- The Supabase migration registers only sources explicitly prepared by a currently leased InstaBox job and inserted after the migration. Existing Muse rows are not eligible for automatic deletion.
-- The reconciliation RPC accepts only `CURRENT` periods, an active lease, enabled production writes, exact period/source identities, supported deletion evidence, and deterministic idempotency keys.
+- The Supabase migration registers only sources explicitly prepared by a currently leased InstaBox job and inserted after the migration. Registration binds each source to a hashed WhatsApp group identity and immutable cycle-start boundary. Existing Muse rows are not eligible for automatic deletion.
+- The reconciliation RPC accepts only `CURRENT`/`ACTIVE` periods with `UNINITIALIZED` payment obligations, an active lease, enabled production writes, exact period/source/group/boundary identities, supported deletion evidence, and deterministic idempotency keys.
+- Reconciliation accepts exactly the reviewed four members: Shiva Kafle, Arjun Bhurtel, Arpan Bhurtel and Swasti Adhikari. Three-member cycles require a separate future membership migration.
 - Grocery deletion, audit insertion and aggregate recalculation are one PostgreSQL transaction. `settlements.owes`, payment obligations and verification fields are never updated.
 - Pending bank evidence may be removed. Reviewed evidence, historical rows and unregistered legacy rows are protected.
 - Local image/cache cleanup happens only after the database RPC succeeds. Shared image files are retained.
@@ -41,6 +42,11 @@ select has_function_privilege('service_role',
 
 select count(*) from public.instabox_managed_whatsapp_sources; -- initially 0
 select count(*) from public.whatsapp_image_reconciliation_audit; -- initially 0
+
+select id,status,whatsapp_cycle_status,whatsapp_start_boundary
+from public.periods where id='period_2026-10-31';
+select id,payment_obligations_status,total_cents,per_person_cents,receipt_count,owes
+from public.settlements where id='settlement_2026-10-31_current';
 
 select id,total_cents,per_person_cents,receipt_count from public.periods order by start_date;
 select id,period_id,total_cents,per_person_cents,member_totals,receipt_count,owes

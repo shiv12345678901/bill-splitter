@@ -32,9 +32,14 @@ test("missing or incomplete production contracts cannot enable writes", () => {
   const filename = path.join(folder, "contract.json");
   const value = { verified: true, schemaReviewed: true, museRulesReviewed: true, legacySourceIdsReviewed: true,
     legacyWorkerStopped: true, dependencyAuditReviewed: true, reviewReference: "fixture review", sourceIdMode: "receipt-id", dateMode: "UTC",
-    shareRounding: "floor", zeroAmountPolicy: "preserve", members: ["Alex", "Jamie", "Morgan", "Taylor"], aliases: { sender: "Alex" }, settlementIdMode: "existing-only" };
+    shareRounding: "floor", zeroAmountPolicy: "preserve",
+    members: ["Shiva Kafle", "Arjun Bhurtel", "Arpan Bhurtel", "Swasti Adhikari"],
+    aliases: { sender: "Shiva Kafle" }, settlementIdMode: "existing-only" };
   fs.writeFileSync(filename, JSON.stringify(value));
   assert.equal(loadContract(filename).approved, true);
+  fs.writeFileSync(filename, JSON.stringify({ ...value, members: ["Alex", "Jamie", "Morgan", "Taylor"], aliases: { sender: "Alex" } }));
+  assert.equal(loadContract(filename).approved, false);
+  fs.writeFileSync(filename, JSON.stringify(value));
   fs.writeFileSync(filename, JSON.stringify({ ...value, aliases: { sender: "Unknown" } }));
   assert.equal(loadContract(filename).approved, false);
 });
@@ -65,4 +70,10 @@ test("worker uses the supported Client userAgent option with a configurable Chro
   const worker = fs.readFileSync("server/worker-sync.cjs", "utf8");
   assert.match(worker, /userAgent: whatsappUserAgent/);
   assert.doesNotMatch(worker, /puppeteer:\s*\{[^}]*userAgent:/s);
+});
+
+test("production worker fails closed until Supabase advertises capability version 7", () => {
+  const source = fs.readFileSync("server/services/supabase-worker.cjs", "utf8");
+  assert.match(source, /capabilities\?\.version === 7/);
+  assert.doesNotMatch(source, /capabilities\?\.version >= 6/);
 });

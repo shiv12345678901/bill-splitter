@@ -12,6 +12,7 @@ const {
   validateBankTransferEvidence,
   assertReceiptCycleAssignment,
   settlementForReceipts,
+  whatsappGroupIdentityHash,
   SupabaseRestClient,
   resolveSupabaseServerKey,
   REQUIRED_COLUMNS,
@@ -114,6 +115,27 @@ test("bank evidence uses Sydney period dates and distinguishes unknown from expl
   assert.throws(
     () => validateBankTransferEvidence({ ...base, paidBy: "" }, period, { sender: "Alex" }),
     (error) => error.code === "BANK_EVIDENCE_MISSING_SENDER",
+  );
+});
+
+test("the November 17 deleted screenshot OCR cannot become financial evidence", () => {
+  const period = { id: "period_2026-10-31", start_date: "2026-10-31", end_date: null };
+  const incident = {
+    id: "false_120363424816420097@g.us_3A48677346BB6FE9253F_60821199667305@lid",
+    isBankTransfer: true,
+    date: "2026-11-17T06:39:00.000Z",
+    paidBy: "",
+    transactionDate: "2026-04-25",
+    transferAmount: 500,
+    amount: 0,
+  };
+  assert.throws(
+    () => validateBankTransferEvidence(incident, period, { sender: "Shiva Kafle" }),
+    (error) => error.code === "BANK_EVIDENCE_MISSING_SENDER",
+  );
+  assert.throws(
+    () => validateBankTransferEvidence({ ...incident, paidBy: "sender" }, period, { sender: "Shiva Kafle" }),
+    (error) => error.code === "BANK_EVIDENCE_DATE_OUTSIDE_PERIOD",
   );
 });
 
@@ -240,7 +262,7 @@ function fakeIntegration({ failInsert = false, periodStatus = "CURRENT" } = {}) 
     transactionalWrites: false,
     workerId: "test-worker",
     settlementIdMode: "text",
-    loadUserConfig: () => ({ defaultGroupId: "fixture-group", aliases: { sender: "Alex" } }),
+    loadUserConfig: () => ({ defaultGroupId: "fixture-group@g.us", aliases: { sender: "Alex" } }),
     localDatabase: { getScanJob: () => ({ status: "complete", result: { expenses } }) },
     imageLoader: async () => ({ buffer: Buffer.from("fixture-image"), mimetype: "image/jpeg" }),
     scanManager: { prepare: async () => ({ jobId: "local", expectedImages: 3 }), runAndGet: async () => {} },
@@ -332,7 +354,7 @@ test("a retry follows an already committed rollover only when boundary IDs match
     mode: "dry-run",
     transactionalWrites: false,
     settlementIdMode: "text",
-    groupId: "fixture-group",
+    groupId: "fixture-group@g.us",
     loadUserConfig: () => ({ aliases: {} }),
     scanManager: {
       detectCycles: async () => [{
@@ -414,7 +436,7 @@ test("transactional publishing records pending-cycle metadata before finalizing 
         zeroAmountPolicy: "preserve",
       },
     },
-    groupId: "fixture-group",
+    groupId: "fixture-group@g.us",
     loadUserConfig: () => ({ aliases: {} }),
     scanManager: {
       detectCycles: async () => [{
@@ -476,8 +498,8 @@ test("transactional publishing records pending-cycle metadata before finalizing 
     "prepare_instabox_whatsapp_sources", "record_period_cycle_state", "record_whatsapp_bank_evidence", "finalize_sync_request",
   ]);
   assert.deepEqual(rpcCalls[0].body.p_sources, [
-    { source_message_id: "receipt-1", source_kind: "receipt" },
-    { source_message_id: "bank-1", source_kind: "bank_evidence" },
+    { source_message_id: "receipt-1", source_kind: "receipt", group_identity_hash: whatsappGroupIdentityHash("fixture-group@g.us"), cycle_start_boundary_id: startBoundary.id },
+    { source_message_id: "bank-1", source_kind: "bank_evidence", group_identity_hash: whatsappGroupIdentityHash("fixture-group@g.us"), cycle_start_boundary_id: startBoundary.id },
   ]);
   assert.equal(rpcCalls[1].body.p_cycle_status, "PENDING_SETTLEMENT");
   assert.deepEqual(rpcCalls[1].body.p_calculation_message, calculationMessage);
@@ -525,6 +547,22 @@ test("equal shares match historical Muse cent rounding", () => {
   }
 });
 
+test("production four-member aggregate matches the current 74284-cent settlement", () => {
+  const members = ["Shiva Kafle", "Arjun Bhurtel", "Arpan Bhurtel", "Swasti Adhikari"];
+  const settlement = settlementForReceipts([
+    { id: "current-total", amount_cents: 74284, payer: "Shiva Kafle", merchant: "Fixture", date: "2026-11-17", is_excluded: false },
+  ], members);
+  assert.equal(settlement.totalCents, 74284);
+  assert.equal(settlement.perPersonCents, 18571);
+  assert.equal(settlement.receiptCount, 1);
+  assert.deepEqual(settlement.memberTotals, {
+    "Arjun Bhurtel": 0,
+    "Arpan Bhurtel": 0,
+    "Shiva Kafle": 74284,
+    "Swasti Adhikari": 0,
+  });
+});
+
 test("a verified clearance rolls forward before November receipts are scanned", async () => {
   const rpcCalls = [];
   let preparedContext = null;
@@ -544,7 +582,7 @@ test("a verified clearance rolls forward before November receipts are scanned", 
         shareRounding: "floor", settlementIdMode: "existing-only", zeroAmountPolicy: "preserve",
       },
     },
-    groupId: "fixture-group",
+    groupId: "fixture-group@g.us",
     loadUserConfig: () => ({ aliases: {} }),
     scanManager: {
       detectCycles: async () => [
@@ -558,8 +596,16 @@ test("a verified clearance rolls forward before November receipts are scanned", 
       runAndGet: async () => {},
     },
     localDatabase: {
+      purgeDeletedLocalArtifacts: () => true,
+      updateDeletionReconciliation: () => {},
       getScanJob: () => ({
         status: "complete",
+        groupId: "fixture-group@g.us",
+        confirmedDeletions: [{
+          message_id: "deleted-source", group_id: "fixture-group@g.us",
+          evidence_source: "message_revoke_everyone", detected_at: "2026-11-17T07:00:00Z",
+          idempotency_key: "whatsapp-delete:deleted-source",
+        }],
         selectedCycleData: {
           id: "cycle_current", startDate: "2026-10-31", endDate: null,
           startBoundary, endBoundary: null, status: "ACTIVE",
@@ -594,14 +640,16 @@ test("a verified clearance rolls forward before November receipts are scanned", 
   });
   await worker.processClaimedJob({ id: "11111111-1111-4111-8111-111111111111" }, { assert() {} });
   assert.deepEqual(rpcCalls.map((call) => call.name), [
-    "rollover_settlement_period", "prepare_instabox_whatsapp_sources", "record_period_cycle_state", "finalize_sync_request",
+    "rollover_settlement_period", "reconcile_deleted_whatsapp_images", "prepare_instabox_whatsapp_sources", "record_period_cycle_state", "finalize_sync_request",
   ]);
   assert.equal(rpcCalls[0].body.p_old_period_id, "period_2026-10-10");
   assert.equal(rpcCalls[0].body.p_new_period_id, "period_2026-10-31");
   assert.equal(rpcCalls[0].body.p_new_settlement_id, "settlement_2026-10-31_current");
+  assert.equal(rpcCalls[1].body.p_deletions[0].cycle_start_boundary_id, "clearance-31-oct");
+  assert.equal(rpcCalls[1].body.p_deletions[0].group_identity_hash, whatsappGroupIdentityHash("fixture-group@g.us"));
   assert.equal(preparedContext.startDate, "2026-10-31");
   assert.equal(preparedContext.cycleBoundaryId, "clearance-31-oct");
-  assert.equal(rpcCalls[3].body.p_period_id, "period_2026-10-31");
+  assert.equal(rpcCalls[4].body.p_period_id, "period_2026-10-31");
 });
 
 test("REST client sends conditional updates used for lease renewals", async () => {
@@ -782,7 +830,7 @@ test("a lost job lease stops processing before receipt writes", async () => {
       update: async () => [],
       insert: async () => { throw new Error("no insert should occur after lease loss"); },
     },
-    groupId: "fixture-group",
+    groupId: "fixture-group@g.us",
     getConnection: () => ({ client: {}, clientStatus: "READY", geminiApiKeys: ["fixture-key"] }),
     scanManager: { prepare: async () => { scans++; } },
     logger: { log() {}, warn() {}, error() {} },

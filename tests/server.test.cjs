@@ -330,6 +330,25 @@ test("confirmed deletion invalidates only its OCR cache and archives its local r
   assert.equal(database.getReceipt(id).deletedFromWhatsApp, true);
 });
 
+test("deleted local image cleanup preserves files still shared by another record", async () => {
+  const firstId = `shared-deleted-${Date.now()}`;
+  const secondId = `${firstId}-copy`;
+  const first = await library.recordImage({
+    id: firstId, groupId: "cache-group@g.us", buffer: Buffer.from("shared-image"),
+    mimetype: "image/jpeg", ocr: { merchant: "Fixture", amount: 10 }, senderName: "Shiva Kafle", timestamp: 1794890000,
+  });
+  await library.recordImage({
+    id: secondId, groupId: "cache-group@g.us", mimetype: "image/jpeg",
+    ocr: { merchant: "Fixture", amount: 10 }, senderName: "Shiva Kafle", timestamp: 1794890001, dedupOf: first,
+  });
+  const imagePath = path.join(database.DATA_DIR, "media_cache", first.fileName);
+  database.recordDeletionTombstone({ messageId: firstId, groupId: "cache-group@g.us", evidenceSource: "message_revoke_everyone" });
+  database.purgeDeletedLocalArtifacts(firstId);
+  assert.equal(library.removeDeletedImageIfUnshared(firstId), false);
+  assert.equal(fs.existsSync(imagePath), true);
+  assert.equal(database.getReceipt(secondId).status || "processed", "processed");
+});
+
 test("disconnected and failed refreshes remain explicitly unverified", async () => {
   const disconnected = recentClient([]);
   disconnected.getState = async () => "DISCONNECTED";
