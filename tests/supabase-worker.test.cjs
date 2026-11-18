@@ -510,6 +510,193 @@ test("transactional publishing records pending-cycle metadata before finalizing 
   assert.deepEqual(rpcCalls[3].body.p_receipts.map((row) => row.id), ["receipt-1"]);
 });
 
+function transactionalOwnershipFixture({
+  expenses,
+  existingReceipts = [],
+  existingBankEvidence = [],
+  failFinalizeOnce = false,
+}) {
+  const receiptRows = new Map(existingReceipts.map((row) => [row.id, { ...row }]));
+  const bankRows = new Map(existingBankEvidence.map((row) => [row.id, { ...row }]));
+  const rpcCalls = [];
+  const uploads = [];
+  let shouldFailFinalize = failFinalizeOnce;
+  const startBoundary = {
+    id: "ownership-start",
+    timestamp: timestamp("2026-09-30T14:00:00Z") - 1,
+    source: "marker",
+    confidence: "HIGH",
+  };
+  const candidates = expenses.map((expense) => ({
+    id: expense.id,
+    timestamp: timestamp(expense.date),
+  }));
+  const worker = createSupabaseWorker({
+    mode: "dry-run",
+    transactionalWrites: true,
+    workerId: "ownership-worker",
+    contract: {
+      approved: true,
+      value: {
+        members: ["Alex", "Jamie", "Morgan", "Taylor"],
+        aliases: {},
+        shareRounding: "round",
+        settlementIdMode: "existing-only",
+        zeroAmountPolicy: "preserve",
+      },
+    },
+    groupId: "fixture-group@g.us",
+    loadUserConfig: () => ({ aliases: {} }),
+    scanManager: {
+      detectCycles: async () => [{
+        id: "cycle_current", status: "ACTIVE", settlementConfirmed: false,
+        startDate: "2026-10-01", endDate: null, startBoundary,
+      }],
+      prepare: async () => ({ jobId: "ownership-local", expectedImages: expenses.length, status: "queued" }),
+      runAndGet: async () => {},
+    },
+    localDatabase: {
+      getScanJob: () => ({
+        status: "complete",
+        selectedCycleData: {
+          id: "cycle_current", status: "ACTIVE", startDate: "2026-10-01", endDate: null,
+          startBoundary, endBoundary: null, calculationMessage: null, clearanceMessage: null,
+        },
+        candidates,
+        result: { expenses },
+        reconciliation: { failed: 0, queued: 0 },
+      }),
+    },
+    imageLoader: async (expense) => ({ buffer: Buffer.from(`image:${expense.id}`), mimetype: "image/jpeg" }),
+    client: {
+      select: async (table, query = {}) => {
+        if (table === "periods")
+          return [{ id: "p", status: "CURRENT", start_date: "2026-10-01", end_date: "2026-10-31", whatsapp_start_boundary: startBoundary }];
+        const id = query.id?.slice(3);
+        if (table === "receipts") return receiptRows.has(id) ? [receiptRows.get(id)] : [];
+        if (table === "whatsapp_bank_transfer_evidence") return bankRows.has(id) ? [bankRows.get(id)] : [];
+        return [];
+      },
+      upload: async (objectPath) => uploads.push(objectPath),
+      update: async (table, filters, body) => table === "sync_requests" ? [{ id: "job", ...body }] : [],
+      rpc: async (name, body) => {
+        rpcCalls.push({ name, body });
+        if (name === "record_whatsapp_bank_evidence") {
+          for (const row of body.p_evidence) {
+            if (!bankRows.has(row.id)) bankRows.set(row.id, { ...row });
+          }
+        }
+        if (name === "finalize_sync_request") {
+          if (shouldFailFinalize) {
+            shouldFailFinalize = false;
+            throw new Error("simulated finalization interruption");
+          }
+          // The production RPC uses ON CONFLICT DO NOTHING, preserving manual edits.
+          for (const row of body.p_receipts) {
+            if (!receiptRows.has(row.id)) receiptRows.set(row.id, { ...row });
+          }
+          return { result_summary: "done" };
+        }
+        return null;
+      },
+    },
+  });
+  return { worker, receiptRows, bankRows, rpcCalls, uploads, startBoundary };
+}
+
+test("source registration excludes a legacy receipt while finalization retains legacy and new rows", async () => {
+  const legacy = {
+    id: "legacy-receipt", period_id: "p", source_message_id: null,
+    merchant: "Manual merchant", payer: "Jamie", amount_cents: 4321,
+    date: "2026-10-02", is_excluded: true, image_url: "storage://bill-evidence/manual.jpg",
+  };
+  const fixture = transactionalOwnershipFixture({
+    existingReceipts: [legacy],
+    expenses: [
+      { id: "legacy-receipt", date: "2026-10-02T01:00:00Z", paidBy: "Alex", merchant: "OCR overwrite", amount: 10, category: "Groceries" },
+      { id: "new-receipt", date: "2026-10-03T01:00:00Z", paidBy: "Alex", merchant: "New market", amount: 20, category: "Groceries" },
+    ],
+  });
+
+  await fixture.worker.processClaimedJob({ id: "11111111-1111-4111-8111-111111111111" }, { assert() {} });
+  const prepare = fixture.rpcCalls.find((call) => call.name === "prepare_instabox_whatsapp_sources");
+  const finalize = fixture.rpcCalls.find((call) => call.name === "finalize_sync_request");
+  assert.deepEqual(prepare.body.p_sources.map((source) => source.source_message_id), ["new-receipt"]);
+  assert.deepEqual(finalize.body.p_receipts.map((row) => row.id), ["legacy-receipt", "new-receipt"]);
+  assert.equal(fixture.receiptRows.size, 2);
+  assert.equal(fixture.receiptRows.get("legacy-receipt").merchant, "Manual merchant");
+  assert.equal(fixture.receiptRows.get("legacy-receipt").is_excluded, true);
+});
+
+test("a scan containing only legacy receipts finalizes idempotently without claiming ownership", async () => {
+  const fixture = transactionalOwnershipFixture({
+    existingReceipts: [{
+      id: "legacy-only", period_id: "p", merchant: "Reviewed", payer: "Alex", amount_cents: 1234,
+      date: "2026-10-02", is_excluded: false, image_url: "storage://bill-evidence/reviewed.jpg",
+    }],
+    expenses: [{ id: "legacy-only", date: "2026-10-02T01:00:00Z", paidBy: "Alex", merchant: "OCR", amount: 12.34, category: "Groceries" }],
+  });
+
+  await fixture.worker.processClaimedJob({ id: "22222222-2222-4222-8222-222222222222" }, { assert() {} });
+  assert.equal(fixture.rpcCalls.some((call) => call.name === "prepare_instabox_whatsapp_sources"), false);
+  const finalize = fixture.rpcCalls.find((call) => call.name === "finalize_sync_request");
+  assert.deepEqual(finalize.body.p_receipts.map((row) => row.id), ["legacy-only"]);
+});
+
+test("a successfully registered new receipt is not registered again on retry", async () => {
+  const fixture = transactionalOwnershipFixture({
+    expenses: [{ id: "retry-receipt", date: "2026-10-02T01:00:00Z", paidBy: "Alex", merchant: "Market", amount: 10, category: "Groceries" }],
+  });
+  const job = { id: "33333333-3333-4333-8333-333333333333" };
+
+  await fixture.worker.processClaimedJob(job, { assert() {} });
+  await fixture.worker.processClaimedJob(job, { assert() {} });
+  assert.equal(fixture.rpcCalls.filter((call) => call.name === "prepare_instabox_whatsapp_sources").length, 1);
+  assert.equal(fixture.rpcCalls.filter((call) => call.name === "finalize_sync_request").length, 2);
+  assert.equal(fixture.receiptRows.size, 1);
+});
+
+test("retry after pending source registration safely completes one receipt", async () => {
+  const fixture = transactionalOwnershipFixture({
+    failFinalizeOnce: true,
+    expenses: [{ id: "pending-receipt", date: "2026-10-02T01:00:00Z", paidBy: "Alex", merchant: "Market", amount: 10, category: "Groceries" }],
+  });
+  const job = { id: "55555555-5555-4555-8555-555555555555" };
+
+  await assert.rejects(
+    () => fixture.worker.processClaimedJob(job, { assert() {} }),
+    /simulated finalization interruption/,
+  );
+  await fixture.worker.processClaimedJob(job, { assert() {} });
+  const preparations = fixture.rpcCalls.filter((call) => call.name === "prepare_instabox_whatsapp_sources");
+  assert.equal(preparations.length, 2);
+  assert.deepEqual(preparations[0].body.p_sources, preparations[1].body.p_sources);
+  assert.equal(fixture.receiptRows.size, 1);
+});
+
+test("retry after bank evidence insertion neither re-registers nor duplicates evidence", async () => {
+  const fixture = transactionalOwnershipFixture({
+    failFinalizeOnce: true,
+    expenses: [{
+      id: "bank-retry", date: "2026-10-02T01:00:00Z", paidBy: "Alex",
+      isBankTransfer: true, transferAmount: 25, transactionDate: "2026-10-02",
+      transferRecipient: "Jamie", transferReference: "TEST-REFERENCE",
+    }],
+  });
+  const job = { id: "44444444-4444-4444-8444-444444444444" };
+
+  await assert.rejects(
+    () => fixture.worker.processClaimedJob(job, { assert() {} }),
+    /simulated finalization interruption/,
+  );
+  await fixture.worker.processClaimedJob(job, { assert() {} });
+  assert.equal(fixture.rpcCalls.filter((call) => call.name === "prepare_instabox_whatsapp_sources").length, 1);
+  assert.equal(fixture.rpcCalls.filter((call) => call.name === "record_whatsapp_bank_evidence").length, 1);
+  assert.equal(fixture.rpcCalls.filter((call) => call.name === "finalize_sync_request").length, 2);
+  assert.equal(fixture.bankRows.size, 1);
+  assert.equal(fixture.receiptRows.size, 0);
+});
+
 test("settlement totals use cents, stable members, and exclude transfer proofs", () => {
   const settlement = settlementForReceipts([
     { id: "a", amount_cents: 101, payer: "Alex", merchant: "Shop", date: "2026-10-01", is_excluded: false },

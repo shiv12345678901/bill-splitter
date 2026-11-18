@@ -726,7 +726,7 @@ function createSupabaseWorker({
   }
 
   async function syncReceipts(expenses, periodId, lease) {
-    const result = { inserted: 0, existing: 0, invalid: [], rows: [] };
+    const result = { inserted: 0, existing: 0, invalid: [], rows: [], registrationRows: [] };
     const seen = new Set();
     for (const expense of expenses || []) {
       const id = String(expense?.id || "");
@@ -741,14 +741,16 @@ function createSupabaseWorker({
       }
         const outcome = await persistReceipt(expense, periodId, lease);
         if (outcome.row) result.rows.push(outcome.row);
-        if (outcome.inserted) result.inserted++;
-        else result.existing++;
+        if (outcome.inserted) {
+          result.inserted++;
+          if (outcome.row) result.registrationRows.push(outcome.row);
+        } else result.existing++;
     }
     return result;
   }
 
   async function syncBankEvidence(expenses, period, lease) {
-    const result = { inserted: 0, existing: 0, invalid: [], rows: [] };
+    const result = { inserted: 0, existing: 0, invalid: [], rows: [], registrationRows: [] };
     const seen = new Set();
     for (const expense of expenses || []) {
       const id = String(expense?.id || "");
@@ -757,8 +759,10 @@ function createSupabaseWorker({
       try {
         const outcome = await persistBankEvidence(expense, period, lease);
         if (outcome.row) result.rows.push(outcome.row);
-        if (outcome.inserted) result.inserted++;
-        else result.existing++;
+        if (outcome.inserted) {
+          result.inserted++;
+          if (outcome.row) result.registrationRows.push(outcome.row);
+        } else result.existing++;
       } catch (error) {
         if (/belongs to another period|conflicting WhatsApp source identity|no cached image|Supabase|Lost the lease/i.test(error.message)) {
           throw error;
@@ -1017,8 +1021,8 @@ function createSupabaseWorker({
       const cycle = localJob.selectedCycleData;
       if (!cycle) throw new Error("The scan has no verified WhatsApp cycle mapping.");
       const managedSources = [
-        ...saved.rows.map((row) => ({ source_message_id: row.id, source_kind: "receipt" })),
-        ...savedBankEvidence.rows.map((row) => ({ source_message_id: row.id, source_kind: "bank_evidence" })),
+        ...saved.registrationRows.map((row) => ({ source_message_id: row.id, source_kind: "receipt" })),
+        ...savedBankEvidence.registrationRows.map((row) => ({ source_message_id: row.id, source_kind: "bank_evidence" })),
       ];
       if (managedSources.length) {
         const cycleBoundaryId = String(cycle.startBoundary?.id || "").trim();
