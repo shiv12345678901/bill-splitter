@@ -36,6 +36,7 @@ import {
 } from "./connection.mjs";
 import { filteredReceipts } from "./views/receipts.mjs";
 import { openLightbox } from "./ui.mjs";
+import { navigateTo } from "./navigation.mjs";
 const record = () => ({
   ...state.work,
   totalPool: result().total,
@@ -122,21 +123,21 @@ const actions = {
       () => request("cycles:repair", { action: "merge", cycleKey }),
     );
   },
-  home: () => (location.hash = "home"),
-  receipts: () => (location.hash = "receipts"),
-  cycles: () => (location.hash = "cycles"),
-  settle: () => (location.hash = "settlements"),
+  home: () => navigateTo("home"),
+  receipts: () => navigateTo("receipts"),
+  cycles: () => navigateTo("cycles"),
+  settle: () => navigateTo("settlements"),
   review: () => {
     state.filter = "review";
     state.query = "";
     state.page = 1;
     state.selected = state.work.expenses.find((e) => needsReview(e))?.id;
-    location.hash = "receipts";
+    navigateTo("receipts");
     emit();
   },
   "select-receipt": (id) => {
     state.selected = id;
-    location.hash = "receipts";
+    navigateTo("receipts");
     emit();
   },
   prev: () => {
@@ -198,7 +199,7 @@ const actions = {
     state.selected = state.work.expenses.find(
       (e) => e.isBankTransfer && !e.reviewed,
     )?.id;
-    location.hash = "receipts";
+    navigateTo("receipts");
     emit();
   },
   "clear-data": (id, control) => {
@@ -320,7 +321,7 @@ const actions = {
         state.error = "";
         state.selected = null;
         persist();
-        location.hash = "home";
+        navigateTo("home");
       },
     );
   },
@@ -351,7 +352,7 @@ const actions = {
       members: h.members || Object.keys(h.settlement?.memberTotals || {}),
     });
     emit();
-    location.hash = "settlements";
+    navigateTo("settlements");
   },
   "return-workspace": () => {
     if (!state.archive || !state.returnWork) return;
@@ -359,11 +360,11 @@ const actions = {
     state.returnWork = null;
     state.archive = null;
     persist();
-    location.hash = "home";
+    navigateTo("home");
   },
   "accept-scan": () => {
     acceptScan();
-    location.hash = "receipts";
+    navigateTo("receipts");
   },
   "discard-scan": () => {
     if (state.scan?.active) return;
@@ -458,7 +459,7 @@ export function wireActions() {
           state.scan = null;
           state.error = "";
           persist();
-          location.hash = "home";
+          navigateTo("home");
         },
       );
     } catch (err) {

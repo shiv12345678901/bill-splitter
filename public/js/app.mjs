@@ -7,6 +7,7 @@ import { history, settings, receiptLibrary } from "./views/library.mjs";
 import { needsReview } from "./domain.mjs";
 import { wireActions } from "./actions.mjs";
 import { updateConnection } from "./dialogs.mjs";
+import { navigateTo, startNavigation } from "./navigation.mjs";
 const routes = {
   home: overview,
   receipts,
@@ -254,18 +255,23 @@ function resultForWorkflow(workspace) {
   const reviewCount = workspace.expenses.filter(needsReview).length;
   return { count: included.length, reviewCount };
 }
-function navigate() {
-  state.route = Object.hasOwn(routes, location.hash.slice(1))
-    ? location.hash.slice(1)
-    : "home";
+function navigate(route) {
+  state.route = route;
   render();
   $("#page-title").focus({ preventScroll: true });
 }
 restore();
 subscribe(render);
 wireActions();
-window.addEventListener("hashchange", navigate);
-navigate();
+document.addEventListener("click", (event) => {
+  const link = event.target.closest("a[href^='#']");
+  const route = link?.getAttribute("href")?.slice(1);
+  if (!link || !Object.hasOwn(routes, route) || event.defaultPrevented ||
+      event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  navigateTo(route);
+});
+startNavigation(Object.keys(routes), navigate);
 
 if ("serviceWorker" in navigator)
   navigator.serviceWorker.register("/sw.js").catch(() => {});
