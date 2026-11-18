@@ -35,17 +35,60 @@ Available only to authenticated UUID mappings for Shiva Kafle or Arjun Bhurtel w
 
 Structured error messages include `UNAUTHORIZED_MEMBERSHIP_CHANGE`, `CLOSED_CYCLE_MEMBERSHIP_CHANGE`, `INVALID_MEMBER_IDENTITY`, `INVALID_PARTICIPATION_MODE`, `ZERO_ENABLED_MEMBERS`, `STALE_MEMBERSHIP_REVISION`, `FINALIZED_OBLIGATIONS`, and `MEMBERSHIP_NOT_INITIALIZED`.
 
+```ts
+await supabase.rpc("set_settlement_cycle_member_mode", {
+  p_period_id: "period_2026-10-31",
+  p_member_name: "Swasti Adhikari",
+  p_participation_mode: "keep_receipts",
+  p_expected_revision: 3,
+});
+```
+
 ### `preview_settlement_cycle_membership(p_period_id text) -> jsonb`
 
 Available to verified household identities and `service_role`. Returns `period_id`, `revision`, `total_cents`, `receipt_count`, `equal_share_cents`, and four member objects containing mode, `paid_cents`, exact `share_cents`, and `net_cents`.
+
+```json
+{
+  "period_id": "period_2026-10-31",
+  "revision": 4,
+  "total_cents": 93931,
+  "receipt_count": 26,
+  "equal_share_cents": 31310,
+  "members": [
+    {
+      "member_name": "Swasti Adhikari",
+      "participation_mode": "keep_receipts",
+      "paid_cents": 12000,
+      "share_cents": 0,
+      "net_cents": 12000
+    }
+  ]
+}
+```
 
 ### `get_effective_receipt_visibility(p_period_id text) -> setof record`
 
 Admin/service diagnostic only. Returns `receipt_id`, `payer`, mode, `visible`, `eligible`, and `manually_excluded`; it does not return merchant, amount, evidence locator, or image data. Normal frontend receipt reads are filtered by restrictive RLS.
 
+### `get_disabled_settlement_receipts(p_period_id text) -> setof record`
+
+Admin/service diagnostic only. Returns disabled receipts using the existing frontend fields: `id`, `period_id`, `captured_at`, `merchant`, `amount_cents`, `payer`, `category`, `date`, `is_excluded`, and `image_url`. Its SECURITY DEFINER authorization checks the immutable auth-UUID mapping; ordinary members and unknown authenticated users are rejected. A restrictive Storage policy permits admins to resolve these private evidence locators while denying disabled receipt objects to other members.
+
 ### Next-cycle initialization
 
 `rollover_settlement_period(..., p_membership_revision bigint)` initializes all four members as `enabled` with revision 1 in the same transaction. There is no browser-callable initialization RPC; initialization remains inside the lease-validated rollover operation.
+
+Worker-only service-role RPC signatures are:
+
+- `prepare_instabox_whatsapp_sources(uuid,text,text,jsonb,bigint)`
+- `record_period_cycle_state(uuid,text,text,text,jsonb,jsonb,bigint)`
+- `record_whatsapp_bank_evidence(uuid,text,text,jsonb,bigint)`
+- `finalize_sync_request(uuid,text,text,jsonb,text[],text,text,bigint)`
+- `reconcile_deleted_whatsapp_images(uuid,text,text,jsonb,text[],text,bigint)`
+- `rollover_settlement_period(uuid,text,text,date,jsonb,text,text,date,jsonb,text,jsonb,text[],bigint)`
+
+The final `bigint` argument is the membership revision. Their capability-v7 signatures remain callable only by `service_role` and always raise `MEMBERSHIP_REVISION_REQUIRED`; the renamed v7 implementations are not executable by API roles.
 
 ## Frontend integration
 
@@ -55,7 +98,8 @@ Admin/service diagnostic only. Returns `receipt_id`, `payer`, mode, `visible`, `
 4. Send the last returned revision with every change. On `STALE_MEMBERSHIP_REVISION`, refetch membership and preview before allowing another edit.
 5. Disable changes for non-CURRENT periods and when `FINALIZED_OBLIGATIONS` is returned.
 6. Refresh periods, settlement, receipts, membership and preview after success. Existing `receipts` queries automatically hide disabled-member rows through RLS; do not rewrite `is_excluded` in the browser.
-7. Never use a service-role or `sb_secret_` key in the browser.
+7. For an administrator-only disabled-receipt review screen, call `get_disabled_settlement_receipts`; never attempt to weaken the normal receipt query or Storage policy.
+8. Never use a service-role or `sb_secret_` key in the browser.
 
 ## Deployment and rollback
 

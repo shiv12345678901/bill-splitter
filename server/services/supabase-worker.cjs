@@ -1071,6 +1071,7 @@ function createSupabaseWorker({
         p_cycle_status: cycle.status,
         p_calculation_message: cycle.calculationMessage,
         p_clearance_message: cycle.clearanceMessage,
+        p_membership_revision: membership.revision,
       });
       lease.assert();
       if (savedBankEvidence.rows.length) {
@@ -1079,6 +1080,7 @@ function createSupabaseWorker({
           p_worker_id: workerId,
           p_period_id: String(period.id),
           p_evidence: savedBankEvidence.rows,
+          p_membership_revision: membership.revision,
         });
         lease.assert();
       }

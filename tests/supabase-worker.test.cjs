@@ -510,10 +510,13 @@ test("transactional publishing records pending-cycle metadata before finalizing 
   assert.equal(rpcCalls[1].body.p_cycle_status, "PENDING_SETTLEMENT");
   assert.deepEqual(rpcCalls[1].body.p_calculation_message, calculationMessage);
   assert.equal(rpcCalls[1].body.p_clearance_message, null);
+  assert.equal(rpcCalls[1].body.p_membership_revision, 1);
   assert.equal(rpcCalls[2].body.p_evidence[0].id, "bank-1");
   assert.equal(rpcCalls[2].body.p_evidence[0].amount_cents, 4255);
   assert.equal(rpcCalls[2].body.p_evidence[0].review_status, "pending");
+  assert.equal(rpcCalls[2].body.p_membership_revision, 1);
   assert.deepEqual(rpcCalls[3].body.p_receipts.map((row) => row.id), ["receipt-1"]);
+  assert.equal(rpcCalls[3].body.p_membership_revision, 1);
 });
 
 function transactionalOwnershipFixture({

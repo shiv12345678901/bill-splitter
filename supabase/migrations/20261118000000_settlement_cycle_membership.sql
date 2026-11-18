@@ -69,6 +69,16 @@ $$;
 revoke all on function public.is_verified_household_identity() from public,anon;
 grant execute on function public.is_verified_household_identity() to authenticated,service_role;
 
+create or replace function public.is_household_membership_admin()
+returns boolean language sql stable security definer set search_path=public,auth,pg_temp as $$
+  select auth.role()='service_role' or exists(
+    select 1 from public.household_auth_identities where auth_user_id=auth.uid()
+      and household_role='admin' and member_name in ('Shiva Kafle','Arjun Bhurtel')
+  );
+$$;
+revoke all on function public.is_household_membership_admin() from public,anon;
+grant execute on function public.is_household_membership_admin() to authenticated,service_role;
+
 grant select on public.settlement_cycle_membership_state,public.settlement_cycle_members to authenticated;
 drop policy if exists household_membership_state_read on public.settlement_cycle_membership_state;
 create policy household_membership_state_read on public.settlement_cycle_membership_state
@@ -78,9 +88,12 @@ create policy household_membership_read on public.settlement_cycle_members
   for select to authenticated using(public.is_verified_household_identity());
 
 create or replace function public.settlement_cycle_member_mode(p_period_id text,p_member_name text)
-returns text language sql stable security definer set search_path=public,pg_temp as $$
-  select coalesce((select participation_mode from public.settlement_cycle_members
+returns text language plpgsql stable security definer set search_path=public,auth,pg_temp as $$
+begin
+  if not public.is_verified_household_identity() then raise exception 'UNAUTHORIZED_MEMBERSHIP_ACCESS'; end if;
+  return coalesce((select participation_mode from public.settlement_cycle_members
     where period_id=p_period_id and member_name=p_member_name),'enabled');
+end
 $$;
 revoke all on function public.settlement_cycle_member_mode(text,text) from public,anon;
 grant execute on function public.settlement_cycle_member_mode(text,text) to authenticated,service_role;
@@ -90,7 +103,29 @@ grant execute on function public.settlement_cycle_member_mode(text,text) to auth
 drop policy if exists settlement_cycle_receipt_visibility on public.receipts;
 create policy settlement_cycle_receipt_visibility on public.receipts as restrictive
   for select to authenticated using(
+    public.is_verified_household_identity() and
     public.settlement_cycle_member_mode(period_id::text,payer)<>'disabled'
+  );
+
+-- A previously issued object URL is time-limited, but new Storage reads must
+-- also honor disabled-member visibility. Unlinked bank/review evidence retains
+-- the existing verified-household behavior; disabled receipt objects are admin-only.
+create or replace function public.can_read_bill_evidence_object(p_object_name text)
+returns boolean language sql stable security definer set search_path=public,auth,pg_temp as $$
+  select public.is_verified_household_identity() and (
+    public.is_household_membership_admin() or not exists(
+      select 1 from public.receipts r
+      where r.image_url='storage://bill-evidence/'||p_object_name
+        and public.settlement_cycle_member_mode(r.period_id::text,r.payer)='disabled'
+    )
+  );
+$$;
+revoke all on function public.can_read_bill_evidence_object(text) from public,anon;
+grant execute on function public.can_read_bill_evidence_object(text) to authenticated,service_role;
+drop policy if exists settlement_cycle_evidence_visibility on storage.objects;
+create policy settlement_cycle_evidence_visibility on storage.objects as restrictive
+  for select to authenticated using(
+    bucket_id<>'bill-evidence' or public.can_read_bill_evidence_object(storage.objects.name)
   );
 
 create or replace function public.compute_settlement_cycle_financials(p_period_id text)
@@ -193,8 +228,7 @@ create or replace function public.get_effective_receipt_visibility(p_period_id t
 returns table(receipt_id text,payer text,participation_mode text,visible boolean,eligible boolean,manually_excluded boolean)
 language plpgsql stable security definer set search_path=public,auth,pg_temp as $$
 begin
-  if not exists(select 1 from public.household_auth_identities
-    where auth_user_id=auth.uid() and household_role='admin') and auth.role()<>'service_role' then
+  if not public.is_household_membership_admin() then
     raise exception 'UNAUTHORIZED_MEMBERSHIP_CHANGE';
   end if;
   return query select r.id::text,r.payer,public.settlement_cycle_member_mode(p_period_id,r.payer),
@@ -204,14 +238,28 @@ begin
   from public.receipts r where r.period_id::text=p_period_id order by r.date,r.id;
 end $$;
 
+create or replace function public.get_disabled_settlement_receipts(p_period_id text)
+returns table(
+  id text,period_id text,captured_at timestamptz,merchant text,amount_cents bigint,
+  payer text,category text,date date,is_excluded boolean,image_url text
+) language plpgsql stable security definer set search_path=public,auth,pg_temp as $$
+begin
+  if not public.is_household_membership_admin() then raise exception 'UNAUTHORIZED_MEMBERSHIP_CHANGE'; end if;
+  if not exists(select 1 from public.periods where public.periods.id::text=p_period_id) then raise exception 'INVALID_PERIOD'; end if;
+  return query select r.id::text,r.period_id::text,r.captured_at,r.merchant,r.amount_cents::bigint,
+    r.payer,r.category,r.date,r.is_excluded,r.image_url
+  from public.receipts r where r.period_id::text=p_period_id
+    and public.settlement_cycle_member_mode(p_period_id,r.payer)='disabled'
+  order by r.date desc,r.id;
+end $$;
+
 create or replace function public.set_settlement_cycle_member_mode(
   p_period_id text,p_member_name text,p_participation_mode text,p_expected_revision bigint
 ) returns jsonb language plpgsql security definer set search_path=public,auth,pg_temp as $$
 declare p public.periods; state public.settlement_cycle_membership_state; s public.settlements;
 begin
   perform pg_advisory_xact_lock(17498013);
-  if not exists(select 1 from public.household_auth_identities where auth_user_id=auth.uid()
-    and household_role='admin' and member_name in ('Shiva Kafle','Arjun Bhurtel')) then
+  if not public.is_household_membership_admin() or auth.role()='service_role' then
     raise exception 'UNAUTHORIZED_MEMBERSHIP_CHANGE';
   end if;
   if not(p_member_name=any(array['Shiva Kafle','Arjun Bhurtel','Arpan Bhurtel','Swasti Adhikari']::text[])) then
@@ -241,7 +289,11 @@ begin
 end $$;
 
 -- Fence capability-v7 workers while retaining an explicit diagnostic at the old signatures.
-alter function public.finalize_sync_request(uuid,text,text,jsonb,text[],text,text) rename to finalize_sync_request_v7;
+do $$ begin
+  if to_regprocedure('public.finalize_sync_request_v7(uuid,text,text,jsonb,text[],text,text)') is null then
+    alter function public.finalize_sync_request(uuid,text,text,jsonb,text[],text,text) rename to finalize_sync_request_v7;
+  end if;
+end $$;
 create or replace function public.finalize_sync_request(uuid,text,text,jsonb,text[],text,text)
 returns jsonb language plpgsql security definer set search_path=public,pg_temp as $$
 begin raise exception 'MEMBERSHIP_REVISION_REQUIRED'; end $$;
@@ -267,7 +319,11 @@ begin
   return jsonb_build_object('result_summary',summary,'membership_revision',p_membership_revision);
 end $$;
 
-alter function public.prepare_instabox_whatsapp_sources(uuid,text,text,jsonb) rename to prepare_instabox_whatsapp_sources_v7;
+do $$ begin
+  if to_regprocedure('public.prepare_instabox_whatsapp_sources_v7(uuid,text,text,jsonb)') is null then
+    alter function public.prepare_instabox_whatsapp_sources(uuid,text,text,jsonb) rename to prepare_instabox_whatsapp_sources_v7;
+  end if;
+end $$;
 create or replace function public.prepare_instabox_whatsapp_sources(uuid,text,text,jsonb)
 returns void language plpgsql security definer set search_path=public,pg_temp as $$
 begin raise exception 'MEMBERSHIP_REVISION_REQUIRED'; end $$;
@@ -282,7 +338,54 @@ begin
   perform public.prepare_instabox_whatsapp_sources_v7(p_job_id,p_worker_id,p_period_id,p_sources);
 end $$;
 
-alter function public.reconcile_deleted_whatsapp_images(uuid,text,text,jsonb,text[],text) rename to reconcile_deleted_whatsapp_images_v7;
+do $$ begin
+  if to_regprocedure('public.record_period_cycle_state_v7(uuid,text,text,text,jsonb,jsonb)') is null then
+    alter function public.record_period_cycle_state(uuid,text,text,text,jsonb,jsonb)
+      rename to record_period_cycle_state_v7;
+  end if;
+end $$;
+create or replace function public.record_period_cycle_state(uuid,text,text,text,jsonb,jsonb)
+returns void language plpgsql security definer set search_path=public,pg_temp as $$
+begin raise exception 'MEMBERSHIP_REVISION_REQUIRED'; end $$;
+create or replace function public.record_period_cycle_state(
+  p_job_id uuid,p_worker_id text,p_period_id text,p_cycle_status text,
+  p_calculation_message jsonb,p_clearance_message jsonb,p_membership_revision bigint
+) returns void language plpgsql security definer set search_path=public,pg_temp as $$
+declare current_revision bigint;
+begin
+  perform pg_advisory_xact_lock(17498013);
+  select revision into current_revision from public.settlement_cycle_membership_state where period_id=p_period_id for update;
+  if current_revision is distinct from p_membership_revision then raise exception 'STALE_MEMBERSHIP_REVISION'; end if;
+  perform public.record_period_cycle_state_v7(p_job_id,p_worker_id,p_period_id,p_cycle_status,
+    p_calculation_message,p_clearance_message);
+  return;
+end $$;
+
+do $$ begin
+  if to_regprocedure('public.record_whatsapp_bank_evidence_v7(uuid,text,text,jsonb)') is null then
+    alter function public.record_whatsapp_bank_evidence(uuid,text,text,jsonb)
+      rename to record_whatsapp_bank_evidence_v7;
+  end if;
+end $$;
+create or replace function public.record_whatsapp_bank_evidence(uuid,text,text,jsonb)
+returns jsonb language plpgsql security definer set search_path=public,pg_temp as $$
+begin raise exception 'MEMBERSHIP_REVISION_REQUIRED'; end $$;
+create or replace function public.record_whatsapp_bank_evidence(
+  p_job_id uuid,p_worker_id text,p_period_id text,p_evidence jsonb,p_membership_revision bigint
+) returns jsonb language plpgsql security definer set search_path=public,pg_temp as $$
+declare current_revision bigint;
+begin
+  perform pg_advisory_xact_lock(17498013);
+  select revision into current_revision from public.settlement_cycle_membership_state where period_id=p_period_id for update;
+  if current_revision is distinct from p_membership_revision then raise exception 'STALE_MEMBERSHIP_REVISION'; end if;
+  return public.record_whatsapp_bank_evidence_v7(p_job_id,p_worker_id,p_period_id,p_evidence);
+end $$;
+
+do $$ begin
+  if to_regprocedure('public.reconcile_deleted_whatsapp_images_v7(uuid,text,text,jsonb,text[],text)') is null then
+    alter function public.reconcile_deleted_whatsapp_images(uuid,text,text,jsonb,text[],text) rename to reconcile_deleted_whatsapp_images_v7;
+  end if;
+end $$;
 create or replace function public.reconcile_deleted_whatsapp_images(uuid,text,text,jsonb,text[],text)
 returns jsonb language plpgsql security definer set search_path=public,pg_temp as $$
 begin raise exception 'MEMBERSHIP_REVISION_REQUIRED'; end $$;
@@ -299,8 +402,12 @@ begin
   return result||jsonb_build_object('membership_revision',p_membership_revision);
 end $$;
 
-alter function public.rollover_settlement_period(uuid,text,text,date,jsonb,text,text,date,jsonb,text,jsonb,text[])
-  rename to rollover_settlement_period_v7;
+do $$ begin
+  if to_regprocedure('public.rollover_settlement_period_v7(uuid,text,text,date,jsonb,text,text,date,jsonb,text,jsonb,text[])') is null then
+    alter function public.rollover_settlement_period(uuid,text,text,date,jsonb,text,text,date,jsonb,text,jsonb,text[])
+      rename to rollover_settlement_period_v7;
+  end if;
+end $$;
 create or replace function public.rollover_settlement_period(uuid,text,text,date,jsonb,text,text,date,jsonb,text,jsonb,text[])
 returns jsonb language plpgsql security definer set search_path=public,pg_temp as $$
 begin raise exception 'MEMBERSHIP_REVISION_REQUIRED'; end $$;
@@ -333,6 +440,8 @@ $$;
 
 revoke all on function public.finalize_sync_request_v7(uuid,text,text,jsonb,text[],text,text),
   public.prepare_instabox_whatsapp_sources_v7(uuid,text,text,jsonb),
+  public.record_period_cycle_state_v7(uuid,text,text,text,jsonb,jsonb),
+  public.record_whatsapp_bank_evidence_v7(uuid,text,text,jsonb),
   public.reconcile_deleted_whatsapp_images_v7(uuid,text,text,jsonb,text[],text),
   public.rollover_settlement_period_v7(uuid,text,text,date,jsonb,text,text,date,jsonb,text,jsonb,text[])
   from public,anon,authenticated,service_role;
@@ -340,6 +449,10 @@ revoke all on function public.finalize_sync_request(uuid,text,text,jsonb,text[],
   public.finalize_sync_request(uuid,text,text,jsonb,text[],text,text,bigint),
   public.prepare_instabox_whatsapp_sources(uuid,text,text,jsonb),
   public.prepare_instabox_whatsapp_sources(uuid,text,text,jsonb,bigint),
+  public.record_period_cycle_state(uuid,text,text,text,jsonb,jsonb),
+  public.record_period_cycle_state(uuid,text,text,text,jsonb,jsonb,bigint),
+  public.record_whatsapp_bank_evidence(uuid,text,text,jsonb),
+  public.record_whatsapp_bank_evidence(uuid,text,text,jsonb,bigint),
   public.reconcile_deleted_whatsapp_images(uuid,text,text,jsonb,text[],text),
   public.reconcile_deleted_whatsapp_images(uuid,text,text,jsonb,text[],text,bigint),
   public.rollover_settlement_period(uuid,text,text,date,jsonb,text,text,date,jsonb,text,jsonb,text[]),
@@ -349,6 +462,10 @@ grant execute on function public.finalize_sync_request(uuid,text,text,jsonb,text
   public.finalize_sync_request(uuid,text,text,jsonb,text[],text,text,bigint),
   public.prepare_instabox_whatsapp_sources(uuid,text,text,jsonb),
   public.prepare_instabox_whatsapp_sources(uuid,text,text,jsonb,bigint),
+  public.record_period_cycle_state(uuid,text,text,text,jsonb,jsonb),
+  public.record_period_cycle_state(uuid,text,text,text,jsonb,jsonb,bigint),
+  public.record_whatsapp_bank_evidence(uuid,text,text,jsonb),
+  public.record_whatsapp_bank_evidence(uuid,text,text,jsonb,bigint),
   public.reconcile_deleted_whatsapp_images(uuid,text,text,jsonb,text[],text),
   public.reconcile_deleted_whatsapp_images(uuid,text,text,jsonb,text[],text,bigint),
   public.rollover_settlement_period(uuid,text,text,date,jsonb,text,text,date,jsonb,text,jsonb,text[]),
@@ -357,9 +474,11 @@ grant execute on function public.finalize_sync_request(uuid,text,text,jsonb,text
 
 revoke all on function public.get_settlement_cycle_membership(text),
   public.preview_settlement_cycle_membership(text),public.get_effective_receipt_visibility(text),
+  public.get_disabled_settlement_receipts(text),
   public.set_settlement_cycle_member_mode(text,text,text,bigint) from public,anon;
 grant execute on function public.get_settlement_cycle_membership(text),
-  public.preview_settlement_cycle_membership(text),public.get_effective_receipt_visibility(text)
+  public.preview_settlement_cycle_membership(text),public.get_effective_receipt_visibility(text),
+  public.get_disabled_settlement_receipts(text)
   to authenticated,service_role;
 grant execute on function public.set_settlement_cycle_member_mode(text,text,text,bigint) to authenticated;
 revoke all on function public.instabox_worker_capabilities() from public,anon,authenticated;

@@ -27,10 +27,14 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
         ('aaaaaaaa-1111-4111-8111-111111111111'),
         ('bbbbbbbb-2222-4222-8222-222222222222'),
         ('cccccccc-3333-4333-8333-333333333333'),
-        ('dddddddd-4444-4444-8444-444444444444');
+        ('dddddddd-4444-4444-8444-444444444444'),
+        ('eeeeeeee-5555-4555-8555-555555555555');
       create schema storage;
+      grant usage on schema storage to authenticated;
       create table storage.buckets(id text primary key,name text,public boolean);
-      create table storage.objects(id text primary key,bucket_id text);
+      create table storage.objects(id text primary key,bucket_id text,name text);
+      alter table storage.objects enable row level security;
+      grant select on storage.objects to authenticated;
       create table public.sync_requests(id uuid primary key,requested_by text,status text,stage text,stage_message text,stage_updated_at timestamptz,result_summary text,error text,created_at timestamptz default now());
       create table public.periods(id text primary key,start_date date,end_date date,status text,total_cents integer,per_person_cents integer,receipt_count integer);
       create table public.receipts(id text primary key,period_id text references public.periods(id),captured_at timestamptz,merchant text,amount_cents integer,payer text,category text,date date,is_excluded boolean,image_url text);
@@ -60,6 +64,7 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     for (const name of fs.readdirSync("supabase/migrations").filter((n) => n.endsWith(".sql")).sort())
       await db.exec(fs.readFileSync(`supabase/migrations/${name}`, "utf8"));
     const q = async (sql, args = []) => (await db.query(sql, args)).rows;
+    await q("select set_config('request.jwt.claim.role','service_role',false)");
     assert.equal((await q("select * from claim_sync_request('a')")).length, 0);
     assert.equal((await q("select total_cents from periods where id='p'"))[0].total_cents, 999);
     await db.exec("update instabox_worker_control set writes_enabled=true");
@@ -74,14 +79,15 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
       { id: "new", period_id: "p", captured_at: "2026-10-02T00:00:00Z", merchant: "Market", amount_cents: 102, payer: "Shiva Kafle", category: "Groceries", date: "2026-10-02", is_excluded: false, image_url: "storage://bill-evidence/new.jpg" },
     ];
     const finalize = (owner, receipts = rows, rounding = "round", revision = 1) => q("select finalize_sync_request($1::uuid,$2,'p',$3::jsonb,array['Shiva Kafle','Arjun Bhurtel','Arpan Bhurtel','Swasti Adhikari'],$4,'existing-only',$5)", [jobId, owner, JSON.stringify(receipts), rounding, revision]);
-    await q("select record_period_cycle_state($1::uuid,'a','p','PENDING_SETTLEMENT',$2::jsonb,null)", [jobId, JSON.stringify({ id: "calc-1", timestamp: 1793500000 })]);
+    await assert.rejects(() => q("select record_period_cycle_state($1::uuid,'a','p','PENDING_SETTLEMENT',$2::jsonb,null)", [jobId, JSON.stringify({ id: "calc-1", timestamp: 1793500000 })]), /MEMBERSHIP_REVISION_REQUIRED/);
+    await q("select record_period_cycle_state($1::uuid,'a','p','PENDING_SETTLEMENT',$2::jsonb,null,1)", [jobId, JSON.stringify({ id: "calc-1", timestamp: 1793500000 })]);
     assert.equal((await q("select whatsapp_cycle_status from periods where id='p'"))[0].whatsapp_cycle_status, "PENDING_SETTLEMENT");
     await assert.rejects(
-      () => q("select record_period_cycle_state($1::uuid,'a','p','SETTLED',null,null)", [jobId]),
+      () => q("select record_period_cycle_state($1::uuid,'a','p','SETTLED',null,null,1)", [jobId]),
       /clearance/i,
     );
     await assert.rejects(
-      () => q("select record_period_cycle_state($1::uuid,'a','p','SETTLED',null,$2::jsonb)", [jobId, JSON.stringify({ id: "calc-only", source: "calculation", confidence: "LOW" })]),
+      () => q("select record_period_cycle_state($1::uuid,'a','p','SETTLED',null,$2::jsonb,1)", [jobId, JSON.stringify({ id: "calc-only", source: "calculation", confidence: "LOW" })]),
       /clearance/i,
     );
     await assert.rejects(() => finalize("b"), /lease/i);
@@ -111,16 +117,18 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
       { source_message_id: "whatsapp-bank-1", registration_status: "pending" },
       { source_message_id: "whatsapp-bank-reviewed", registration_status: "pending" },
     ]);
-    await q("select record_whatsapp_bank_evidence($1::uuid,'a','p',$2::jsonb)", [jobId, JSON.stringify(bankEvidence)]);
-    await q("select record_whatsapp_bank_evidence($1::uuid,'a','p',$2::jsonb)", [jobId, JSON.stringify(bankEvidence)]);
+    await assert.rejects(() => q("select record_whatsapp_bank_evidence($1::uuid,'a','p',$2::jsonb)", [jobId, JSON.stringify(bankEvidence)]), /MEMBERSHIP_REVISION_REQUIRED/);
+    await q("select record_whatsapp_bank_evidence($1::uuid,'a','p',$2::jsonb,1)", [jobId, JSON.stringify(bankEvidence)]);
+    await q("select record_whatsapp_bank_evidence($1::uuid,'a','p',$2::jsonb,1)", [jobId, JSON.stringify(bankEvidence)]);
+    await assert.rejects(() => q("select record_whatsapp_bank_evidence($1::uuid,'a','p',$2::jsonb,2)", [jobId, JSON.stringify(bankEvidence)]), /STALE_MEMBERSHIP_REVISION/);
     await assert.rejects(
-      () => q("select record_whatsapp_bank_evidence($1::uuid,'a','p',$2::jsonb)", [
+      () => q("select record_whatsapp_bank_evidence($1::uuid,'a','p',$2::jsonb,1)", [
         jobId, JSON.stringify([{ ...bankEvidence[0], id: "zero", source_message_id: "zero", amount_cents: 0 }]),
       ]),
       /BANK_EVIDENCE_REVIEW_REQUIRED/,
     );
     await assert.rejects(
-      () => q("select record_whatsapp_bank_evidence($1::uuid,'a','p',$2::jsonb)", [
+      () => q("select record_whatsapp_bank_evidence($1::uuid,'a','p',$2::jsonb,1)", [
         jobId, JSON.stringify([{ ...bankEvidence[0], id: "old-date", source_message_id: "old-date", transfer_date: "2026-04-25" }]),
       ]),
       /BANK_EVIDENCE_DATE_OUTSIDE_PERIOD/,
@@ -254,9 +262,15 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     assert.equal((await q("select has_function_privilege('service_role','public.finalize_sync_request(uuid,text,text,jsonb,text[],text,text,bigint)','execute') as allowed"))[0].allowed, true);
     assert.equal((await q("select has_function_privilege('authenticated','public.record_period_cycle_state(uuid,text,text,text,jsonb,jsonb)','execute') as allowed"))[0].allowed, false);
     assert.equal((await q("select has_function_privilege('service_role','public.record_period_cycle_state(uuid,text,text,text,jsonb,jsonb)','execute') as allowed"))[0].allowed, true);
+    assert.equal((await q("select has_function_privilege('authenticated','public.record_period_cycle_state(uuid,text,text,text,jsonb,jsonb,bigint)','execute') as allowed"))[0].allowed, false);
+    assert.equal((await q("select has_function_privilege('service_role','public.record_period_cycle_state(uuid,text,text,text,jsonb,jsonb,bigint)','execute') as allowed"))[0].allowed, true);
+    assert.equal((await q("select has_function_privilege('service_role','public.record_period_cycle_state_v7(uuid,text,text,text,jsonb,jsonb)','execute') as allowed"))[0].allowed, false);
     assert.equal((await q("select has_function_privilege('authenticated','public.record_whatsapp_bank_evidence(uuid,text,text,jsonb)','execute') as allowed"))[0].allowed, false);
     assert.equal((await q("select has_function_privilege('service_role','public.record_whatsapp_bank_evidence(uuid,text,text,jsonb)','execute') as allowed"))[0].allowed, true);
+    assert.equal((await q("select has_function_privilege('authenticated','public.record_whatsapp_bank_evidence(uuid,text,text,jsonb,bigint)','execute') as allowed"))[0].allowed, false);
+    assert.equal((await q("select has_function_privilege('service_role','public.record_whatsapp_bank_evidence(uuid,text,text,jsonb,bigint)','execute') as allowed"))[0].allowed, true);
     assert.equal((await q("select has_function_privilege('service_role','public.record_whatsapp_bank_evidence_v6(uuid,text,text,jsonb)','execute') as allowed"))[0].allowed, false);
+    assert.equal((await q("select has_function_privilege('service_role','public.record_whatsapp_bank_evidence_v7(uuid,text,text,jsonb)','execute') as allowed"))[0].allowed, false);
     assert.equal((await q("select has_function_privilege('authenticated','public.prepare_instabox_whatsapp_sources(uuid,text,text,jsonb)','execute') as allowed"))[0].allowed, false);
     assert.equal((await q("select has_function_privilege('service_role','public.prepare_instabox_whatsapp_sources(uuid,text,text,jsonb)','execute') as allowed"))[0].allowed, true);
     assert.equal((await q("select has_function_privilege('authenticated','public.prepare_instabox_whatsapp_sources(uuid,text,text,jsonb,bigint)','execute') as allowed"))[0].allowed, false);
@@ -317,8 +331,15 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
       ('bbbbbbbb-2222-4222-8222-222222222222','Arjun Bhurtel','admin','sql-test'),
       ('cccccccc-3333-4333-8333-333333333333','Arpan Bhurtel','member','sql-test'),
       ('dddddddd-4444-4444-8444-444444444444','Swasti Adhikari','member','sql-test')`);
+    await q("select set_config('request.jwt.claim.role','authenticated',false),set_config('request.jwt.claim.sub','eeeeeeee-5555-4555-8555-555555555555',false)");
+    await db.exec("set role authenticated");
+    await assert.rejects(() => q("select get_settlement_cycle_membership('period_2026-10-31')"), /UNAUTHORIZED_MEMBERSHIP_ACCESS/);
+    await assert.rejects(() => q("select settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari')"), /UNAUTHORIZED_MEMBERSHIP_ACCESS/);
+    await assert.rejects(() => q("select set_settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari','disabled',1)"), /UNAUTHORIZED_MEMBERSHIP_CHANGE/);
+    await db.exec("reset role");
     await q("select set_config('request.jwt.claim.role','authenticated',false),set_config('request.jwt.claim.sub','cccccccc-3333-4333-8333-333333333333',false)");
     await db.exec("set role authenticated");
+    assert.equal((await q("select count(*)::integer n from receipts where period_id='p'"))[0].n, 1);
     await assert.rejects(() => q("select set_settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari','disabled',1)"), /UNAUTHORIZED_MEMBERSHIP_CHANGE/);
     await db.exec("reset role");
     await q("select set_config('request.jwt.claim.sub','aaaaaaaa-1111-4111-8111-111111111111',false)");
@@ -336,6 +357,15 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     await q("select set_settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari','disabled',2)");
     assert.equal((await q("select count(*)::integer n from receipts where period_id='period_2026-10-31'"))[0].n, 1);
     assert.equal((await q("select total_cents from periods where id='period_2026-10-31'"))[0].total_cents, 400);
+    assert.equal((await q("select count(*)::integer n from get_disabled_settlement_receipts('period_2026-10-31')"))[0].n, 2);
+    await db.exec("reset role");
+    await q("insert into storage.objects(id,bucket_id,name) values('disabled-object','bill-evidence','swasti.jpg'),('unlinked-object','bill-evidence','bank/unlinked.jpg')");
+    await db.exec("set role authenticated");
+    assert.equal((await q("select count(*)::integer n from storage.objects where bucket_id='bill-evidence'"))[0].n, 2);
+    await q("select set_config('request.jwt.claim.sub','cccccccc-3333-4333-8333-333333333333',false)");
+    assert.equal((await q("select count(*)::integer n from storage.objects where bucket_id='bill-evidence'"))[0].n, 1);
+    await assert.rejects(() => q("select * from get_disabled_settlement_receipts('period_2026-10-31')"), /UNAUTHORIZED_MEMBERSHIP_CHANGE/);
+    await q("select set_config('request.jwt.claim.sub','aaaaaaaa-1111-4111-8111-111111111111',false)");
     await q("select set_settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari','enabled',3)");
     assert.equal((await q("select count(*)::integer n from receipts where period_id='period_2026-10-31'"))[0].n, 3);
     assert.equal((await q("select is_excluded from receipts where id='swasti-manual-exclusion'"))[0].is_excluded, true);
@@ -353,6 +383,10 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     await assert.rejects(() => q("select set_settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari','keep_receipts',10)"), /FINALIZED_OBLIGATIONS/);
     await db.exec("reset role");
     assert.equal((await q("select verification_status from bank_transfer_receipts"))[0].verification_status, null);
+    const membershipMigration = fs.readFileSync("supabase/migrations/20261118000000_settlement_cycle_membership.sql", "utf8");
+    await db.exec(membershipMigration);
+    assert.equal((await q("select revision from settlement_cycle_membership_state where period_id='period_2026-10-31'"))[0].revision, 10);
+    assert.equal((await q("select payment_obligations_status from settlements where period_id='period_2026-10-31'"))[0].payment_obligations_status, "REVIEWED");
     assert.equal((await q("select count(*)::integer n from whatsapp_image_reconciliation_audit"))[0].n, 8);
     assert.equal((await q("select count(*)::integer n from whatsapp_image_reconciliation_audit where previous_record ? 'reference_number' or previous_record ? 'recipient_name'"))[0].n, 0);
     await db.exec("set role authenticated");
@@ -361,6 +395,10 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     await assert.rejects(() => db.exec("insert into sync_requests(id,requested_by,status,worker_id) values('55555555-5555-4555-8555-555555555555','netlify-app','processing','evil')"), /row-level security/);
     await db.exec("insert into sync_requests(id,requested_by,status) values('44444444-4444-4444-8444-444444444444','netlify-app','pending')");
     assert.equal((await q("select count(*)::integer n from receipts"))[0].n, 4);
+    await db.exec("reset role");
+    await db.exec("set role anon");
+    await assert.rejects(() => q("select * from receipts"), /permission denied/i);
+    await assert.rejects(() => q("select get_settlement_cycle_membership('period_2026-10-31')"), /permission denied/i);
     await db.exec("reset role");
   } finally { await db.close(); }
 });
