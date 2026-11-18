@@ -257,6 +257,7 @@ function resultForWorkflow(workspace) {
 }
 function navigate(route) {
   state.route = route;
+  document.body.dataset.route = route;
   render();
   $("#page-title").focus({ preventScroll: true });
 }
