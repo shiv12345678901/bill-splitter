@@ -80,6 +80,7 @@ module.exports = async function processReceipts({
   concurrency,
   effectiveAliases,
   filterMember,
+  disabledMembers = [],
   socket,
   isAborted,
   downloadMediaBuffer,
@@ -89,6 +90,7 @@ module.exports = async function processReceipts({
   retryBaseMs = Number(process.env.SPLITMATE_RETRY_BASE_MS) || 1000,
 }) {
   const parsedExpenses = [];
+  const disabledMemberSet = new Set(disabledMembers);
   let completedCount = 0;
   let nextCandidateIndex = 0;
 
@@ -170,6 +172,13 @@ module.exports = async function processReceipts({
           continue;
         }
         const senderName = await resolveSender(msg);
+
+        if (disabledMemberSet.has(senderName)) {
+          await recordOutcome("excluded", {
+            reason: "MEMBER_DISABLED_FOR_CYCLE",
+          });
+          continue;
+        }
 
         if (
           filterMember &&

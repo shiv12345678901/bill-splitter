@@ -7,6 +7,7 @@ const library = require("./library.cjs");
 const { calculateSettlement } = require("./settlement.cjs");
 const { planPeriodRollover, sydneyDate } = require("./cycle-state.cjs");
 const { safeErrorMessage } = require("./whatsapp-snapshot.cjs");
+const { normalizeCycleMembership, disabledCycleMembers } = require("./cycle-membership.cjs");
 
 const DEFAULT_POLL_MS = 5000;
 const DEFAULT_LEASE_SECONDS = 15 * 60;
@@ -478,11 +479,12 @@ class SupabaseRestClient {
     const bucket = await this.request("storage/v1", "bucket/bill-evidence");
     if (!bucket || bucket.public !== false) throw new Error("bill-evidence must be a private Storage bucket.");
     const capabilities = await this.rpc("instabox_worker_capabilities", {});
-    if (capabilities?.version !== 7) {
+    if (capabilities?.version !== 8) {
       throw new Error(
-        "WhatsApp image reconciliation migration version 7 is required."
+        "Settlement-cycle membership migration capability version 8 is required."
       );
-    }    this.writeEnabled = capabilities.writes_enabled === true;
+    }
+    this.writeEnabled = capabilities.writes_enabled === true;
     this.columns = verified;
     return verified;
   }
@@ -608,6 +610,13 @@ function createSupabaseWorker({
     else query.status = encodeFilter("eq", "CURRENT");
     const rows = await client.select("periods", query);
     return Array.isArray(rows) ? rows[0] || null : null;
+  }
+
+  async function periodMembership(periodId) {
+    const value = await client.rpc("get_settlement_cycle_membership", { p_period_id: String(periodId) });
+    const membership = normalizeCycleMembership(value, contract.value.members);
+    if (membership.periodId !== String(periodId)) throw new Error("Settlement membership period mismatch.");
+    return membership;
   }
 
   async function rolloverApproval(periodId) {
@@ -775,7 +784,7 @@ function createSupabaseWorker({
     return result;
   }
 
-  async function reconcileConfirmedDeletions(job, period, scanJob, lease) {
+  async function reconcileConfirmedDeletions(job, period, scanJob, lease, membership) {
     const deletions = Array.isArray(scanJob.confirmedDeletions) ? scanJob.confirmedDeletions : [];
     if (!deletions.length) return { receipts_deleted: 0, bank_evidence_deleted: 0, protected: 0 };
     if (scanJob.selectedCycleData?.status !== "ACTIVE") {
@@ -819,6 +828,7 @@ function createSupabaseWorker({
       p_deletions: evidence,
       p_members: contract.value.members,
       p_rounding: contract.value.shareRounding,
+      p_membership_revision: membership.revision,
     });
     lease.assert();
     for (const item of deletions) {
@@ -911,7 +921,13 @@ function createSupabaseWorker({
       period = recoveredCurrent;
     }
 
+    let membership = transactionalWrites ? await periodMembership(period.id) : null;
     let context = requestContext(job, period);
+    if (membership) {
+      context.runId = `supabase-${job.id}-membership-${membership.revision}`;
+      context.disabledMembers = disabledCycleMembers(membership);
+      context.membershipRevision = membership.revision;
+    }
     if (!context.groupId) throw new Error("No WhatsApp group is configured for the Supabase worker.");
 
     if (typeof scanManager.detectCycles === "function") {
@@ -941,6 +957,7 @@ function createSupabaseWorker({
           p_new_cycle_status: rollover.nextCycle.status,
           p_calculation_message: rollover.nextCycle.calculationMessage,
           p_members: contract.value.members,
+          p_membership_revision: membership.revision,
         });
         lease.assert();
         period = await currentPeriod(rollover.newPeriodId);
@@ -948,6 +965,10 @@ function createSupabaseWorker({
           throw new Error("The rollover did not produce the expected CURRENT period.");
         }
         context = requestContext(job, period);
+        membership = await periodMembership(period.id);
+        context.runId = `supabase-${job.id}-membership-${membership.revision}`;
+        context.disabledMembers = disabledCycleMembers(membership);
+        context.membershipRevision = membership.revision;
         context.cycleId = rollover.nextCycle.id;
         context.cycleBoundaryId = rollover.nextCycle.startBoundary?.id;
       } else {
@@ -993,6 +1014,11 @@ function createSupabaseWorker({
     if (["failed", "cancelled"].includes(localJob.status)) {
       throw new Error(localJob.message || localJob.errorCode || "WhatsApp scan failed.");
     }
+    if (transactionalWrites) {
+      const latestMembership = await periodMembership(period.id);
+      if (latestMembership.revision !== membership.revision)
+        throw new Error("STALE_MEMBERSHIP_REVISION: cycle participation changed during the scan; retrying with the new configuration.");
+    }
 
     const expenses = localJob.result?.expenses || [];
     if (transactionalWrites || context.cycleId || context.cycleBoundaryId) {
@@ -1010,7 +1036,7 @@ function createSupabaseWorker({
     });
     const receiptExpenses = expenses.filter((expense) => !expense.isBankTransfer);
     const bankExpenses = expenses.filter((expense) => expense.isBankTransfer);
-    const deletionReconciliation = await reconcileConfirmedDeletions(job, period, localJob, lease);
+    const deletionReconciliation = await reconcileConfirmedDeletions(job, period, localJob, lease, membership);
     const saved = await syncReceipts(receiptExpenses, period.id, lease);
     const savedBankEvidence = await syncBankEvidence(bankExpenses, period, lease);
     if (transactionalWrites) {
@@ -1033,7 +1059,8 @@ function createSupabaseWorker({
           source.cycle_start_boundary_id = cycleBoundaryId;
         }
         await client.rpc("prepare_instabox_whatsapp_sources", {
-          p_job_id: String(job.id), p_worker_id: workerId, p_period_id: String(period.id), p_sources: managedSources,
+          p_job_id: String(job.id), p_worker_id: workerId, p_period_id: String(period.id),
+          p_sources: managedSources, p_membership_revision: membership.revision,
         });
         lease.assert();
       }
@@ -1059,6 +1086,7 @@ function createSupabaseWorker({
         p_job_id: String(job.id), p_worker_id: workerId, p_period_id: String(period.id),
         p_receipts: saved.rows, p_members: contract.value.members,
         p_rounding: contract.value.shareRounding, p_settlement_id_mode: contract.value.settlementIdMode,
+        p_membership_revision: membership.revision,
       });
       return {
         finalized: true,
@@ -1185,7 +1213,7 @@ function createSupabaseWorker({
     }
     if (mode === LIVE_MODE && schemaVerified && liveWritesApproved) {
       const capabilities = await client.rpc("instabox_worker_capabilities", {});
-      client.writeEnabled = capabilities?.version === 7 && capabilities.writes_enabled === true;
+      client.writeEnabled = capabilities?.version === 8 && capabilities.writes_enabled === true;
     }
     if (mode !== LIVE_MODE) {
       if (!guardLogged) {

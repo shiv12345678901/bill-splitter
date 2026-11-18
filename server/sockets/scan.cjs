@@ -460,6 +460,7 @@ function createScanManager(
           ...(job.request.aliases || {}),
         },
         filterMember: job.request.filterMember || "all",
+        disabledMembers: Array.isArray(job.request.disabledMembers) ? job.request.disabledMembers : [],
         socket,
         isAborted: () => Boolean(database.getScanJob(jobId)?.cancelRequested),
         downloadMediaBuffer,

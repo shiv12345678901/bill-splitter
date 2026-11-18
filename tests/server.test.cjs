@@ -698,6 +698,44 @@ test("OCR retries quota failures with backoff and records the final outcome", as
   assert.equal(outcomes[0].apiCalls, 3);
   assert.equal(processReceipts.classifyScanError(new Error("429 quota")), "quota");
 });
+test("disabled WhatsApp senders are excluded before media, cache, or OCR and can be scanned after re-enable", async () => {
+  const id = `disabled-member-${Date.now()}`;
+  let downloads = 0;
+  let ocrCalls = 0;
+  const outcomes = [];
+  const input = {
+    client: { getContactById: async () => ({ name: "Swasti Adhikari" }) },
+    groupId: "membership-group",
+    candidateMessages: [{ id, timestamp: 1700000000, author: "swasti" }],
+    activeKeys: ["fixture-key"],
+    concurrency: 1,
+    effectiveAliases: { swasti: "Swasti Adhikari" },
+    filterMember: "all",
+    socket: socket(),
+    isAborted: () => false,
+    retryBaseMs: 0,
+    downloadMediaBuffer: async () => {
+      downloads++;
+      return { data: Buffer.from(id).toString("base64"), mimetype: "image/jpeg" };
+    },
+    parseReceiptWithGemini: async () => {
+      ocrCalls++;
+      return { merchant: "Re-enabled Market", amount: 7, category: "Groceries", confidence: "HIGH" };
+    },
+    onOutcome: async (outcome) => outcomes.push(outcome),
+  };
+  const disabled = await processReceipts({ ...input, disabledMembers: ["Swasti Adhikari"] });
+  assert.deepEqual(disabled, []);
+  assert.equal(downloads, 0);
+  assert.equal(ocrCalls, 0);
+  assert.equal(outcomes[0].status, "excluded");
+  assert.equal(outcomes[0].reason, "MEMBER_DISABLED_FOR_CYCLE");
+
+  const enabled = await processReceipts({ ...input, disabledMembers: [] });
+  assert.equal(downloads, 1);
+  assert.equal(ocrCalls, 1);
+  assert.equal(enabled[0].merchant, "Re-enabled Market");
+});
 test("scan reports missing WhatsApp with matching request id", async () => {
   const s = socket();
   registerScan(s, () => ({ client: null, clientStatus: "DISCONNECTED" }), {});

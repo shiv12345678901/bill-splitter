@@ -36,9 +36,23 @@ psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261102000000
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261102000001_automatic_cycle_rollover.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261104000000_whatsapp_bank_transfer_evidence.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261117000000_whatsapp_image_reconciliation.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/20261118000000_settlement_cycle_membership.sql
 ```
 
-Migration 00000 adds lease fields, claim indexes/function, and creates the private bucket if absent. Migration 00001 adds the verified production safeguards. Migration 00002 adds pending-cycle metadata. Migration 00003 adds guarded rollover. Migration 00004 adds the separate `whatsapp_bank_transfer_evidence` store. Migration 00005 adds explicit WhatsApp-revocation reconciliation and raises the capability contract to version 7. It registers only new sources pre-authorized by a leased InstaBox job and binds them to a hashed group identity and immutable cycle boundary; the 134 existing rows are not registered and cannot be automatically deleted. Automatic cleanup additionally requires a CURRENT/ACTIVE period, an UNINITIALIZED settlement, and the four reviewed household members. It permits an open-ended CURRENT period, derives the historical period status from existing rows, and creates a zero-total settlement placeholder with `owes = null` and `payment_obligations_status = 'UNINITIALIZED'`. Normal scans can save bank-transfer screenshots for review without creating a `bank_transfer_receipts.step_id`, verifying a payment, or changing bill totals. Clearances older than the migration's rollout watermark require an exact row in `instabox_rollover_approvals`; follow the separate reconciliation plan for the known 31 October boundary. None of these migrations enable writes, backfill verification, move receipts, rename settlement IDs, or touch historical `settlements.owes`.
+Migration 00000 adds lease fields, claim indexes/function, and creates the private bucket if absent. Migration 00001 adds the verified production safeguards. Migration 00002 adds pending-cycle metadata. Migration 00003 adds guarded rollover. Migration 00004 adds the separate `whatsapp_bank_transfer_evidence` store. Migration 00005 adds explicit WhatsApp-revocation reconciliation and raises the capability contract to version 7. Migration 00006 adds revision-fenced, cycle-specific membership and raises the worker contract to version 8. It initializes only the CURRENT cycle with all four members enabled; historical cycles retain their prior all-enabled behavior. It does not alter receipt exclusions, `settlements.owes`, payment verification, or write controls. See `CYCLE_MEMBERSHIP.md` before applying it.
+
+Pause job creation and allow any processing lease to finish before applying migration 00006. The migration deliberately fences capability-v7 writers. Apply it, verify and seed the reviewed auth UUID mappings, deploy the capability-v8 worker, and only then resume job creation. Do not infer UUID mappings from email or user metadata:
+
+```sql
+select id,email,raw_user_meta_data from auth.users order by created_at;
+-- After independently verifying each UUID, insert all four mappings. Only Shiva and Arjun are admins.
+insert into public.household_auth_identities(auth_user_id,member_name,household_role,verified_by)
+values
+  ('REVIEWED-SHIVA-UUID','Shiva Kafle','admin','change-ticket-reference'),
+  ('REVIEWED-ARJUN-UUID','Arjun Bhurtel','admin','change-ticket-reference'),
+  ('REVIEWED-ARPAN-UUID','Arpan Bhurtel','member','change-ticket-reference'),
+  ('REVIEWED-SWASTI-UUID','Swasti Adhikari','member','change-ticket-reference');
+```
 
 ```sql
 select public.instabox_worker_capabilities();

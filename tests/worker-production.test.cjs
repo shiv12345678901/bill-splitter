@@ -75,8 +75,9 @@ test("worker uses the supported Client userAgent option with a configurable Chro
   assert.doesNotMatch(worker, /puppeteer:\s*\{[^}]*userAgent:/s);
 });
 
-test("production worker fails closed until Supabase advertises capability version 7", () => {
+test("production worker fails closed until Supabase advertises membership capability version 8", () => {
   const source = fs.readFileSync("server/services/supabase-worker.cjs", "utf8");
-  assert.match(source, /capabilities\?\.version === 7/);
-  assert.doesNotMatch(source, /capabilities\?\.version >= 6/);
+  assert.match(source, /capabilities\?\.version === 8/);
+  assert.match(source, /capabilities\?\.version !== 8/);
+  assert.doesNotMatch(source, /capabilities\?\.version >= 7/);
 });

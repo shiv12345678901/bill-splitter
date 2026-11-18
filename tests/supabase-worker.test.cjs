@@ -22,6 +22,11 @@ const {
 } = require("../server/services/supabase-worker.cjs");
 const { WhatsAppSessionLock, clearStaleChromiumProfileLocks } = require("../server/services/whatsapp-session-lock.cjs");
 const timestamp = (value) => Math.floor(Date.parse(value) / 1000);
+const membershipResponse = (periodId, members = ["Alex", "Jamie", "Morgan", "Taylor"], revision = 1) => ({
+  period_id: periodId,
+  revision,
+  members: members.map((member_name) => ({ member_name, participation_mode: "enabled" })),
+});
 
 test("Supabase receipt validation follows the available SplitMate cent and category rules", () => {
   assert.equal(centsFromAmount(12.345), 1235);
@@ -487,6 +492,7 @@ test("transactional publishing records pending-cycle metadata before finalizing 
       upload: async () => {},
       update: async (table, filters, body) => table === "sync_requests" ? [{ id: "job", ...body }] : [],
       rpc: async (name, body) => {
+        if (name === "get_settlement_cycle_membership") return membershipResponse(body.p_period_id);
         rpcCalls.push({ name, body });
         return name === "finalize_sync_request" ? { result_summary: "done" } : null;
       },
@@ -515,12 +521,14 @@ function transactionalOwnershipFixture({
   existingReceipts = [],
   existingBankEvidence = [],
   failFinalizeOnce = false,
+  changeMembershipDuringScan = false,
 }) {
   const receiptRows = new Map(existingReceipts.map((row) => [row.id, { ...row }]));
   const bankRows = new Map(existingBankEvidence.map((row) => [row.id, { ...row }]));
   const rpcCalls = [];
   const uploads = [];
   let shouldFailFinalize = failFinalizeOnce;
+  let membershipRevision = 1;
   const startBoundary = {
     id: "ownership-start",
     timestamp: timestamp("2026-09-30T14:00:00Z") - 1,
@@ -553,7 +561,9 @@ function transactionalOwnershipFixture({
         startDate: "2026-10-01", endDate: null, startBoundary,
       }],
       prepare: async () => ({ jobId: "ownership-local", expectedImages: expenses.length, status: "queued" }),
-      runAndGet: async () => {},
+      runAndGet: async () => {
+        if (changeMembershipDuringScan) membershipRevision++;
+      },
     },
     localDatabase: {
       getScanJob: () => ({
@@ -580,6 +590,7 @@ function transactionalOwnershipFixture({
       upload: async (objectPath) => uploads.push(objectPath),
       update: async (table, filters, body) => table === "sync_requests" ? [{ id: "job", ...body }] : [],
       rpc: async (name, body) => {
+        if (name === "get_settlement_cycle_membership") return membershipResponse(body.p_period_id, undefined, membershipRevision);
         rpcCalls.push({ name, body });
         if (name === "record_whatsapp_bank_evidence") {
           for (const row of body.p_evidence) {
@@ -694,6 +705,20 @@ test("retry after bank evidence insertion neither re-registers nor duplicates ev
   assert.equal(fixture.rpcCalls.filter((call) => call.name === "record_whatsapp_bank_evidence").length, 1);
   assert.equal(fixture.rpcCalls.filter((call) => call.name === "finalize_sync_request").length, 2);
   assert.equal(fixture.bankRows.size, 1);
+  assert.equal(fixture.receiptRows.size, 0);
+});
+
+test("a concurrent membership revision change aborts before source registration or finalization", async () => {
+  const fixture = transactionalOwnershipFixture({
+    changeMembershipDuringScan: true,
+    expenses: [{ id: "stale-membership", date: "2026-10-02T01:00:00Z", paidBy: "Alex", merchant: "Market", amount: 10, category: "Groceries" }],
+  });
+  await assert.rejects(
+    () => fixture.worker.processClaimedJob({ id: "77777777-7777-4777-8777-777777777777" }, { assert() {} }),
+    /STALE_MEMBERSHIP_REVISION/,
+  );
+  assert.equal(fixture.rpcCalls.some((call) => call.name === "prepare_instabox_whatsapp_sources"), false);
+  assert.equal(fixture.rpcCalls.some((call) => call.name === "finalize_sync_request"), false);
   assert.equal(fixture.receiptRows.size, 0);
 });
 
@@ -821,6 +846,7 @@ test("a verified clearance rolls forward before November receipts are scanned", 
       upload: async () => {},
       update: async (table, filters, body) => table === "sync_requests" ? [{ id: "job", ...body }] : [],
       rpc: async (name, body) => {
+        if (name === "get_settlement_cycle_membership") return membershipResponse(body.p_period_id);
         rpcCalls.push({ name, body });
         if (name === "reconcile_deleted_whatsapp_images") return { outcomes: { "deleted-source": "protected_legacy" } };
         return name === "finalize_sync_request" ? { result_summary: "done" } : {};
