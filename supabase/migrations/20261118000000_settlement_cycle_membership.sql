@@ -201,11 +201,43 @@ begin
 end $$;
 revoke all on function public.apply_settlement_cycle_financials(text) from public,anon,authenticated,service_role;
 
+create or replace function public.get_settlement_cycle_membership_permissions(p_period_id text)
+returns jsonb language plpgsql stable security definer set search_path=public,auth,pg_temp as $$
+declare
+  identity_row public.household_auth_identities;
+  p public.periods;
+  obligation_status text;
+  is_admin boolean:=false;
+begin
+  if auth.role()='service_role' then
+    if not exists(select 1 from public.periods where id::text=p_period_id) then raise exception 'INVALID_PERIOD'; end if;
+    return jsonb_build_object('can_view',true,'can_edit',false,'can_review_disabled_receipts',true);
+  end if;
+  if auth.uid() is null then
+    return jsonb_build_object('can_view',false,'can_edit',false,'can_review_disabled_receipts',false);
+  end if;
+  select * into identity_row from public.household_auth_identities where auth_user_id=auth.uid();
+  if identity_row.auth_user_id is null then
+    return jsonb_build_object('can_view',false,'can_edit',false,'can_review_disabled_receipts',false);
+  end if;
+  select * into p from public.periods where id::text=p_period_id;
+  if p.id is null then raise exception 'INVALID_PERIOD'; end if;
+  is_admin:=identity_row.household_role='admin' and identity_row.member_name in ('Shiva Kafle','Arjun Bhurtel');
+  select s.payment_obligations_status into obligation_status from public.settlements s
+    where s.period_id::text=p_period_id order by s.calculated_at desc limit 1;
+  return jsonb_build_object(
+    'can_view',true,
+    'can_edit',is_admin and p.status='CURRENT' and coalesce(obligation_status='UNINITIALIZED',false),
+    'can_review_disabled_receipts',is_admin
+  );
+end $$;
+
 create or replace function public.get_settlement_cycle_membership(p_period_id text)
 returns jsonb language plpgsql stable security definer set search_path=public,auth,pg_temp as $$
-declare p public.periods; revision bigint; rows jsonb;
+declare p public.periods; revision bigint; rows jsonb; permissions jsonb;
 begin
-  if not public.is_verified_household_identity() then raise exception 'UNAUTHORIZED_MEMBERSHIP_ACCESS'; end if;
+  permissions:=public.get_settlement_cycle_membership_permissions(p_period_id);
+  if not coalesce((permissions->>'can_view')::boolean,false) then raise exception 'UNAUTHORIZED_MEMBERSHIP_ACCESS'; end if;
   select * into p from public.periods where id::text=p_period_id;
   if p.id is null then raise exception 'INVALID_PERIOD'; end if;
   select coalesce(s.revision,1) into revision from public.settlement_cycle_membership_state s where s.period_id=p_period_id;
@@ -214,14 +246,16 @@ begin
     order by m.member_name collate "C") into rows
   from unnest(array['Shiva Kafle','Arjun Bhurtel','Arpan Bhurtel','Swasti Adhikari']::text[]) m(member_name);
   return jsonb_build_object('period_id',p_period_id,'revision',coalesce(revision,1),
-    'status',p.status,'members',rows);
+    'status',p.status,'members',rows,'permissions',permissions);
 end $$;
 
 create or replace function public.preview_settlement_cycle_membership(p_period_id text)
 returns jsonb language plpgsql stable security definer set search_path=public,auth,pg_temp as $$
+declare permissions jsonb;
 begin
-  if not public.is_verified_household_identity() then raise exception 'UNAUTHORIZED_MEMBERSHIP_ACCESS'; end if;
-  return public.compute_settlement_cycle_financials(p_period_id);
+  permissions:=public.get_settlement_cycle_membership_permissions(p_period_id);
+  if not coalesce((permissions->>'can_view')::boolean,false) then raise exception 'UNAUTHORIZED_MEMBERSHIP_ACCESS'; end if;
+  return public.compute_settlement_cycle_financials(p_period_id)||jsonb_build_object('permissions',permissions);
 end $$;
 
 create or replace function public.get_effective_receipt_visibility(p_period_id text)
@@ -472,11 +506,13 @@ grant execute on function public.finalize_sync_request(uuid,text,text,jsonb,text
   public.rollover_settlement_period(uuid,text,text,date,jsonb,text,text,date,jsonb,text,jsonb,text[],bigint)
   to service_role;
 
-revoke all on function public.get_settlement_cycle_membership(text),
+revoke all on function public.get_settlement_cycle_membership_permissions(text),
+  public.get_settlement_cycle_membership(text),
   public.preview_settlement_cycle_membership(text),public.get_effective_receipt_visibility(text),
   public.get_disabled_settlement_receipts(text),
   public.set_settlement_cycle_member_mode(text,text,text,bigint) from public,anon;
-grant execute on function public.get_settlement_cycle_membership(text),
+grant execute on function public.get_settlement_cycle_membership_permissions(text),
+  public.get_settlement_cycle_membership(text),
   public.preview_settlement_cycle_membership(text),public.get_effective_receipt_visibility(text),
   public.get_disabled_settlement_receipts(text)
   to authenticated,service_role;

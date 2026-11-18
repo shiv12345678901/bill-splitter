@@ -333,26 +333,62 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
       ('dddddddd-4444-4444-8444-444444444444','Swasti Adhikari','member','sql-test')`);
     await q("select set_config('request.jwt.claim.role','authenticated',false),set_config('request.jwt.claim.sub','eeeeeeee-5555-4555-8555-555555555555',false)");
     await db.exec("set role authenticated");
+    assert.deepEqual((await q("select get_settlement_cycle_membership_permissions('period_2026-10-31') value"))[0].value, {
+      can_edit: false, can_review_disabled_receipts: false, can_view: false,
+    });
     await assert.rejects(() => q("select get_settlement_cycle_membership('period_2026-10-31')"), /UNAUTHORIZED_MEMBERSHIP_ACCESS/);
     await assert.rejects(() => q("select settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari')"), /UNAUTHORIZED_MEMBERSHIP_ACCESS/);
     await assert.rejects(() => q("select set_settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari','disabled',1)"), /UNAUTHORIZED_MEMBERSHIP_CHANGE/);
     await db.exec("reset role");
     await q("select set_config('request.jwt.claim.role','authenticated',false),set_config('request.jwt.claim.sub','cccccccc-3333-4333-8333-333333333333',false)");
     await db.exec("set role authenticated");
+    assert.deepEqual((await q("select get_settlement_cycle_membership_permissions('period_2026-10-31') value"))[0].value, {
+      can_edit: false, can_review_disabled_receipts: false, can_view: true,
+    });
     assert.equal((await q("select count(*)::integer n from receipts where period_id='p'"))[0].n, 1);
     await assert.rejects(() => q("select set_settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari','disabled',1)"), /UNAUTHORIZED_MEMBERSHIP_CHANGE/);
+    await db.exec("reset role");
+    await q("select set_config('request.jwt.claim.sub','dddddddd-4444-4444-8444-444444444444',false)");
+    await db.exec("set role authenticated");
+    assert.deepEqual((await q("select get_settlement_cycle_membership_permissions('period_2026-10-31') value"))[0].value, {
+      can_edit: false, can_review_disabled_receipts: false, can_view: true,
+    });
+    await db.exec("reset role");
+    await q("select set_config('request.jwt.claim.sub','bbbbbbbb-2222-4222-8222-222222222222',false)");
+    await db.exec("set role authenticated");
+    assert.deepEqual((await q("select get_settlement_cycle_membership_permissions('period_2026-10-31') value"))[0].value, {
+      can_edit: true, can_review_disabled_receipts: true, can_view: true,
+    });
     await db.exec("reset role");
     await q("select set_config('request.jwt.claim.sub','aaaaaaaa-1111-4111-8111-111111111111',false)");
     await db.exec("set role authenticated");
     const initialMembership = (await q("select get_settlement_cycle_membership('period_2026-10-31') value"))[0].value;
     assert.equal(initialMembership.revision, 1);
-    await q("select set_settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari','keep_receipts',1)");
+    assert.deepEqual(Object.keys(initialMembership).sort(), ["members", "period_id", "permissions", "revision", "status"]);
+    assert.equal(initialMembership.members.length, 4);
+    assert.ok(initialMembership.members.every((member) =>
+      ["enabled", "keep_receipts", "disabled"].includes(member.participation_mode)));
+    assert.deepEqual(initialMembership.permissions, {
+      can_edit: true, can_review_disabled_receipts: true, can_view: true,
+    });
+    await assert.rejects(() => q("select set_settlement_cycle_member_mode('period_2026-10-31','Unknown Member','disabled',1)"), /INVALID_MEMBER_IDENTITY/);
+    await assert.rejects(() => q("select set_settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari','unknown',1)"), /INVALID_PARTICIPATION_MODE/);
+    assert.deepEqual((await q("select get_settlement_cycle_membership_permissions('p') value"))[0].value, {
+      can_edit: false, can_review_disabled_receipts: true, can_view: true,
+    });
+    const mutation = (await q("select set_settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari','keep_receipts',1) value"))[0].value;
+    assert.equal(mutation.revision, 2);
+    assert.deepEqual(mutation.permissions, initialMembership.permissions);
     const keepPreview = (await q("select preview_settlement_cycle_membership('period_2026-10-31') value"))[0].value;
     assert.equal(keepPreview.total_cents, 600);
     assert.equal(keepPreview.equal_share_cents, 200);
     assert.equal(keepPreview.members.find((member) => member.member_name==='Swasti Adhikari').paid_cents, 200);
     assert.equal(keepPreview.members.find((member) => member.member_name==='Swasti Adhikari').share_cents, 0);
     assert.equal(keepPreview.members.reduce((sum, member) => sum+member.net_cents,0), 0);
+    assert.deepEqual(Object.keys(keepPreview).sort(), [
+      "equal_share_cents", "members", "period_id", "permissions", "receipt_count", "revision", "total_cents",
+    ]);
+    assert.deepEqual(keepPreview.permissions, initialMembership.permissions);
     await assert.rejects(() => q("select set_settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari','disabled',1)"), /STALE_MEMBERSHIP_REVISION/);
     await q("select set_settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari','disabled',2)");
     assert.equal((await q("select count(*)::integer n from receipts where period_id='period_2026-10-31'"))[0].n, 1);
@@ -380,8 +416,18 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     await db.exec("reset role");
     await q("update settlements set payment_obligations_status='REVIEWED' where period_id='period_2026-10-31'");
     await db.exec("set role authenticated");
+    assert.deepEqual((await q("select get_settlement_cycle_membership_permissions('period_2026-10-31') value"))[0].value, {
+      can_edit: false, can_review_disabled_receipts: true, can_view: true,
+    });
     await assert.rejects(() => q("select set_settlement_cycle_member_mode('period_2026-10-31','Swasti Adhikari','keep_receipts',10)"), /FINALIZED_OBLIGATIONS/);
     await db.exec("reset role");
+    await q("update settlements set payment_obligations_status=null where period_id='period_2026-10-31'");
+    await db.exec("set role authenticated");
+    assert.deepEqual((await q("select get_settlement_cycle_membership_permissions('period_2026-10-31') value"))[0].value, {
+      can_edit: false, can_review_disabled_receipts: true, can_view: true,
+    });
+    await db.exec("reset role");
+    await q("update settlements set payment_obligations_status='REVIEWED' where period_id='period_2026-10-31'");
     assert.equal((await q("select verification_status from bank_transfer_receipts"))[0].verification_status, null);
     const membershipMigration = fs.readFileSync("supabase/migrations/20261118000000_settlement_cycle_membership.sql", "utf8");
     await db.exec(membershipMigration);
@@ -397,6 +443,7 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     assert.equal((await q("select count(*)::integer n from receipts"))[0].n, 4);
     await db.exec("reset role");
     await db.exec("set role anon");
+    await assert.rejects(() => q("select get_settlement_cycle_membership_permissions('period_2026-10-31')"), /permission denied/i);
     await assert.rejects(() => q("select * from receipts"), /permission denied/i);
     await assert.rejects(() => q("select get_settlement_cycle_membership('period_2026-10-31')"), /permission denied/i);
     await db.exec("reset role");
