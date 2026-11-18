@@ -4,7 +4,7 @@ async (page) => {
   await page.evaluate(async()=>{
     const {state,blank,persist}=await import('/js/store.mjs');
     state.work={...blank(),groupName:'Recovery test',members:['Alex','Jamie'],expenses:[{id:'a',merchant:'Store',date:'2026-09-09',paidBy:'Alex',amount:20}]};
-    state.scan=null;state.archive=null;state.edits={};state.selected='a';state.filter='all';state.query='';persist();document.querySelector('a[href="#receipts"]')?.click();
+    state.scan=null;state.archive=null;state.edits={};state.selected='a';state.filter='all';state.query='';persist();location.hash='receipts';
   });
   await page.locator('#receipt-form [name=merchant]').fill('Unapplied draft');
   await page.reload();
@@ -21,7 +21,7 @@ async (page) => {
   check(await page.locator('#receipt-form [name=merchant]').isDisabled(),'Completed receipts are read only');
   await page.evaluate(async()=>{
     const{state,emit}=await import('/js/store.mjs');
-    state.history=[{id:'archive-fixture',groupName:'Archived house',expenses:[],startDate:'2026-08-01',endDate:'2026-08-31'}];emit();document.querySelector('a[href="#history"]')?.click();
+    state.history=[{id:'archive-fixture',groupName:'Archived house',expenses:[],startDate:'2026-08-01',endDate:'2026-08-31'}];emit();location.hash='history';
   });
   await page.getByRole('button',{name:/Archived house/}).click();
   check(await page.locator('#workspace-status').innerText()==='Saved record','History opens read only');

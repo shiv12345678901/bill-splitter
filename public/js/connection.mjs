@@ -6,7 +6,6 @@ import {
   today,
 } from "./domain.mjs";
 import { toast } from "./ui.mjs";
-import { navigateTo } from "./navigation.mjs";
 export const socket = window.io();
 let saveTimer, scanTimer, pendingSync = false;
 export function request(event, payload) {
@@ -427,7 +426,7 @@ socket.on("scan:complete", (data) => {
   }
   request("library:get");
   request("cycles:get");
-  navigateTo("receipts");
+  location.hash = "receipts";
   toast(
     sync
       ? "Synced through today. Existing edits were preserved."

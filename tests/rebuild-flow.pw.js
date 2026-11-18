@@ -58,11 +58,11 @@ async (page) => {
   for(const theme of ['light','dark'])for(const width of [1024,1280,1440,1920]){
     await page.setViewportSize({width,height:1000});await page.evaluate(t=>window.setAppearance(t),theme);
     for(const route of ['home','receipts','settlements','history','settings']){
-      await page.evaluate(r=>document.querySelector(`a[href="#${r}"]`)?.click(),route);await page.waitForTimeout(60);
+      await page.evaluate(r=>location.hash=r,route);await page.waitForTimeout(60);
       check(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),`Overflow ${theme} ${width} ${route}`);
     }
   }
-  await page.setViewportSize({width:1440,height:1050});await page.evaluate(()=>{window.setAppearance('light');document.querySelector('a[href="#home"]')?.click();});
+  await page.setViewportSize({width:1440,height:1050});await page.evaluate(()=>{window.setAppearance('light');location.hash='home';});
   await page.screenshot({path:'output/playwright/rebuild-overview.png',fullPage:true});
   await page.getByRole('link',{name:'Receipts',exact:true}).click();
   await page.locator('.receipt-rows .receipt-summary').first().click();

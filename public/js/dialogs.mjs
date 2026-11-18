@@ -2,7 +2,6 @@ import { state, change, persist } from "./store.mjs";
 import { today, normaliseReceipt } from "./domain.mjs";
 import { dialog, field, esc, toast, $ } from "./ui.mjs";
 import { beginScan, request } from "./connection.mjs";
-import { navigateTo } from "./navigation.mjs";
 const footer = (label) =>
   `<footer><button class="primary" type="submit">${label}</button></footer>`;
 export function editPeriod() {
@@ -49,7 +48,7 @@ export function addReceipt() {
       });
       state.selected = e.id;
       root.close();
-      navigateTo("receipts");
+      location.hash = "receipts";
     },
   );
 }
