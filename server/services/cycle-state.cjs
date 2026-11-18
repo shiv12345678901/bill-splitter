@@ -111,16 +111,26 @@ function buildCycle({ id, groupId, messages, startBoundary, endBoundary, aliases
   const startTs = Number.isFinite(startBoundary?.timestamp) ? startBoundary.timestamp + 1 : messages[0]?.timestamp || nowTs;
   const endTs = endBoundary?.timestamp ?? null;
   const within = messages.filter((message) => message.timestamp >= startTs && (endTs === null || message.timestamp <= endTs));
-  const calculation = within.filter((message) =>
+  const calculations = within.filter((message) =>
     !message.isNotification &&
     !message.isMedia &&
     isCalculationMessage(message.body)
-  ).at(-1) || null;
+  );
+  // The first verified calculation closes receipt collection for this cycle.
+  // A later calculation may correct the displayed totals, but it must not make
+  // settlement/payment screenshots eligible for OCR or financial publishing.
+  const receiptCutoff = calculations[0] || null;
+  const calculation = calculations.at(-1) || null;
   const groceryMessages = [];
   const paymentMessages = [];
   const unclassifiedMessages = [];
+  let ignoredAfterCalculationCount = 0;
   for (const message of within) {
     if (!message.isMedia) continue;
+    if (receiptCutoff && message.timestamp >= receiptCutoff.timestamp) {
+      ignoredAfterCalculationCount += 1;
+      continue;
+    }
     const view = messageView(message, aliases);
     if (message.classification === "bank_transfer") paymentMessages.push(view);
     else if (message.classification === "grocery_receipt") groceryMessages.push(view);
@@ -141,7 +151,11 @@ function buildCycle({ id, groupId, messages, startBoundary, endBoundary, aliases
     status, settlementConfirmed: Boolean(endBoundary), startBoundary, endBoundary: endBoundary || null,
     startCheckpoint: startBoundary, endCheckpoint: endBoundary || null, calculationMessage, clearanceMessage,
     groundTruth: calculation ? parseGroundTruth(calculation.body) : null,
-    startTs, endTs, calcTs: calculation?.timestamp || null, startDate: sydneyDate(startTs),
+    startTs, endTs, calcTs: calculation?.timestamp || null,
+    receiptCutoffTs: receiptCutoff?.timestamp || null,
+    receiptCutoffMessageId: receiptCutoff?.id || null,
+    ignoredAfterCalculationCount,
+    startDate: sydneyDate(startTs),
     endDate: endTs === null ? null : sydneyDate(endTs),
     groceryCount: groceryMessages.length, paymentCount: paymentMessages.length, unclassifiedCount: unclassifiedMessages.length,
     groceryMessages, paymentMessages, unclassifiedMessages,

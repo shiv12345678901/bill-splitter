@@ -305,6 +305,31 @@ function assertReceiptCycleAssignment({
   return true;
 }
 
+function filterPostCalculationResults(expenses = [], scanJob = {}) {
+  const cycle = scanJob?.selectedCycleData;
+  const cutoff = Number(cycle?.receiptCutoffTs ?? cycle?.calculationMessage?.timestamp);
+  if (!Number.isSafeInteger(cutoff) || cutoff <= 0) {
+    if (cycle?.status === "PENDING_SETTLEMENT" && cycle?.calculationMessage) {
+      throw new Error("The pending settlement calculation has no immutable timestamp; refusing to publish scan results.");
+    }
+    return { eligible: expenses, ignoredCount: 0 };
+  }
+  const timestamps = new Map((scanJob.candidates || []).map((candidate) => [
+    String(candidate?.id || ""), Number(candidate?.timestamp),
+  ]));
+  const eligible = [];
+  let ignoredCount = 0;
+  for (const expense of expenses || []) {
+    const timestamp = timestamps.get(String(expense?.id || ""));
+    if (Number.isSafeInteger(timestamp) && timestamp >= cutoff) {
+      ignoredCount += 1;
+      continue;
+    }
+    eligible.push(expense);
+  }
+  return { eligible, ignoredCount };
+}
+
 function safeObjectName(value) {
   return String(value).replace(/[^a-zA-Z0-9_-]/g, "_");
 }
@@ -1031,7 +1056,11 @@ function createSupabaseWorker({
         throw new Error("STALE_MEMBERSHIP_REVISION: cycle participation changed during the scan; retrying with the new configuration.");
     }
 
-    const expenses = localJob.result?.expenses || [];
+    const filteredResults = filterPostCalculationResults(localJob.result?.expenses || [], localJob);
+    const expenses = filteredResults.eligible;
+    if (filteredResults.ignoredCount) {
+      logger.log(`[Supabase] Ignored ${filteredResults.ignoredCount} post-calculation image result(s); settlement-window media is not published.`);
+    }
     if (transactionalWrites || context.cycleId || context.cycleBoundaryId) {
       assertReceiptCycleAssignment({
         expenses,
@@ -1305,6 +1334,7 @@ module.exports = {
   validateReceipt,
   validateBankTransferEvidence,
   assertReceiptCycleAssignment,
+  filterPostCalculationResults,
   settlementForReceipts,
   whatsappGroupIdentityHash,
 };

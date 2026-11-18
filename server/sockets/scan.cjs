@@ -131,6 +131,9 @@ function createScanManager(
           groceryCount: target.groceryCount || 0,
           paymentCount: target.paymentCount || 0,
           unclassifiedCount: target.unclassifiedCount || 0,
+          ignoredAfterCalculationCount: target.ignoredAfterCalculationCount || 0,
+          receiptCutoffTs: target.receiptCutoffTs || null,
+          receiptCutoffMessageId: target.receiptCutoffMessageId || null,
           calculationMessage: target.calculationMessage || null,
           clearanceMessage: target.clearanceMessage || null,
           settlementConfirmed: target.settlementConfirmed === true,
@@ -225,7 +228,9 @@ function createScanManager(
         createdAt: now,
         updatedAt: now,
         stage: "estimated",
-        message: `${discovered.candidates.length} images ready to scan.`,
+        message: discovered.selectedCycleData?.ignoredAfterCalculationCount
+          ? `${discovered.candidates.length} receipt image(s) ready; ${discovered.selectedCycleData.ignoredAfterCalculationCount} post-calculation image(s) ignored.`
+          : `${discovered.candidates.length} images ready to scan.`,
         estimate: {
           imageCount: discovered.candidates.length,
           cachedImages,

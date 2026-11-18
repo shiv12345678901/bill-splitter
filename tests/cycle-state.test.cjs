@@ -21,7 +21,7 @@ const detect = (messages, options = {}) => buildSettlementCycles({
   ...options,
 });
 
-test("a calculation creates an open pending-settlement cycle and keeps later transfer evidence in it", () => {
+test("a calculation closes receipt collection and ignores later settlement images", () => {
   const cycles = detect([
     message("grocery", "2026-10-01T01:00:00Z", "", { isMedia: true, classification: "grocery_receipt" }),
     message("calculation", "2026-10-02T01:00:00Z", "Arjun = 40\nArpan = 20\nTotal = 60\n$15 each"),
@@ -31,7 +31,9 @@ test("a calculation creates an open pending-settlement cycle and keeps later tra
   assert.equal(cycles[0].status, "PENDING_SETTLEMENT");
   assert.equal(cycles[0].endDate, null);
   assert.equal(cycles[0].settlementConfirmed, false);
-  assert.deepEqual(cycles[0].paymentMessages.map((item) => item.id), ["transfer"]);
+  assert.deepEqual(cycles[0].paymentMessages, []);
+  assert.equal(cycles[0].ignoredAfterCalculationCount, 1);
+  assert.equal(cycles[0].receiptCutoffMessageId, "calculation");
 });
 
 test("only an explicit clearance closes the pending cycle and starts a new active cycle", () => {
@@ -45,7 +47,8 @@ test("only an explicit clearance closes the pending cycle and starts a new activ
   assert.deepEqual(cycles[0].groceryMessages.map((item) => item.id), ["next-grocery"]);
   assert.equal(cycles[1].status, "SETTLED");
   assert.equal(cycles[1].settlementConfirmed, true);
-  assert.deepEqual(cycles[1].paymentMessages.map((item) => item.id), ["transfer"]);
+  assert.deepEqual(cycles[1].paymentMessages, []);
+  assert.equal(cycles[1].ignoredAfterCalculationCount, 1);
 });
 
 test("an explicit clearance without a calculation still closes exactly one cycle", () => {
@@ -78,15 +81,35 @@ test("repeated calculations do not create cycles and the latest one is authorita
   assert.equal(cycles[0].calculationMessage.id, "calc-new");
 });
 
-test("message IDs are idempotent and grocery images after calculations remain grocery receipts", () => {
+test("message IDs are idempotent and every image after calculation is ignored", () => {
   const duplicate = message("same", "2026-10-03T01:00:00Z", "", { isMedia: true, classification: "grocery_receipt" });
   const cycles = detect([
     message("calc", "2026-10-02T01:00:00Z", "Arjun = 20\nArpan = 20\nTotal = 40"),
     duplicate,
     { ...duplicate },
   ]);
-  assert.equal(cycles[0].groceryCount, 1);
+  assert.equal(cycles[0].groceryCount, 0);
   assert.equal(cycles[0].paymentCount, 0);
+  assert.equal(cycles[0].ignoredAfterCalculationCount, 1);
+});
+
+test("the first calculation is the immutable receipt cutoff while the latest calculation remains authoritative", () => {
+  const cycles = detect([
+    message("before", "2026-10-01T00:59:59Z", "", { isMedia: true, classification: "grocery_receipt" }),
+    message("calc-first", "2026-10-01T01:00:00Z", "Arjun = 10\nArpan = 10\nTotal = 20"),
+    message("same-second", "2026-10-01T01:00:00Z", "", { isMedia: true, classification: "grocery_receipt" }),
+    message("bank", "2026-10-01T02:00:00Z", "", { isMedia: true, classification: "bank_transfer" }),
+    message("unknown", "2026-10-01T03:00:00Z", "", { isMedia: true, classification: "unclassified" }),
+    message("calc-correction", "2026-10-01T04:00:00Z", "Arjun = 20\nArpan = 20\nTotal = 40"),
+    message("clearance", "2026-10-02T01:00:00Z", "Clear up to date"),
+  ]);
+  const settled = cycles[1];
+  assert.deepEqual(settled.groceryMessages.map((item) => item.id), ["before"]);
+  assert.deepEqual(settled.paymentMessages, []);
+  assert.deepEqual(settled.unclassifiedMessages, []);
+  assert.equal(settled.ignoredAfterCalculationCount, 3);
+  assert.equal(settled.receiptCutoffMessageId, "calc-first");
+  assert.equal(settled.calculationMessage.id, "calc-correction");
 });
 
 test("31 October Sydney clearance rolls the CURRENT period to the open cycle containing 2 November receipts", () => {

@@ -417,16 +417,16 @@ test("a retry follows an already committed rollover only when boundary IDs match
   );
 });
 
-test("transactional publishing records pending-cycle metadata before finalizing receipts", async () => {
+test("transactional publishing ignores stale post-calculation images before Supabase writes", async () => {
   const rpcCalls = [];
-  const calculationMessage = { id: "calc-1", text: "Total = 40", timestamp: 1793500000 };
+  const receiptTimestamp = timestamp("2026-10-02T01:00:00Z");
+  const calculationMessage = { id: "calc-1", text: "Total = 40", timestamp: receiptTimestamp + 1 };
   const startBoundary = {
     id: "start-1",
     timestamp: timestamp("2026-09-30T14:00:00Z") - 1,
     source: "marker",
     confidence: "HIGH",
   };
-  const receiptTimestamp = timestamp("2026-10-02T01:00:00Z");
   const worker = createSupabaseWorker({
     mode: "dry-run",
     transactionalWrites: true,
@@ -501,22 +501,17 @@ test("transactional publishing records pending-cycle metadata before finalizing 
   const result = await worker.processClaimedJob({ id: "11111111-1111-4111-8111-111111111111" }, { assert() {} });
   assert.equal(result.finalized, true);
   assert.deepEqual(rpcCalls.map((call) => call.name), [
-    "prepare_instabox_whatsapp_sources", "record_period_cycle_state", "record_whatsapp_bank_evidence", "finalize_sync_request",
+    "prepare_instabox_whatsapp_sources", "record_period_cycle_state", "finalize_sync_request",
   ]);
   assert.deepEqual(rpcCalls[0].body.p_sources, [
     { source_message_id: "receipt-1", source_kind: "receipt", group_identity_hash: whatsappGroupIdentityHash("fixture-group@g.us"), cycle_start_boundary_id: startBoundary.id },
-    { source_message_id: "bank-1", source_kind: "bank_evidence", group_identity_hash: whatsappGroupIdentityHash("fixture-group@g.us"), cycle_start_boundary_id: startBoundary.id },
   ]);
   assert.equal(rpcCalls[1].body.p_cycle_status, "PENDING_SETTLEMENT");
   assert.deepEqual(rpcCalls[1].body.p_calculation_message, calculationMessage);
   assert.equal(rpcCalls[1].body.p_clearance_message, null);
   assert.equal(rpcCalls[1].body.p_membership_revision, 1);
-  assert.equal(rpcCalls[2].body.p_evidence[0].id, "bank-1");
-  assert.equal(rpcCalls[2].body.p_evidence[0].amount_cents, 4255);
-  assert.equal(rpcCalls[2].body.p_evidence[0].review_status, "pending");
+  assert.deepEqual(rpcCalls[2].body.p_receipts.map((row) => row.id), ["receipt-1"]);
   assert.equal(rpcCalls[2].body.p_membership_revision, 1);
-  assert.deepEqual(rpcCalls[3].body.p_receipts.map((row) => row.id), ["receipt-1"]);
-  assert.equal(rpcCalls[3].body.p_membership_revision, 1);
 });
 
 function transactionalOwnershipFixture({
