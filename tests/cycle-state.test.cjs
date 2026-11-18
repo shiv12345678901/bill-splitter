@@ -113,6 +113,56 @@ test("31 October Sydney clearance rolls the CURRENT period to the open cycle con
   assert.equal(plan.newSettlementId, "settlement_2026-10-31_current");
 });
 
+test("a verified evening clearance supplies a missing period end date", () => {
+  const cycles = detect([
+    message("clearance-31-oct", "2026-10-30T13:00:00Z", "Clear up to date"),
+    message("before-clearance", "2026-11-10T01:00:00Z", "", { isMedia: true, classification: "grocery_receipt" }),
+    message("clearance-18-nov", "2026-11-18T08:51:00Z", "Clear up to date 18th November"),
+    message("after-clearance", "2026-11-18T08:51:01Z", "", { isMedia: true, classification: "grocery_receipt" }),
+  ]);
+  const plan = planPeriodRollover(cycles, {
+    id: "period_2026-10-31",
+    status: "CURRENT",
+    start_date: "2026-10-31",
+    end_date: null,
+  }, "household@g.us");
+  assert.equal(plan.closedCycle.endDate, "2026-11-18");
+  assert.equal(plan.nextCycle.startDate, "2026-11-18");
+  assert.deepEqual(plan.nextCycle.groceryMessages.map((item) => item.id), ["after-clearance"]);
+});
+
+test("rollover accepts any Sydney time and preserves one-second same-day boundaries", () => {
+  for (const [id, instant, expectedDate] of [
+    ["morning", "2026-11-17T21:00:00Z", "2026-11-18"],
+    ["after-midnight", "2026-11-17T13:01:00Z", "2026-11-18"],
+    ["before-midnight", "2026-11-18T12:59:00Z", "2026-11-18"],
+    ["dst-start", "2026-10-03T16:30:00Z", "2026-10-04"],
+    ["year-end", "2026-12-31T12:59:00Z", "2026-12-31"],
+  ]) {
+    const boundary = ts(instant);
+    const cycles = detect([
+      { id, timestamp: boundary, body: "Clear up to date" },
+      { id: `${id}-after`, timestamp: boundary + 1, body: "", isMedia: true, classification: "grocery_receipt" },
+    ], { configuredGroupStart: "2026-01-01" });
+    const plan = planPeriodRollover(cycles, {
+      status: "CURRENT", start_date: "2026-01-01", end_date: null,
+    }, "household@g.us");
+    assert.equal(plan.closedCycle.endDate, expectedDate, id);
+    assert.equal(plan.nextCycle.startDate, sydneyDate(boundary + 1), id);
+    assert.deepEqual(plan.nextCycle.groceryMessages.map((item) => item.id), [`${id}-after`], id);
+    assert.equal(plan.closedCycle.groceryMessages.some((item) => item.id === `${id}-after`), false, id);
+  }
+});
+
+test("rollover rejects a cycle discovered from another WhatsApp group", () => {
+  const cycles = detect([
+    message("clearance", "2026-11-18T08:51:00Z", "Clear up to date"),
+  ], { groupId: "other-household@g.us" });
+  assert.throws(() => planPeriodRollover(cycles, {
+    status: "CURRENT", start_date: "2026-09-01", end_date: null,
+  }, "household@g.us"), /different WhatsApp group/i);
+});
+
 test("a clearance at Sydney midnight rolls the next cycle onto the following local day", () => {
   const cycles = detect([
     message("midnight-clearance", "2026-10-31T12:59:59Z", "All settled"),

@@ -933,7 +933,7 @@ function createSupabaseWorker({
     if (typeof scanManager.detectCycles === "function") {
       const cycles = await scanManager.detectCycles(context.groupId);
       const approval = await rolloverApproval(period.id);
-      const rollover = planPeriodRollover(cycles, { ...period, rollover_approval: approval });
+      const rollover = planPeriodRollover(cycles, { ...period, rollover_approval: approval }, context.groupId);
       if (rollover.action === "rollover") {
         if (!transactionalWrites || !contract.approved) {
           throw new Error("A verified cycle rollover requires the reviewed transactional production adapter.");
@@ -944,16 +944,27 @@ function createSupabaseWorker({
           stage_message: "Closing the cleared period and opening the next WhatsApp cycle…",
           error: null,
         });
+        const groupIdentityHash = whatsappGroupIdentityHash(context.groupId);
+        const clearanceMessage = {
+          ...rollover.closedCycle.clearanceMessage,
+          dateStr: rollover.closedCycle.endDate,
+          group_identity_hash: groupIdentityHash,
+          cycle_start_boundary_id: rollover.closedCycle.startBoundary.id,
+        };
+        const startBoundary = {
+          ...rollover.nextCycle.startBoundary,
+          group_identity_hash: groupIdentityHash,
+        };
         await client.rpc("rollover_settlement_period", {
           p_job_id: String(job.id),
           p_worker_id: workerId,
           p_old_period_id: String(period.id),
           p_old_end_date: rollover.closedCycle.endDate,
-          p_clearance_message: rollover.closedCycle.clearanceMessage,
+          p_clearance_message: clearanceMessage,
           p_new_period_id: rollover.newPeriodId,
           p_new_settlement_id: rollover.newSettlementId,
           p_new_start_date: rollover.nextCycle.startDate,
-          p_start_boundary: rollover.nextCycle.startBoundary,
+          p_start_boundary: startBoundary,
           p_new_cycle_status: rollover.nextCycle.status,
           p_calculation_message: rollover.nextCycle.calculationMessage,
           p_members: contract.value.members,

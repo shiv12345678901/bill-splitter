@@ -863,6 +863,10 @@ test("a verified clearance rolls forward before November receipts are scanned", 
   assert.equal(rpcCalls[0].body.p_old_period_id, "period_2026-10-10");
   assert.equal(rpcCalls[0].body.p_new_period_id, "period_2026-10-31");
   assert.equal(rpcCalls[0].body.p_new_settlement_id, "settlement_2026-10-31_current");
+  assert.equal(rpcCalls[0].body.p_clearance_message.dateStr, "2026-10-31");
+  assert.equal(rpcCalls[0].body.p_clearance_message.cycle_start_boundary_id, "old-start");
+  assert.equal(rpcCalls[0].body.p_clearance_message.group_identity_hash, whatsappGroupIdentityHash("fixture-group@g.us"));
+  assert.equal(rpcCalls[0].body.p_start_boundary.group_identity_hash, whatsappGroupIdentityHash("fixture-group@g.us"));
   assert.equal(rpcCalls[1].body.p_deletions[0].cycle_start_boundary_id, "clearance-31-oct");
   assert.equal(rpcCalls[1].body.p_deletions[0].group_identity_hash, whatsappGroupIdentityHash("fixture-group@g.us"));
   assert.deepEqual(reconciliationUpdates, [{ id: "deleted-source", status: "review_required" }]);

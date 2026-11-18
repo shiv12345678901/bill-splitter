@@ -188,7 +188,7 @@ The final `bigint` argument is the membership revision. Their capability-v7 sign
 
 ## Deployment and rollback
 
-Deployment order: back up and inspect schema; pause new queue creation; wait for leases to finish; apply migrations through `20261118000000`; verify four CURRENT membership rows and revision 1; manually seed four reviewed auth UUID mappings; run SQL tests/queries; deploy capability-v8 worker; verify dry-run/health; resume queue creation; then release frontend controls.
+Deployment order: back up and inspect schema; pause new queue creation; wait for leases to finish; apply migrations through `20261118000001`; verify four CURRENT membership rows and revision 1; manually seed four reviewed auth UUID mappings; run SQL tests/queries; deploy the matching capability-v8 worker; verify dry-run/health; resume queue creation; then release frontend controls.
 
 Rollback is forward-only because production migrations are additive. Pause new queue creation and the worker, restore the capability-v7 application only together with a reviewed database follow-up that keeps old RPC signatures fenced, or restore the pre-migration database backup. Do not drop membership tables while the v8 worker or frontend is active. Membership rows can be reset only through the authorized RPC while obligations are `UNINITIALIZED`; never edit historical rows to simulate rollback.
 

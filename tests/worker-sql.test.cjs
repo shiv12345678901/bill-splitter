@@ -41,7 +41,7 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
       create table public.settlements(id text primary key,period_id text references public.periods(id),total_cents integer,per_person_cents integer,member_totals jsonb,receipt_count integer,calculated_at timestamptz,owes jsonb);
       create table public.bank_transfer_receipts(id uuid primary key,period_id text references public.periods(id),step_id text,from_name text,to_name text,amount_cents integer,transfer_date date,receipt_url text);
       insert into periods values('historical','2026-09-01','2026-09-30','CLOSED',500,125,1),('p','2026-10-01','2026-10-31','CURRENT',999,499,1);
-      insert into receipts values('edited','p',now(),'Manual merchant',999,'Shiva Kafle','Other','2026-10-02',true,'storage://bill-evidence/manual.jpg');
+      insert into receipts values('edited','p','2026-10-02T01:00:00Z','Manual merchant',999,'Shiva Kafle','Other','2026-10-02',true,'storage://bill-evidence/manual.jpg');
       insert into settlements values('settlement_2026-10-01_current','p',999,499,'{"Shiva Kafle":999}',1,now(),'{"Shiva Kafle":{"Arjun Bhurtel":250}}');
       insert into bank_transfer_receipts values('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','p','step-1','Shiva Kafle','Arjun Bhurtel',250,'2026-10-03','storage://bill-evidence/transfer.jpg');
       insert into sync_requests(id,requested_by,status) values('${jobId}','netlify-app','pending'),('${job2Id}','netlify-app','pending');
@@ -68,7 +68,12 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     assert.equal((await q("select * from claim_sync_request('a')")).length, 0);
     assert.equal((await q("select total_cents from periods where id='p'"))[0].total_cents, 999);
     await db.exec("update instabox_worker_control set writes_enabled=true");
-    await q("update periods set whatsapp_start_boundary=$1::jsonb where id='p'", [JSON.stringify({ id: cycleBoundaryId })]);
+    await q("update periods set whatsapp_start_boundary=$1::jsonb where id='p'", [JSON.stringify({
+      id: cycleBoundaryId,
+      timestamp: Math.floor(new Date("2026-09-30T14:00:00Z").getTime() / 1000) - 1,
+      source: "configured",
+      confidence: "HIGH",
+    })]);
     await q("update settlements set payment_obligations_status='UNINITIALIZED' where period_id='p'");
     assert.equal((await q("select instabox_worker_capabilities() as value"))[0].value.version, 8);
     assert.equal((await q("select verification_status from bank_transfer_receipts"))[0].verification_status, null);
@@ -282,11 +287,15 @@ test("production SQL: preservation, RLS, claims, fencing, retries and atomic rep
     await q("insert into sync_requests(id,requested_by,status) values($1,'netlify-app','pending')", [job3Id]);
     await q("select * from claim_sync_request('rollover-worker')");
     const clearanceTimestamp = Math.floor(new Date("2026-10-31T12:30:00Z").getTime() / 1000);
-    const clearance = { id: "clearance-31-oct", timestamp: clearanceTimestamp, source: "marker", confidence: "HIGH", text: "Clear up to date" };
+    const clearance = {
+      id: "clearance-31-oct", timestamp: clearanceTimestamp, dateStr: "2026-10-31",
+      source: "marker", confidence: "HIGH", text: "Clear up to date",
+      group_identity_hash: groupIdentityHash, cycle_start_boundary_id: cycleBoundaryId,
+    };
     const rolloverArgs = [
       job3Id, "rollover-worker", "p", "2026-10-31", JSON.stringify(clearance),
       "period_2026-10-31", "settlement_2026-10-31_current", "2026-10-31",
-      JSON.stringify({ ...clearance, dateStr: "2026-10-31" }), "ACTIVE", null,
+      JSON.stringify(clearance), "ACTIVE", null,
       ["Shiva Kafle", "Arjun Bhurtel", "Arpan Bhurtel", "Swasti Adhikari"],
     ];
     rolloverArgs.push(1);

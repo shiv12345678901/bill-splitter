@@ -107,7 +107,7 @@ function messageView(message, aliases) {
   };
 }
 
-function buildCycle({ id, messages, startBoundary, endBoundary, aliases, nowTs }) {
+function buildCycle({ id, groupId, messages, startBoundary, endBoundary, aliases, nowTs }) {
   const startTs = Number.isFinite(startBoundary?.timestamp) ? startBoundary.timestamp + 1 : messages[0]?.timestamp || nowTs;
   const endTs = endBoundary?.timestamp ?? null;
   const within = messages.filter((message) => message.timestamp >= startTs && (endTs === null || message.timestamp <= endTs));
@@ -134,7 +134,7 @@ function buildCycle({ id, messages, startBoundary, endBoundary, aliases, nowTs }
     ? { id: endBoundary.id, text: endBoundary.text, timestamp: endBoundary.timestamp, timeStr: displayTime(endBoundary.timestamp), source: "marker", confidence: "HIGH" }
     : null;
   return {
-    id,
+    id, groupId,
     title: status === "SETTLED" ? `Settlement: ${sydneyDate(startTs)} to ${sydneyDate(endTs)}`
       : status === "PENDING_SETTLEMENT" ? `Awaiting clearance (Since ${sydneyDate(startTs)})`
         : `Current Active Cycle (Since ${sydneyDate(startTs)})`,
@@ -168,11 +168,13 @@ function buildSettlementCycles({ groupId, aliases = {}, configuredGroupStart = n
   const cycles = [];
   let startBoundary = firstBoundary(groupId, configuredGroupStart, sorted[0]);
   for (let index = 0; index < markers.length; index += 1) {
-    cycles.push(buildCycle({ id: `cycle_hist_${index + 1}`, messages: sorted, startBoundary, endBoundary: markers[index], aliases, nowTs }));
+    cycles.push(buildCycle({ id: `cycle_hist_${index + 1}`, groupId, messages: sorted, startBoundary, endBoundary: markers[index], aliases, nowTs }));
     startBoundary = markers[index];
   }
-  cycles.push(buildCycle({ id: "cycle_current", messages: sorted, startBoundary, endBoundary: null, aliases, nowTs }));
-  return cycles.reverse();
+  cycles.push(buildCycle({ id: "cycle_current", groupId, messages: sorted, startBoundary, endBoundary: null, aliases, nowTs }));
+  const result = cycles.reverse();
+  result.groupId = groupId;
+  return result;
 }
 
 function sameBoundary(expected, actual) {
@@ -236,12 +238,16 @@ function selectCycleForPeriod(cycles, periodOrStartDate) {
   return strictInterior.length === 1 ? strictInterior[0] : null;
 }
 
-function planPeriodRollover(cycles, period) {
+function planPeriodRollover(cycles, period, expectedGroupId = null) {
   if (!period || period.status !== "CURRENT" || !/^\d{4}-\d{2}-\d{2}$/.test(period.start_date || "")) {
     throw new Error("A valid CURRENT Supabase period is required for cycle mapping.");
   }
   const mappedCycle = cycleForPeriod(cycles, period);
   if (!mappedCycle) throw new Error("The CURRENT period does not map to exactly one verified WhatsApp cycle.");
+  if (expectedGroupId && ((cycles?.groupId && cycles.groupId !== expectedGroupId) ||
+      (mappedCycle.groupId && mappedCycle.groupId !== expectedGroupId))) {
+    throw new Error("The verified clearance belongs to a different WhatsApp group.");
+  }
   if (["ACTIVE", "PENDING_SETTLEMENT"].includes(mappedCycle.status)) {
     return { action: "continue", cycle: mappedCycle };
   }
@@ -249,12 +255,15 @@ function planPeriodRollover(cycles, period) {
     mappedCycle.clearanceMessage?.source !== "marker" || mappedCycle.clearanceMessage?.confidence !== "HIGH") {
     throw new Error("The mapped WhatsApp cycle is not closed by a verified explicit clearance marker.");
   }
-  if (!period.end_date || period.end_date !== mappedCycle.endDate) {
+  if (period.end_date && period.end_date !== mappedCycle.endDate) {
     throw new Error("The period end date does not match the verified WhatsApp clearance date.");
   }
   const openCycles = (cycles || []).filter((cycle) => ["ACTIVE", "PENDING_SETTLEMENT"].includes(cycle.status));
   if (openCycles.length !== 1) throw new Error("The next open WhatsApp cycle is ambiguous.");
   const nextCycle = openCycles[0];
+  if (expectedGroupId && nextCycle.groupId && nextCycle.groupId !== expectedGroupId) {
+    throw new Error("The next cycle belongs to a different WhatsApp group.");
+  }
   const boundaryTimestamp = Number(mappedCycle.endBoundary?.timestamp);
   if (!Number.isFinite(boundaryTimestamp)) throw new Error("The verified clearance has no stable timestamp.");
   const expectedNextStartDate = sydneyDate(boundaryTimestamp + 1);
