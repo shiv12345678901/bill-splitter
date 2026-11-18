@@ -478,8 +478,11 @@ class SupabaseRestClient {
     const bucket = await this.request("storage/v1", "bucket/bill-evidence");
     if (!bucket || bucket.public !== false) throw new Error("bill-evidence must be a private Storage bucket.");
     const capabilities = await this.rpc("instabox_worker_capabilities", {});
-    if (capabilities?.version !== 6) throw new Error("WhatsApp bank-evidence safeguards migration version 6 is required.");
-    this.writeEnabled = capabilities.writes_enabled === true;
+    if (capabilities?.version !== 7) {
+      throw new Error(
+        "WhatsApp image reconciliation migration version 7 is required."
+      );
+    }    this.writeEnabled = capabilities.writes_enabled === true;
     this.columns = verified;
     return verified;
   }
