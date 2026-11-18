@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createNavigation, shouldCompleteSwipe } from "../public/js/navigation.mjs";
+import { createNavigation, isSwipeBackRoute, shouldCompleteSwipe } from "../public/js/navigation.mjs";
 
 function fakeBrowser(initialHash = "#home") {
   const location = { hash: initialHash };
@@ -88,4 +88,13 @@ test("iOS-style swipe completion supports deliberate drags and quick flicks", ()
   assert.equal(shouldCompleteSwipe({ distance: 48, width: 390, elapsedMs: 70 }), true);
   assert.equal(shouldCompleteSwipe({ distance: 48, width: 390, elapsedMs: 500 }), false);
   assert.equal(shouldCompleteSwipe({ distance: 20, width: 390, elapsedMs: 20 }), false);
+});
+
+test("custom swipe is limited to the visible History page", () => {
+  assert.equal(isSwipeBackRoute("history", "history"), true);
+  assert.equal(isSwipeBackRoute("home", "home"), false);
+  assert.equal(isSwipeBackRoute("receipts", "receipts"), false);
+  assert.equal(isSwipeBackRoute("settings", "settings"), false);
+  assert.equal(isSwipeBackRoute("history", "home"), false);
+  assert.equal(isSwipeBackRoute("home", "history"), false);
 });

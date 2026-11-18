@@ -78,7 +78,11 @@ export function shouldCompleteSwipe({ distance, width, elapsedMs }) {
     (distance >= 36 && velocity >= 0.55);
 }
 
-export function installSwipeBack({ element, body, viewport, getRoute, navigate }) {
+export function isSwipeBackRoute(historyRoute, visibleRoute) {
+  return historyRoute === "history" && visibleRoute === "history";
+}
+
+export function installSwipeBack({ element, body, viewport, canSwipe, navigate }) {
   if (!element) return () => {};
   let gesture = null;
   let resetTimer = null;
@@ -105,7 +109,7 @@ export function installSwipeBack({ element, body, viewport, getRoute, navigate }
   };
 
   const touchStart = (event) => {
-    if (getRoute() === HOME || event.touches.length !== 1 ||
+    if (!canSwipe() || event.touches.length !== 1 ||
         event.touches[0].clientX > SWIPE_EDGE_PX ||
         body.classList.contains("swipe-back-active") ||
         body.ownerDocument.querySelector("dialog[open], #lightbox:not([hidden])")) return;
@@ -179,7 +183,7 @@ export function startNavigation(routes, onRoute) {
     element: document.querySelector("main"),
     body: document.body,
     viewport: window,
-    getRoute: () => controller.route,
+    canSwipe: () => isSwipeBackRoute(controller.route, document.body.dataset.route),
     navigate: controller.navigate,
   });
   return controller;
